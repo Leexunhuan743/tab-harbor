@@ -387,6 +387,20 @@ body.theme-tone-dark::before {
     width: 100%;
 }
 
+/* Manual column count for landscape layouts — portrait (<=960px) keeps auto-fill */
+@media (min-width: 961px) {
+    .quick-tabs-grid.is-fixed-cols-4 {
+        grid-template-columns: repeat(4, 1fr);
+    }
+    .quick-tabs-grid.is-fixed-cols-5 {
+        grid-template-columns: repeat(5, 1fr);
+    }
+    .quick-tabs-grid.is-fixed-cols-4 .quick-shortcut-card,
+    .quick-tabs-grid.is-fixed-cols-5 .quick-shortcut-card {
+        width: 100%;
+    }
+}
+
 .quick-shortcut-card {
     position: relative;
     width: var(--quick-shortcut-card-size);

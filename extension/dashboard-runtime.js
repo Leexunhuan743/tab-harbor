@@ -2978,6 +2978,16 @@ function renderWorkspaceThemeTools() {
               <div class="theme-range-value" id="themeShortcutScaleValue">100%</div>
             </div>
           </div>
+          <div class="theme-menu-section">
+            <div class="theme-menu-row theme-menu-row-inline-choices">
+              <div class="theme-menu-label">${runtimeT ? runtimeT('quickShortcutColsLabel') : 'Quick links per row'}</div>
+              <div class="theme-mode-options" role="group" aria-label="${runtimeT ? runtimeT('quickShortcutColsLabel') : 'Quick links per row'}">
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutCols === 'auto') ? 'is-active' : ''}" type="button" data-action="select-quick-shortcut-cols" data-cols="auto" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutCols === 'auto') ? 'true' : 'false'}">${runtimeT ? runtimeT('quickShortcutColsAuto') : 'Auto'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutCols === '4') ? 'is-active' : ''}" type="button" data-action="select-quick-shortcut-cols" data-cols="4" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutCols === '4') ? 'true' : 'false'}">${runtimeT ? runtimeT('quickShortcutCols4') : '4 columns'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutCols === '5') ? 'is-active' : ''}" type="button" data-action="select-quick-shortcut-cols" data-cols="5" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutCols === '5') ? 'true' : 'false'}">${runtimeT ? runtimeT('quickShortcutCols5') : '5 columns'}</button>
+              </div>
+            </div>
+          </div>
         </div>
         <div class="theme-menu-panel" id="themeMenuFeaturesPanel" role="tabpanel" aria-labelledby="themeMenuFeaturesTab" data-theme-menu-panel="features" hidden>
           <div class="theme-menu-section">
@@ -3552,6 +3562,19 @@ document.addEventListener('click', async (e) => {
       ? runtimeT(modeLabelKey)
       : mode;
     showToast(runtimeT ? runtimeT('toastThemeModeUpdated', { mode: modeLabel }) : `Appearance mode: ${modeLabel}`);
+    return;
+  }
+
+  if (action === 'select-quick-shortcut-cols') {
+    const cols = ['auto', '4', '5'].includes(actionEl.dataset.cols) ? actionEl.dataset.cols : 'auto';
+    await saveThemePreferences({ quickShortcutCols: cols });
+    // renderThemeMenu does not know about this choice row, so patch it in place.
+    document.querySelectorAll('[data-action="select-quick-shortcut-cols"]').forEach(option => {
+      const isActive = option.dataset.cols === cols;
+      option.classList.toggle('is-active', isActive);
+      option.setAttribute('aria-pressed', String(isActive));
+    });
+    setThemeMenuOpen(false, { restoreFocus: true });
     return;
   }
 

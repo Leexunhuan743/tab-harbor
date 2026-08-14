@@ -51,7 +51,7 @@ Tab Harbor also works as a tiny action layer: jot down todos, keep short descrip
 
 ### Theme switching
 
-When you want the page to feel more like your own workspace, you can **switch themes, tune transparency, adjust text and shortcut size, and use a custom background image**. In **Desk settings → Features** you can also choose whether clicking a quick link opens it in a **new tab** or in the **current tab**.
+When you want the page to feel more like your own workspace, you can **switch themes, tune transparency, adjust text and shortcut size, and use a custom background image**. In **Desk settings → Features** you can also choose whether clicking a quick link opens it in a **new tab** or in the **current tab**; in **Desk settings → Appearance** you can fix quick links to **4 or 5 columns per row** (portrait stays automatic) so every link keeps its place.
 
 <table>
   <tr>

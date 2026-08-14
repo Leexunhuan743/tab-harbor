@@ -106,6 +106,22 @@ test('normalizeThemePreferences falls back to new-tab for invalid quick shortcut
   assert.equal(result.quickShortcutOpenMode, 'new-tab');
 });
 
+test('normalizeThemePreferences defaults quick shortcut columns to auto', () => {
+  const result = normalizeThemePreferences({});
+  assert.equal(result.quickShortcutCols, 'auto');
+});
+
+test('normalizeThemePreferences preserves quick shortcut columns when fixed', () => {
+  const result = normalizeThemePreferences({ quickShortcutCols: '4' });
+  assert.equal(result.quickShortcutCols, '4');
+  assert.equal(normalizeThemePreferences({ quickShortcutCols: '5' }).quickShortcutCols, '5');
+});
+
+test('normalizeThemePreferences falls back to auto for invalid quick shortcut columns', () => {
+  const result = normalizeThemePreferences({ quickShortcutCols: '6' });
+  assert.equal(result.quickShortcutCols, 'auto');
+});
+
 test('normalizeThemePreferences defaults closeDuplicateNewTabsEnabled to false', () => {
   const result = normalizeThemePreferences({});
   assert.equal(result.closeDuplicateNewTabsEnabled, false);

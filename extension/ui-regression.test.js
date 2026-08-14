@@ -1019,9 +1019,37 @@ test('quick shortcuts default to a new active tab and can opt into the current t
   assert.match(runtimeJs, /saveThemePreferences\(\{\s*quickShortcutOpenMode: nextMode\s*\}\)/);
   assert.match(runtimeJs, /toggleSwitch\.classList\.toggle\('is-active', nextMode === 'current-tab'\)/);
   assert.match(runtimeJs, /toggleSwitch\.setAttribute\('aria-pressed', String\(nextMode === 'current-tab'\)\)/);
-  assert.match(themeJs, /globalThis\.TabOutThemeControls = \{\s*filterRealTabs,\s*getQuickShortcutOpenMode,/);
+  assert.match(themeJs, /globalThis\.TabOutThemeControls = \{\s*filterRealTabs,\s*getQuickShortcutCols,\s*getQuickShortcutOpenMode,/);
   assert.match(i18nJs, /quickShortcutOpenModeLabel: 'Open quick links in current tab'/);
   assert.match(i18nJs, /quickShortcutOpenModeLabel: '在当前标签页打开快捷链接'/);
+});
+
+test('quick links per row can be fixed to 4 or 5 columns in landscape only', () => {
+  const css = fs.readFileSync(path.join(__dirname, 'style.css'), 'utf8');
+  // Preference defaults to auto so existing auto-fill behavior is preserved.
+  assert.match(themeJs, /quickShortcutCols:\s*'auto'/);
+  assert.match(themeJs, /quickShortcutCols: VALID_QUICK_SHORTCUT_COLS\.has\(rawQuickShortcutCols\) \? rawQuickShortcutCols : 'auto'/);
+  // applyThemePreferences pins the grid class from the saved preference.
+  assert.match(themeJs, /quickTabsList\.classList\.toggle\('is-fixed-cols-4', themePreferences\.quickShortcutCols === '4'\)/);
+  assert.match(themeJs, /quickTabsList\.classList\.toggle\('is-fixed-cols-5', themePreferences\.quickShortcutCols === '5'\)/);
+  // Landscape (>=961px) applies fixed tracks; portrait keeps auto-fill.
+  assert.match(css, /@media \(min-width: 961px\)[\s\S]*\.quick-tabs-grid\.is-fixed-cols-4 \{\s*grid-template-columns: repeat\(4, 1fr\);[\s\S]*\.quick-tabs-grid\.is-fixed-cols-5 \{\s*grid-template-columns: repeat\(5, 1fr\);[\s\S]*\.quick-tabs-grid\.is-fixed-cols-4 \.quick-shortcut-card,[\s\S]*\.quick-tabs-grid\.is-fixed-cols-5 \.quick-shortcut-card \{\s*width: 100%;/);
+  // The fixed rules must NOT leak into the portrait (max-width: 960px) block.
+  assert.doesNotMatch(css, /@media \(max-width: 960px\)[\s\S]{0,600}is-fixed-cols/);
+  // The Appearance panel exposes an Auto / 4 / 5 choice row.
+  assert.match(runtimeJs, /data-action="select-quick-shortcut-cols"[\s\S]*data-cols="auto"[\s\S]*data-cols="4"[\s\S]*data-cols="5"/);
+  assert.match(runtimeJs, /const cols = \['auto', '4', '5'\]\.includes\(actionEl\.dataset\.cols\) \? actionEl\.dataset\.cols : 'auto';/);
+  assert.match(runtimeJs, /saveThemePreferences\(\{\s*quickShortcutCols: cols\s*\}\)/);
+  // renderThemeMenu does not refresh this row, so the handler patches it in place.
+  assert.match(runtimeJs, /document\.querySelectorAll\('\[data-action="select-quick-shortcut-cols"\]'\)\.forEach\(option => \{[\s\S]*option\.dataset\.cols === cols[\s\S]*option\.classList\.toggle\('is-active', isActive\)[\s\S]*option\.setAttribute\('aria-pressed', String\(isActive\)\)/);
+  assert.match(i18nJs, /quickShortcutColsLabel: 'Quick links per row'/);
+  assert.match(i18nJs, /quickShortcutColsAuto: 'Auto'/);
+  assert.match(i18nJs, /quickShortcutCols4: '4 columns'/);
+  assert.match(i18nJs, /quickShortcutCols5: '5 columns'/);
+  assert.match(i18nJs, /quickShortcutColsLabel: '快捷链接每行'/);
+  assert.match(i18nJs, /quickShortcutColsAuto: '自动'/);
+  assert.match(i18nJs, /quickShortcutCols4: '4 列'/);
+  assert.match(i18nJs, /quickShortcutCols5: '5 列'/);
 });
 
 test('keyboard focus receives explicit visible treatment', () => {
