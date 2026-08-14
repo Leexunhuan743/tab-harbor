@@ -1959,11 +1959,45 @@ body.group-dragging .group-nav-button {
     line-height: 1.4;
 }
 
+/* Handle-click selection: selected rows reorder together when dragged. */
+.page-chip.is-selected {
+    background: color-mix(in srgb, var(--workspace-chip-bg) 82%, var(--workspace-accent-border) 18%);
+    box-shadow: inset 2px 0 0 var(--workspace-accent-border);
+}
+
+/* During a drag the rest of the selection dims so the moving set is obvious. */
+body.page-chip-list-dragging .page-chip.is-selected:not(.is-dragging) {
+    opacity: 0.55;
+}
+
+/* Batch drag count badge (shown when more than one row is moving). */
+.page-chip-drag-badge {
+    position: fixed;
+    z-index: 9999;
+    transform: translate(-50%, -100%);
+    background: var(--workspace-chip-bg-strong);
+    border: 1px solid var(--workspace-chip-border);
+    color: var(--workspace-chip-text);
+    font-size: 12px;
+    font-size: var(--ui-font-12);
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 999px;
+    pointer-events: none;
+    box-shadow: 0 2px 8px rgba(26, 22, 19, 0.18);
+}
+
+/* The grip is a pure drag surface: no scrolling/selection gestures on touch. */
+.chip-reorder-handle {
+    touch-action: none;
+}
+
 .page-chip > .chip-reorder-handle {
     flex-shrink: 0;
     margin-left: 1px;
     width: 30px;
-    height: 30px;
+    /* Generous grab target (>=32px) without inflating the row height. */
+    height: 36px;
 }
 
 .page-chip:last-child,

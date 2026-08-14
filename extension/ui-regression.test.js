@@ -770,7 +770,36 @@ test('todo list and tab chips expose drag handles with drag-state styling', () =
   assert.match(appJs, /data-chip-drag-handle="tab"/);
   assert.match(appJs, /const chipItem = e\.target\.closest\('\[data-chip-sort-id\]'\);/);
   assert.match(appJs, /const chipAction = e\.target\.closest\('\.chip-actions'\);/);
-  assert.match(appJs, /if \(chipItem && !chipAction && e\.button === 0\)/);
+  assert.match(appJs, /if \(chipHandle && chipItem && !chipAction && e\.button === 0\)/);
+  // Handle-click toggles a row into the highlight-only selection; dragging a
+  // selected row reorders the whole selection together within its group.
+  assert.match(appJs, /function togglePageChipSelection\(chipId\) \{[\s\S]*selectedPageChipIds\.add\(key\);/);
+  assert.match(appJs, /row\.classList\.toggle\('is-selected', selectedPageChipIds\.has\(String\(row\.dataset\.chipSortId \|\| ''\)\)\)/);
+  assert.match(appJs, /if \(selectedPageChipIds\.size > 0 && !e\.target\.closest\('\.mission-card'\)\) \{\s*selectedPageChipIds\.clear\(\);\s*refreshPageChipSelectionClasses\(\);/);
+  assert.match(appJs, /const finalDistance = Math\.hypot\(e\.clientX - pageChipDragState\.x, e\.clientY - pageChipDragState\.y\);\s*if \(finalDistance < 4\) \{\s*togglePageChipSelection\(draggedPageChipId\);/);
+  assert.match(appJs, /function buildBatchOrderedIdsFromList\(listEl, movingIds\) \{[\s\S]*rest\.splice\(dropPos, 0, \.\.\.moving\);/);
+  assert.match(appJs, /const orderIds = buildBatchOrderedIdsFromList\(targetListEl, movingIds\);/);
+  // Cross-group moves and new-group creation move the whole selection when
+  // the dragged row is selected.
+  assert.match(appJs, /function collectMovingTabIds\(movingChipIds, fallbackGroupKey = ''\) \{[\s\S]*const chipGroupKey = findGroupKeyForChip\(chipId\) \|\| String\(fallbackGroupKey \|\| ''\);[\s\S]*tabIds\.push\(\.\.\.getTabIdsForGroupChip\(chipGroupKey, chipId\)\);/);
+  assert.match(appJs, /function findGroupKeyForChip\(chipId\) \{[\s\S]*\(group\.tabs \|\| \[\]\)\.some\(tab => getTabOrderTokens\(tab\)\.includes\(key\)\)/);
+  assert.match(appJs, /getTabOrderTokens\(tab\)\.some\(token => movingSet\.has\(String\(token\)\)\)/);
+  assert.match(appJs, /async function saveCrossGroupTabRowOrder\(sourceGroupKey, targetGroupKey, targetListEl, movingIds\) \{[\s\S]*Array\.isArray\(movingIds\)[\s\S]*const chipsByGroup = \{\};[\s\S]*findGroupKeyForChip\(id\) \|\| String\(sourceGroupKey \|\| ''\)[\s\S]*buildCrossGroupTargetOrder\(targetListEl, ids\)/);
+  assert.match(appJs, /saveCrossGroupTabRowOrder\(sourceGroupKey, movedGroup\.groupKey, targetListEl, getMovingPageChipIds\(\)\)/);
+  // Every source card a batch move leaves must be patched, not just the
+  // dragged row's card — otherwise moved rows linger in their old cards.
+  assert.match(appJs, /for \(const g of \(movedGroup\.sourceGroupKeys \|\| \[\]\)\) changedGroupKeys\.add\(g\);/);
+  assert.match(appJs, /return \{ \.\.\.created\.group, sourceGroupKeys \};/);
+  assert.match(appJs, /selectedPageChipIds\.has\(String\(getPrimaryTabOrderToken\(tab\)\)\) \? ' is-selected' : ''/);
+  assert.match(css, /\.page-chip\.is-selected \{[\s\S]*background: color-mix\(in srgb, var\(--workspace-chip-bg\) 82%, var\(--workspace-accent-border\) 18%\);/);
+  // Drag feedback: the rest of the selection dims and a count badge appears.
+  assert.match(css, /body\.page-chip-list-dragging \.page-chip\.is-selected:not\(\.is-dragging\) \{\s*opacity: 0\.55;/);
+  assert.match(css, /\.page-chip-drag-badge \{[\s\S]*position: fixed;[\s\S]*pointer-events: none;/);
+  assert.match(css, /\.chip-reorder-handle \{\s*touch-action: none;/);
+  assert.match(appJs, /function updatePageChipDragBadge\(count\) \{[\s\S]*badge\.textContent = count > 1 \? `×\$\{count\}` : '';/);
+  assert.match(appJs, /if \(chipItem && !chipAction && e\.button === 0\) \{\s*e\.preventDefault\(\);/);
+  assert.match(appJs, /if \(e\.key === 'Escape' && selectedPageChipIds\.size > 0\) \{\s*selectedPageChipIds\.clear\(\);/);
+  assert.match(appJs, /movingChipIds: getMovingPageChipIds\(\),/);
   assert.match(appJs, /e\.stopPropagation\(\);/);
   assert.match(appJs, /document\.body\.classList\.add\('page-chip-drag-armed'\)/);
   assert.match(appJs, /const GROUP_TAB_ORDER_KEY = 'groupTabOrder'/);
@@ -831,7 +860,7 @@ test('todo list and tab chips expose drag handles with drag-state styling', () =
   assert.doesNotMatch(drawerJs, /title="Drag to reorder"/);
   assert.match(css, /\.drawer-reorder-handle\s*\{/);
   assert.match(css, /\.todo-reorder-handle\s*\{[\s\S]*width:\s*30px;[\s\S]*height:\s*30px;/);
-  assert.match(css, /\.page-chip > \.chip-reorder-handle\s*\{[\s\S]*width:\s*30px;[\s\S]*height:\s*30px;/);
+  assert.match(css, /\.page-chip > \.chip-reorder-handle\s*\{[\s\S]*width:\s*30px;[\s\S]*height:\s*36px;/);
   assert.match(css, /\.chip-reorder-handle\s*\{[\s\S]*opacity:\s*1;[\s\S]*border:\s*1px solid/);
   assert.match(css, /\.drawer-reorder-placeholder\s*\{/);
   assert.match(css, /body\.page-chip-list-dragging\s*\{/);

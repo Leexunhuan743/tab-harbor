@@ -138,6 +138,10 @@ let draggedGroupId = '';
 let dragStartPoint = null;
 let suppressJumpUntil = 0;
 let suppressPageChipClickUntil = 0;
+// Handle-click selection: clicking a row's drag handle toggles it into the
+// selection; dragging a selected row then reorders the whole selection
+// together within its group.
+let selectedPageChipIds = new Set();
 let draggedGroupButtonEl = null;
 let dragPlaceholderEl = null;
 let draggedDrawerItemId = '';
@@ -458,6 +462,63 @@ function getTabIdsForGroupChip(groupKey, chipSortId) {
     .filter(Number.isFinite);
 }
 
+/**
+ * findGroupKeyForChip(chipId)
+ *
+ * Locates the domain group that currently owns a chip's tabs, so a drag
+ * selection spanning several cards can move every selected row from its own
+ * source group into the target.
+ */
+function findGroupKeyForChip(chipId) {
+  const key = String(chipId || '');
+  if (!key) return '';
+  for (const group of domainGroups) {
+    if ((group.tabs || []).some(tab => getTabOrderTokens(tab).includes(key))) {
+      return String(group.domain || '');
+    }
+  }
+  return '';
+}
+
+/**
+ * getMovingPageChipIds()
+ *
+ * The chips participating in the current drag: the whole highlight-only
+ * selection when the dragged row is part of it, otherwise just the dragged
+ * row. Same-group reorders and cross-group moves all use this set.
+ */
+function getMovingPageChipIds() {
+  const draggedChipId = String(draggedPageChipId || '');
+  // Prefer the snapshot captured when the drag armed — the selection must
+  // not change mid-drag, so commit-time logic uses the same set throughout.
+  if (pageChipDragState?.movingChipIds?.length) {
+    return [...pageChipDragState.movingChipIds];
+  }
+  if (selectedPageChipIds.size > 0 && selectedPageChipIds.has(draggedChipId)) {
+    return [...selectedPageChipIds].map(String).filter(Boolean);
+  }
+  return [draggedChipId].filter(Boolean);
+}
+
+/**
+ * collectMovingTabIds(movingChipIds, fallbackGroupKey)
+ *
+ * Returns { tabIds, groupsById } for every moving chip, resolving each chip's
+ * own source group (chips from other cards are collected from their cards).
+ */
+function collectMovingTabIds(movingChipIds, fallbackGroupKey = '') {
+  const tabIds = [];
+  const groupsById = {};
+  for (const chipId of movingChipIds) {
+    const chipGroupKey = findGroupKeyForChip(chipId) || String(fallbackGroupKey || '');
+    if (!chipGroupKey) continue;
+    groupsById[chipGroupKey] = groupsById[chipGroupKey] || new Set();
+    groupsById[chipGroupKey].add(String(chipId));
+    tabIds.push(...getTabIdsForGroupChip(chipGroupKey, chipId));
+  }
+  return { tabIds, groupsById };
+}
+
 function getOrderedIdsForGroup(groupKey) {
   const group = getDomainGroupByKey(groupKey);
   return getOrderedUniqueTabsForGroup(group).map(tab => getPrimaryTabOrderToken(tab)).filter(Boolean);
@@ -472,6 +533,34 @@ function buildOrderedIdsFromList(listEl, draggedId) {
       return node.dataset?.chipSortId || '';
     })
     .filter(Boolean);
+}
+
+/**
+ * buildBatchOrderedIdsFromList(listEl, movingIds)
+ *
+ * Rebuilds the list order with every moving chip placed consecutively at the
+ * placeholder (drop) position, preserving their relative order.
+ */
+function buildBatchOrderedIdsFromList(listEl, movingIds) {
+  if (!listEl) return [];
+  const movingSet = new Set((movingIds || []).map(String).filter(Boolean));
+  const children = [...listEl.children];
+  const rest = [];
+  const moving = [];
+  for (const node of children) {
+    if (node === pageChipPlaceholderEl) continue;
+    const id = node.dataset?.chipSortId || '';
+    if (id && movingSet.has(id)) moving.push(id);
+    else if (id) rest.push(id);
+  }
+  const placeholderIdx = children.findIndex(node => node === pageChipPlaceholderEl);
+  const dropPos = placeholderIdx === -1
+    ? rest.length
+    : children.slice(0, placeholderIdx)
+        .filter(n => n !== pageChipPlaceholderEl && !movingSet.has(String(n.dataset?.chipSortId || '')))
+        .length;
+  rest.splice(dropPos, 0, ...moving);
+  return rest;
 }
 
 function logPageChipDragDebug(stage, details = {}) {
@@ -1962,6 +2051,7 @@ function clearPageChipDragState({ removeNode = false } = {}) {
 
   pageChipDragState = null;
   draggedPageChipEl = null;
+  document.getElementById('pageChipDragBadge')?.remove();
 }
 
 function updateDraggedPageChipPosition(clientX, clientY) {
@@ -1970,6 +2060,12 @@ function updateDraggedPageChipPosition(clientX, clientY) {
 
   draggedPageChipEl.style.setProperty('--drag-left', `${clampedPoint.clientX - pageChipDragState.offsetX}px`);
   draggedPageChipEl.style.setProperty('--drag-top', `${clampedPoint.clientY - pageChipDragState.offsetY}px`);
+
+  const badge = document.getElementById('pageChipDragBadge');
+  if (badge) {
+    badge.style.left = `${clampedPoint.clientX + 14}px`;
+    badge.style.top = `${clampedPoint.clientY - 22}px`;
+  }
 }
 
 function startPageChipDragVisuals() {
@@ -1980,10 +2076,24 @@ function startPageChipDragVisuals() {
   draggedPageChipEl.classList.add('is-dragging');
   draggedPageChipEl.style.setProperty('--drag-width', `${draggedPageChipEl.getBoundingClientRect().width}px`);
   ensurePageChipPlaceholder();
+  // Batch feedback: show how many rows are moving.
+  updatePageChipDragBadge(pageChipDragState.movingChipIds?.length || 1);
   logPageChipDragDebug('drag-start', {
     groupKey: pageChipDragState.sourceGroupKey,
     chip: draggedPageChipId,
   });
+}
+
+function updatePageChipDragBadge(count) {
+  let badge = document.getElementById('pageChipDragBadge');
+  if (!badge) {
+    badge = document.createElement('div');
+    badge.id = 'pageChipDragBadge';
+    badge.className = 'page-chip-drag-badge';
+    document.body.appendChild(badge);
+  }
+  badge.textContent = count > 1 ? `×${count}` : '';
+  badge.style.display = count > 1 ? '' : 'none';
 }
 
 function syncPageChipDropTarget(clientX, clientY) {
@@ -2115,22 +2225,51 @@ function createSessionGroupFromDraggedTab(state, tab) {
   return addSessionGroup(state, nextName);
 }
 
-async function saveCrossGroupTabRowOrder(sourceGroupKey, targetGroupKey, targetListEl, draggedId) {
-  const nextState = {
-    ...groupTabOrderState,
-    [String(sourceGroupKey)]: getOrderedIdsForGroup(sourceGroupKey).filter(id => id !== String(draggedId || '')),
-    [String(targetGroupKey)]: targetListEl
-      ? buildOrderedIdsFromList(targetListEl, draggedId)
-      : [String(draggedId || '')].filter(Boolean),
-  };
+async function saveCrossGroupTabRowOrder(sourceGroupKey, targetGroupKey, targetListEl, movingIds) {
+  const ids = Array.isArray(movingIds)
+    ? movingIds.map(id => String(id)).filter(Boolean)
+    : [String(movingIds || '')].filter(Boolean);
+  if (!ids.length) return;
+
+  // Remove every moving chip from its own source group's stored order, so a
+  // selection spanning several cards cleans up every card it left.
+  const chipsByGroup = {};
+  for (const id of ids) {
+    const groupKey = findGroupKeyForChip(id) || String(sourceGroupKey || '');
+    if (!groupKey) continue;
+    chipsByGroup[groupKey] = chipsByGroup[groupKey] || [];
+    chipsByGroup[groupKey].push(id);
+  }
+  const nextState = { ...groupTabOrderState };
+  for (const [groupKey, chipIds] of Object.entries(chipsByGroup)) {
+    const chipSet = new Set(chipIds);
+    nextState[groupKey] = getOrderedIdsForGroup(groupKey).filter(id => !chipSet.has(String(id || '')));
+  }
+  nextState[String(targetGroupKey)] = targetListEl
+    ? buildCrossGroupTargetOrder(targetListEl, ids)
+    : ids;
 
   await saveGroupTabOrder(nextState);
+}
+
+function buildCrossGroupTargetOrder(targetListEl, movingIds) {
+  const children = [...targetListEl.children];
+  const targetIds = children.filter(n => n.dataset?.chipSortId).map(n => String(n.dataset.chipSortId));
+  const placeholderIdx = children.findIndex(n => n === pageChipPlaceholderEl);
+  const insertAt = placeholderIdx === -1 ? targetIds.length : Math.min(placeholderIdx, targetIds.length);
+  targetIds.splice(insertAt, 0, ...movingIds.map(String).filter(Boolean));
+  return targetIds;
 }
 
 async function moveDraggedPageChipToGroup(targetGroupKey) {
   const sourceGroupKey = pageChipDragState?.sourceGroupKey || '';
   const draggedChipId = draggedPageChipId;
-  const draggedTabIds = getTabIdsForGroupChip(sourceGroupKey, draggedChipId);
+  // Move the whole selection together when the dragged row is selected,
+  // resolving each chip's own source card (cross-card selections work).
+  const movingChipIds = getMovingPageChipIds();
+  const collected = collectMovingTabIds(movingChipIds, sourceGroupKey);
+  const draggedTabIds = collected.tabIds;
+  const sourceGroupKeys = Object.keys(collected.groupsById);
   if (!sourceGroupKey || !draggedChipId || !draggedTabIds.length) return null;
   const targetWasManualGroup = isManualGroupKey(targetGroupKey);
 
@@ -2138,6 +2277,7 @@ async function moveDraggedPageChipToGroup(targetGroupKey) {
     sourceGroupKey,
     targetGroupKey,
     draggedChipId,
+    movingChips: movingChipIds.join(','),
     tabIds: draggedTabIds.join(','),
   });
   let nextState = clearTabsFromSessionGroups(sessionGroupsState, draggedTabIds);
@@ -2158,21 +2298,29 @@ async function moveDraggedPageChipToGroup(targetGroupKey) {
     groupKey: `${MANUAL_GROUP_PREFIX}${targetGroup.groupId}`,
     groupName: targetGroup.groupName,
     targetWasManualGroup,
+    sourceGroupKeys,
   };
 }
 
 async function createSessionGroupFromDraggedPageChip() {
   const sourceGroupKey = pageChipDragState?.sourceGroupKey || '';
   const draggedChipId = draggedPageChipId;
-  const draggedTabs = getDomainGroupByKey(sourceGroupKey)?.tabs?.filter(tab =>
-    getTabOrderTokens(tab).includes(String(draggedChipId || ''))
-  ) || [];
-  const draggedTabIds = draggedTabs.map(tab => Number(tab?.id)).filter(Number.isFinite);
+  // Create the group from the whole selection when the dragged row is
+  // selected, resolving each chip's own source card.
+  const movingChipIds = getMovingPageChipIds();
+  const collected = collectMovingTabIds(movingChipIds, sourceGroupKey);
+  const draggedTabIds = collected.tabIds;
+  const sourceGroupKeys = Object.keys(collected.groupsById);
+  const movingSet = new Set(movingChipIds);
+  const draggedTabs = (domainGroups || [])
+    .flatMap(group => group.tabs || [])
+    .filter(tab => getTabOrderTokens(tab).some(token => movingSet.has(String(token))));
   if (!sourceGroupKey || !draggedChipId || !draggedTabs.length || !draggedTabIds.length) return null;
 
   logPageChipDragDebug('create-group-begin', {
     sourceGroupKey,
     draggedChipId,
+    movingChips: movingChipIds.join(','),
     tabIds: draggedTabIds.join(','),
   });
   let nextState = clearTabsFromSessionGroups(sessionGroupsState, draggedTabIds);
@@ -2188,13 +2336,14 @@ async function createSessionGroupFromDraggedPageChip() {
     groupId: created.group.id,
     groupName: created.group.name,
   });
-  await saveCrossGroupTabRowOrder(sourceGroupKey, `${MANUAL_GROUP_PREFIX}${created.group.id}`, null, draggedChipId);
+  await saveCrossGroupTabRowOrder(sourceGroupKey, `${MANUAL_GROUP_PREFIX}${created.group.id}`, null, getMovingPageChipIds());
   logPageChipDragDebug('create-group-end', {
     groupId: created.group.id,
     groupName: created.group.name,
+    sourceGroups: sourceGroupKeys.join(','),
   });
 
-  return created.group;
+  return { ...created.group, sourceGroupKeys };
 }
 
 async function finishPageChipDrag() {
@@ -2218,11 +2367,20 @@ async function finishPageChipDrag() {
     let requiresOpenTabsRebuild = true;
     if (moved) {
       if (targetGroupKey && targetGroupKey === sourceGroupKey && targetListEl) {
-        const orderIds = buildOrderedIdsFromList(targetListEl, draggedPageChipId);
-        logPageChipDragDebug('finish-reorder-save', { orderCount: orderIds.length });
+        // Batch reorder: when the dragged row belongs to a selection, the
+        // whole selection moves together to the drop point.
+        const draggedSelected = selectedPageChipIds.size > 0 && selectedPageChipIds.has(String(draggedPageChipId || ''));
+        const movingIds = draggedSelected
+          ? [...selectedPageChipIds].map(String).filter(Boolean)
+          : [String(draggedPageChipId || '')];
+        const orderIds = buildBatchOrderedIdsFromList(targetListEl, movingIds);
+        logPageChipDragDebug('finish-reorder-save', { orderCount: orderIds.length, moving: movingIds.join(',') });
         await saveGroupTabRowOrder(sourceGroupKey, orderIds);
-        if (draggedPageChipEl && pageChipPlaceholderEl) {
-          targetListEl.insertBefore(draggedPageChipEl, pageChipPlaceholderEl);
+        if (pageChipPlaceholderEl && movingIds.length) {
+          const movingSet = new Set(movingIds);
+          const movingEls = [...targetListEl.querySelectorAll('[data-chip-sort-id]')]
+            .filter(el => movingSet.has(String(el.dataset.chipSortId || '')));
+          for (const el of movingEls) targetListEl.insertBefore(el, pageChipPlaceholderEl);
         }
         requiresOpenTabsRebuild = false;
       } else if (targetGroupKey) {
@@ -2230,13 +2388,14 @@ async function finishPageChipDrag() {
         if (movedGroup) {
           disableChromeTabGroupsImportModeForLocalEdits();
           changedGroupKeys.add(sourceGroupKey);
+          for (const g of (movedGroup.sourceGroupKeys || [])) changedGroupKeys.add(g);
           changedGroupKeys.add(movedGroup.groupKey);
           if (!movedGroup.targetWasManualGroup) {
             const nextGroupOrder = buildPersistentGroupOrderReplacingKey(movedGroup.groupKey, targetGroupKey);
             await persistGroupOrder(nextGroupOrder);
           }
           logPageChipDragDebug('finish-save-cross-order', { groupKey: movedGroup.groupKey });
-          await saveCrossGroupTabRowOrder(sourceGroupKey, movedGroup.groupKey, targetListEl, draggedPageChipId);
+          await saveCrossGroupTabRowOrder(sourceGroupKey, movedGroup.groupKey, targetListEl, getMovingPageChipIds());
           logPageChipDragDebug('finish-group-move', { groupKey: movedGroup.groupKey, groupName: movedGroup.groupName });
         }
       } else if (createNewGroup) {
@@ -2244,6 +2403,7 @@ async function finishPageChipDrag() {
         if (createdGroup) {
           disableChromeTabGroupsImportModeForLocalEdits();
           changedGroupKeys.add(sourceGroupKey);
+          for (const g of (createdGroup.sourceGroupKeys || [])) changedGroupKeys.add(g);
           const createdGroupKey = `${MANUAL_GROUP_PREFIX}${createdGroup.id}`;
           changedGroupKeys.add(createdGroupKey);
           const nextGroupOrder = buildPersistentGroupOrderWithInsertedGroup(createdGroupKey, {
@@ -2834,7 +2994,7 @@ function renderDomainCard(group) {
     } catch {}
     const count    = urlCounts[tab.url];
     const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
-    const chipClass = `${count > 1 ? ' chip-has-dupes' : ''}${tab.discarded ? ' page-chip--discarded' : ''}`;
+    const chipClass = `${count > 1 ? ' chip-has-dupes' : ''}${tab.discarded ? ' page-chip--discarded' : ''}${selectedPageChipIds.has(String(getPrimaryTabOrderToken(tab))) ? ' is-selected' : ''}`;
     const safeUrl   = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(tab.url || '') : (tab.url || '').replace(/"/g, '&quot;');
     const safeTitle = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(label) : label.replace(/"/g, '&quot;');
     const safeLabel = runtimeEscapeHtml ? runtimeEscapeHtml(label) : label;
@@ -3637,6 +3797,11 @@ function updateBackToTopVisibility() {
    ---------------------------------------------------------------- */
 
 document.addEventListener('click', async (e) => {
+  // Clicking outside the tab cards clears the highlight-only selection.
+  if (selectedPageChipIds.size > 0 && !e.target.closest('.mission-card')) {
+    selectedPageChipIds.clear();
+    refreshPageChipSelectionClasses();
+  }
   if (e.target.closest('.chip-reorder-handle')) return;
   // Walk up the DOM to find the nearest element with data-action
   const actionEl = e.target.closest('[data-action]');
@@ -3919,6 +4084,11 @@ document.addEventListener('click', async (e) => {
     if (Date.now() < suppressPageChipClickUntil) return;
     const tabUrl = actionEl.dataset.tabUrl;
     const tabId = actionEl.dataset.tabId || '';
+    // A plain row click activates the tab and clears the selection.
+    if (selectedPageChipIds.size > 0) {
+      selectedPageChipIds.clear();
+      refreshPageChipSelectionClasses();
+    }
     if (tabUrl || tabId) await focusTab(tabUrl, tabId);
     return;
   }
@@ -4359,6 +4529,34 @@ document.addEventListener('click', (e) => {
   });
 });
 
+/**
+ * togglePageChipSelection(chipId)
+ *
+ * Handle-click toggles a row into the highlight-only selection. Selected
+ * rows reorder together when one of them is dragged within its group.
+ */
+function togglePageChipSelection(chipId) {
+  const key = String(chipId || '');
+  if (!key) return;
+  if (selectedPageChipIds.has(key)) selectedPageChipIds.delete(key);
+  else selectedPageChipIds.add(key);
+  refreshPageChipSelectionClasses();
+}
+
+function refreshPageChipSelectionClasses() {
+  document.querySelectorAll('.page-chip[data-chip-sort-id]').forEach(row => {
+    row.classList.toggle('is-selected', selectedPageChipIds.has(String(row.dataset.chipSortId || '')));
+  });
+}
+
+// Escape clears the highlight-only selection.
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && selectedPageChipIds.size > 0) {
+    selectedPageChipIds.clear();
+    refreshPageChipSelectionClasses();
+  }
+});
+
 document.addEventListener('click', async (e) => {
   const actionEl = e.target.closest('[data-action]');
   if (!actionEl) return;
@@ -4470,7 +4668,10 @@ document.addEventListener('pointerdown', (e) => {
   const chipHandle = e.target.closest('[data-chip-drag-handle="tab"]');
   const chipItem = e.target.closest('[data-chip-sort-id]');
   const chipAction = e.target.closest('.chip-actions');
-  if (chipItem && !chipAction && e.button === 0) {
+  // Drag only starts from the reorder handle. Pressing the row body keeps
+  // its plain click behavior (activate the tab) — arming a drag from the
+  // body would jump to the link on release after a drag gesture.
+  if (chipHandle && chipItem && !chipAction && e.button === 0) {
     const item = chipItem;
     const listEl = item?.parentElement;
     const groupKey = item?.dataset.chipGroupId || '';
@@ -4499,6 +4700,7 @@ document.addEventListener('pointerdown', (e) => {
       offsetX: e.clientX - rect.left,
       offsetY: e.clientY - rect.top,
       moved: false,
+      movingChipIds: getMovingPageChipIds(),
     };
     logPageChipDragDebug('pointerdown', {
       groupKey,
@@ -4506,6 +4708,7 @@ document.addEventListener('pointerdown', (e) => {
       x: Math.round(e.clientX),
       y: Math.round(e.clientY),
       pointerId: e.pointerId,
+      moving: pageChipDragState.movingChipIds.length,
     });
     if (typeof dragHandleEl.setPointerCapture === 'function' && e.pointerId != null) {
       try {
@@ -4514,6 +4717,13 @@ document.addEventListener('pointerdown', (e) => {
       } catch {}
     }
     return;
+  }
+
+  // Pressing the row body (not the handle) must not arm a drag, but it
+  // should also not start a text selection while the user is about to click
+  // the row to activate the tab.
+  if (chipItem && !chipAction && e.button === 0) {
+    e.preventDefault();
   }
 
   const drawerHandle = e.target.closest('.drawer-reorder-handle');
@@ -4580,6 +4790,14 @@ document.addEventListener('pointerup', async (e) => {
       pointerId: e.pointerId,
       moved: pageChipDragState.moved,
     });
+    // A handle press that never moved is a click: toggle the row in the
+    // highlight-only selection instead of starting a drag.
+    const finalDistance = Math.hypot(e.clientX - pageChipDragState.x, e.clientY - pageChipDragState.y);
+    if (finalDistance < 4) {
+      togglePageChipSelection(draggedPageChipId);
+      clearPageChipDragState({ removeNode: false });
+      return;
+    }
     if (!pageChipDragState.moved) {
       const distance = Math.hypot(e.clientX - pageChipDragState.x, e.clientY - pageChipDragState.y);
       if (distance >= 4) {
