@@ -62,10 +62,12 @@ const THEME_MODE_ORDER = ['system', 'light', 'dark'];
 const THEME_PALETTE_ORDER = ['paper', 'sage', 'mist', 'blush'];
 const SAVED_SESSION_RESTORE_MODE_ORDER = ['current-window', 'new-window'];
 const SAVED_SESSION_NAV_DISPLAY_MODE_ORDER = ['icon', 'name'];
+const QUICK_SHORTCUT_OPEN_MODE_ORDER = ['new-tab', 'current-tab'];
 const VALID_THEME_MODES = new Set(THEME_MODE_ORDER);
 const VALID_THEME_PALETTES = new Set(THEME_PALETTE_ORDER);
 const VALID_SAVED_SESSION_RESTORE_MODES = new Set(SAVED_SESSION_RESTORE_MODE_ORDER);
 const VALID_SAVED_SESSION_NAV_DISPLAY_MODES = new Set(SAVED_SESSION_NAV_DISPLAY_MODE_ORDER);
+const VALID_QUICK_SHORTCUT_OPEN_MODES = new Set(QUICK_SHORTCUT_OPEN_MODE_ORDER);
 const THEME_MODE_LABEL_KEYS = {
   system: 'themeModeSystem',
   light: 'themeModeLight',
@@ -253,6 +255,7 @@ let themePreferences = {
   closeDuplicateNewTabsEnabled: false,
   savedSessionRestoreMode: 'new-window',
   savedSessionNavDisplayMode: 'name',
+  quickShortcutOpenMode: 'new-tab',
 };
 
 let systemThemeMediaQuery = null;
@@ -278,6 +281,7 @@ function normalizeThemePreferences(input) {
     : 100;
   const rawSavedSessionRestoreMode = String(next.savedSessionRestoreMode || 'new-window');
   const rawSavedSessionNavDisplayMode = String(next.savedSessionNavDisplayMode || 'name');
+  const rawQuickShortcutOpenMode = String(next.quickShortcutOpenMode || 'new-tab');
   return {
     mode: VALID_THEME_MODES.has(rawMode) ? rawMode : 'system',
     paletteId: VALID_THEME_PALETTES.has(rawPaletteId) ? rawPaletteId : 'paper',
@@ -290,7 +294,12 @@ function normalizeThemePreferences(input) {
     closeDuplicateNewTabsEnabled: next.closeDuplicateNewTabsEnabled === true,
     savedSessionRestoreMode: VALID_SAVED_SESSION_RESTORE_MODES.has(rawSavedSessionRestoreMode) ? rawSavedSessionRestoreMode : 'new-window',
     savedSessionNavDisplayMode: VALID_SAVED_SESSION_NAV_DISPLAY_MODES.has(rawSavedSessionNavDisplayMode) ? rawSavedSessionNavDisplayMode : 'name',
+    quickShortcutOpenMode: VALID_QUICK_SHORTCUT_OPEN_MODES.has(rawQuickShortcutOpenMode) ? rawQuickShortcutOpenMode : 'new-tab',
   };
+}
+
+function getQuickShortcutOpenMode(preferences = themePreferences) {
+  return normalizeThemePreferences(preferences).quickShortcutOpenMode;
 }
 
 function getSavedSessionRestoreMode(preferences = themePreferences) {
@@ -1856,6 +1865,14 @@ document.addEventListener('click', async (e) => {
     if (Date.now() < quickShortcutSuppressClickUntil) return;
     const url = actionEl.dataset.shortcutUrl;
     if (!url) return;
+    if (getQuickShortcutOpenMode() === 'current-tab') {
+      if (typeof navigateCurrentTabToUrl === 'function') {
+        const navigated = await navigateCurrentTabToUrl(url).catch(() => false);
+        if (navigated) return;
+      }
+      await openOrFocusUrl(url);
+      return;
+    }
     await openOrFocusUrl(url);
     return;
   }
@@ -2152,6 +2169,7 @@ async function saveSavedSessionNavDisplayMode(mode) {
 
 globalThis.TabOutThemeControls = {
   filterRealTabs,
+  getQuickShortcutOpenMode,
   getSavedSessionNavDisplayMode,
   getSavedSessionRestoreMode,
   getResolvedThemeDefinition,

@@ -12,6 +12,7 @@ const runtimeJs = fs.readFileSync(path.join(__dirname, 'dashboard-runtime.js'), 
 const themeJs = fs.readFileSync(path.join(__dirname, 'theme-controls.js'), 'utf8');
 const drawerJs = fs.readFileSync(path.join(__dirname, 'drawer-manager.js'), 'utf8');
 const helperJs = fs.readFileSync(path.join(__dirname, 'ui-helpers.js'), 'utf8');
+const i18nJs = fs.readFileSync(path.join(__dirname, 'i18n.js'), 'utf8');
 const tabSessionsJs = fs.existsSync(path.join(__dirname, 'tab-sessions.js'))
   ? fs.readFileSync(path.join(__dirname, 'tab-sessions.js'), 'utf8')
   : '';
@@ -1001,11 +1002,26 @@ test('saved tabs top nav supports icon and name display modes', () => {
   assert.match(css, /\.saved-session-nav-label\s*\{[\s\S]*white-space:\s*nowrap;[\s\S]*text-overflow:\s*ellipsis;/);
 });
 
-test('quick shortcuts always open a new active tab from the dashboard and popup', () => {
+test('quick shortcuts default to a new active tab and can opt into the current tab', () => {
   assert.match(runtimeJs, /async function openOrFocusUrl\(url\)\s*\{\s*if \(!url\) return false;\s*await chrome\.tabs\.create\(\{\s*url,\s*active:\s*true\s*\}\);\s*return true;\s*\}/);
   assert.match(popupJs, /async function openPopupUrl\(url\)\s*\{\s*if \(!url\) return;\s*await chrome\.tabs\.create\(\{\s*url,\s*active:\s*true\s*\}\);\s*window\.close\(\);\s*\}/);
   assert.doesNotMatch(popupJs, /async function findTabByUrl\(/);
   assert.match(runtimeJs, /const fallbackUrl = `https:\/\/www\.google\.com\/search\?q=\$\{encodeURIComponent\(text\)\}`;\s*await navigateCurrentTabToUrl\(fallbackUrl\);/);
+  // New-tab stays the default so existing behavior is preserved.
+  assert.match(themeJs, /quickShortcutOpenMode:\s*'new-tab'/);
+  assert.match(themeJs, /getQuickShortcutOpenMode\(\) === 'current-tab'/);
+  assert.match(themeJs, /typeof navigateCurrentTabToUrl === 'function'/);
+  assert.match(themeJs, /await navigateCurrentTabToUrl\(url\)\.catch\(\(\) => false\)/);
+  assert.match(themeJs, /await openOrFocusUrl\(url\);\s*return;\s*}\s*if \(action === 'close-shortcut-editor'\)/);
+  // The Features panel exposes a switch for the mode and persists it.
+  assert.match(runtimeJs, /id="themeMenuFeaturesPanel"[\s\S]*toggle-quick-shortcut-open-mode/);
+  assert.match(runtimeJs, /type="button" data-action="toggle-quick-shortcut-open-mode"/);
+  assert.match(runtimeJs, /saveThemePreferences\(\{\s*quickShortcutOpenMode: nextMode\s*\}\)/);
+  assert.match(runtimeJs, /toggleSwitch\.classList\.toggle\('is-active', nextMode === 'current-tab'\)/);
+  assert.match(runtimeJs, /toggleSwitch\.setAttribute\('aria-pressed', String\(nextMode === 'current-tab'\)\)/);
+  assert.match(themeJs, /globalThis\.TabOutThemeControls = \{\s*filterRealTabs,\s*getQuickShortcutOpenMode,/);
+  assert.match(i18nJs, /quickShortcutOpenModeLabel: 'Open quick links in current tab'/);
+  assert.match(i18nJs, /quickShortcutOpenModeLabel: '在当前标签页打开快捷链接'/);
 });
 
 test('keyboard focus receives explicit visible treatment', () => {

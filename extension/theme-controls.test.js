@@ -91,6 +91,21 @@ test('normalizeThemePreferences falls back to new-window for invalid saved sessi
   assert.equal(result.savedSessionNavDisplayMode, 'name');
 });
 
+test('normalizeThemePreferences defaults quick shortcut open mode to new-tab', () => {
+  const result = normalizeThemePreferences({});
+  assert.equal(result.quickShortcutOpenMode, 'new-tab');
+});
+
+test('normalizeThemePreferences preserves quick shortcut open mode when current-tab', () => {
+  const result = normalizeThemePreferences({ quickShortcutOpenMode: 'current-tab' });
+  assert.equal(result.quickShortcutOpenMode, 'current-tab');
+});
+
+test('normalizeThemePreferences falls back to new-tab for invalid quick shortcut open mode', () => {
+  const result = normalizeThemePreferences({ quickShortcutOpenMode: 'new-window' });
+  assert.equal(result.quickShortcutOpenMode, 'new-tab');
+});
+
 test('normalizeThemePreferences defaults closeDuplicateNewTabsEnabled to false', () => {
   const result = normalizeThemePreferences({});
   assert.equal(result.closeDuplicateNewTabsEnabled, false);

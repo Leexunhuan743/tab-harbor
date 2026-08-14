@@ -3005,6 +3005,12 @@ function renderWorkspaceThemeTools() {
             </label>
           </div>
           <div class="theme-menu-section">
+            <label class="theme-menu-toggle-label theme-menu-toggle-button-row">
+              <button class="theme-toggle-switch ${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutOpenMode === 'current-tab') ? 'is-active' : ''}" type="button" data-action="toggle-quick-shortcut-open-mode" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutOpenMode === 'current-tab') ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('quickShortcutOpenModeLabel') : 'Open quick links in current tab'}"></button>
+              <span class="theme-menu-label theme-menu-toggle-text">${runtimeT ? runtimeT('quickShortcutOpenModeLabel') : 'Open quick links in current tab'}</span>
+            </label>
+          </div>
+          <div class="theme-menu-section">
             <div class="theme-menu-label">${runtimeT ? runtimeT('settingsExportImport') : 'Export & import'}</div>
             <div class="theme-menu-actions">
               <button class="theme-menu-action" type="button" data-action="export-config">${runtimeT ? runtimeT('settingsExport') : 'Export'}</button>
@@ -3651,6 +3657,17 @@ document.addEventListener('click', async (e) => {
     if (toggleSwitch) {
       toggleSwitch.classList.toggle('is-active', nextEnabled);
       toggleSwitch.setAttribute('aria-pressed', String(nextEnabled));
+    }
+    return;
+  }
+
+  if (action === 'toggle-quick-shortcut-open-mode') {
+    const nextMode = (typeof themePreferences !== 'undefined' && themePreferences.quickShortcutOpenMode === 'current-tab') ? 'new-tab' : 'current-tab';
+    await saveThemePreferences({ quickShortcutOpenMode: nextMode });
+    const toggleSwitch = document.querySelector('[data-action="toggle-quick-shortcut-open-mode"]');
+    if (toggleSwitch) {
+      toggleSwitch.classList.toggle('is-active', nextMode === 'current-tab');
+      toggleSwitch.setAttribute('aria-pressed', String(nextMode === 'current-tab'));
     }
     return;
   }
