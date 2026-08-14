@@ -142,6 +142,10 @@ let suppressPageChipClickUntil = 0;
 // selection; dragging a selected row then reorders the whole selection
 // together within its group.
 let selectedPageChipIds = new Set();
+// Cards whose "+N more" overflow rows were expanded. Kept for the session so
+// re-renders after a drag (or any other refresh) do not silently re-collapse
+// the rows the user opened.
+let expandedPageChipGroupKeys = new Set();
 // Last toggled/selected row id — the anchor for Shift+click / Shift+Space
 // range selection within the same card.
 let pageChipSelectionAnchorId = '';
@@ -2237,7 +2241,10 @@ function previewPageChipOrder(clientX, clientY) {
 
   const placeholder = ensurePageChipPlaceholder(listEl);
   const previousRects = new Map();
-  const items = [...listEl.querySelectorAll('[data-chip-sort-id]:not(.is-dragging)')];
+  // Collapsed overflow rows are hidden (zero-size) and sit after every visible
+  // row; they must not be insertion candidates, or a drop at the bottom of the
+  // visible list would land the batch inside the collapsed section.
+  const items = [...listEl.querySelectorAll('[data-chip-sort-id]:not(.is-dragging):not(.page-chip--collapsed)')];
 
   items.forEach(item => {
     previousRects.set(item.dataset.chipSortId || '', item.getBoundingClientRect());
@@ -2255,7 +2262,11 @@ function previewPageChipOrder(clientX, clientY) {
   if (insertBeforeItem) {
     listEl.insertBefore(placeholder, insertBeforeItem);
   } else {
-    listEl.appendChild(placeholder);
+    // Dropping below the last visible row: park the placeholder right before
+    // the collapsed block (i.e. as the last visible row), not at the end.
+    const firstCollapsed = listEl.querySelector('.page-chip--collapsed');
+    if (firstCollapsed) listEl.insertBefore(placeholder, firstCollapsed);
+    else listEl.appendChild(placeholder);
   }
 
   animatePageChipItems(listEl, previousRects);
@@ -2444,7 +2455,10 @@ async function finishPageChipDrag() {
             .filter(el => movingSet.has(String(el.dataset.chipSortId || '')));
           for (const el of movingEls) targetListEl.insertBefore(el, pageChipPlaceholderEl);
         }
-        requiresOpenTabsRebuild = false;
+        // Defensive: the order was persisted from the placeholder position; if
+        // the placeholder is somehow missing, fall back to a full re-render so
+        // the DOM cannot diverge from the stored order.
+        requiresOpenTabsRebuild = !pageChipPlaceholderEl;
       } else if (targetGroupKey) {
         const movedGroup = await moveDraggedPageChipToGroup(targetGroupKey);
         if (movedGroup) {
@@ -2484,6 +2498,14 @@ async function finishPageChipDrag() {
           // so drop the selection to avoid residual highlights.
           clearPageChipSelection();
         }
+      } else {
+        // Dropped outside any valid target (dead zone): cancel the drag and
+        // restore the rows. Removing them here would hide open tabs from the
+        // view until the next full render, since the source card is not
+        // patched in this path.
+        logPageChipDragDebug('finish-dead-zone-cancel', { moved });
+        clearPageChipDragState({ removeNode: false });
+        return true;
       }
 
       clearPageChipDragState({ removeNode: requiresOpenTabsRebuild });
@@ -2969,46 +2991,63 @@ function checkTabOutDupes() {
    OVERFLOW CHIPS ("+N more" expand button in domain cards)
    ---------------------------------------------------------------- */
 
-function buildOverflowChips(hiddenTabs, urlCounts = {}) {
-  const hiddenChips = hiddenTabs.map(tab => {
-    const label    = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), '');
-    const count    = urlCounts[tab.url] || 1;
-    const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
-    const chipClass = count > 1 ? ' chip-has-dupes' : '';
-    const safeUrl   = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(tab.url || '') : (tab.url || '').replace(/"/g, '&quot;');
-    const safeTitle = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(label) : label.replace(/"/g, '&quot;');
-    const safeLabel = runtimeEscapeHtml ? runtimeEscapeHtml(label) : label;
-    const iconData = runtimeGetIconSources(tab, 16);
-    const faviconUrl = iconData.sources[0] || '';
-    const fallbackUrl = iconData.sources[1] || '';
-    const fallbackLabel = runtimeGetFallbackLabel(label, iconData.hostname);
-    const safeFallbackUrl = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(fallbackUrl) : fallbackUrl.replace(/"/g, '&quot;');
-    const safeTabId = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(String(tab.id || '')) : String(tab.id || '').replace(/"/g, '&quot;');
-    return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-id="${safeTabId}" data-tab-url="${safeUrl}" aria-label="${safeTitle}">
+/**
+ * buildPageChipHtml(tab, group, urlCounts, collapsed)
+ *
+ * Renders one open-tab row. Used for both the visible rows and the overflow
+ * rows (collapsed = true) so every row is identical: drag handle, sort id,
+ * group id, selection highlight and aria state. Collapsed rows stay in the
+ * list as direct children — hidden with a CSS class — so the drag machinery
+ * (placeholder, drop index, order save) treats them like any other row.
+ */
+function buildPageChipHtml(tab, group, urlCounts = {}, collapsed = false) {
+  let label = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), group?.domain || '');
+  // For localhost tabs, prepend port number so you can tell projects apart
+  try {
+    const parsed = new URL(tab.url);
+    if (parsed.hostname === 'localhost' && parsed.port) label = `${parsed.port} ${label}`;
+  } catch {}
+  const count    = urlCounts[tab.url] || 1;
+  const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
+  const sortId = getPrimaryTabOrderToken(tab);
+  const isSelected = selectedPageChipIds.has(String(sortId || ''));
+  const chipClass = `${count > 1 ? ' chip-has-dupes' : ''}${tab.discarded ? ' page-chip--discarded' : ''}${isSelected ? ' is-selected' : ''}${collapsed ? ' page-chip--collapsed' : ''}`;
+  const safeUrl   = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(tab.url || '') : (tab.url || '').replace(/"/g, '&quot;');
+  const safeTitle = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(label) : label.replace(/"/g, '&quot;');
+  const safeLabel = runtimeEscapeHtml ? runtimeEscapeHtml(label) : label;
+  const safeSortId = (runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(sortId) : String(sortId).replace(/"/g, '&quot;'));
+  const safeGroupId = (runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(group?.domain || '') : String(group?.domain || '').replace(/"/g, '&quot;'));
+  const iconData = runtimeGetIconSources(tab, 16);
+  const faviconUrl = iconData.sources[0] || '';
+  const fallbackUrl = iconData.sources[1] || '';
+  const fallbackLabel = runtimeGetFallbackLabel(label, iconData.hostname);
+  const safeFallbackUrl = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(fallbackUrl) : fallbackUrl.replace(/"/g, '&quot;');
+  return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" data-chip-sort-id="${safeSortId}" data-chip-group-id="${safeGroupId}" aria-label="${safeTitle}">
+      <button class="drawer-reorder-handle chip-reorder-handle" type="button" data-chip-drag-handle="tab" aria-pressed="${isSelected ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('dragReorderTabSelect') : 'Drag to reorder; Enter or Space to select'}">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M8 6h.01M8 12h.01M8 18h.01M16 6h.01M16 12h.01M16 18h.01" /></svg>
+      </button>
       ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" data-fallback-src="${safeFallbackUrl}" data-fallback-srcset="${runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(JSON.stringify(iconData.sources.slice(2))) : JSON.stringify(iconData.sources.slice(2)).replace(/"/g, '&quot;')}">` : ''}
       <span class="chip-favicon chip-favicon-fallback"${faviconUrl ? ' style="display:none"' : ''}>${fallbackLabel}</span>
       <span class="chip-text">${safeLabel}</span>${dupeTag}
       <div class="chip-actions">
-        ${sleepControlEnabled && !tab.active ? `
-        <button class="chip-action chip-discard" type="button" data-action="discard-tab" data-tab-id="${tab.id}" aria-label="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}" data-tooltip="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}">
+        ${sleepControlEnabled && !tab.active ? `<button class="chip-action chip-discard" data-action="discard-tab" data-tab-id="${tab.id}" aria-label="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}" data-tooltip="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}">
           ${ICONS.moon}
-        </button>
-        ` : ''}
-        <button class="chip-action chip-session-save" type="button" data-action="save-single-tab-session" data-tab-id="${safeTabId}" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" aria-label="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}" data-tooltip="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}">
+        </button>` : ''}
+        <button class="chip-action chip-session-save" data-action="save-single-tab-session" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" aria-label="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}" data-tooltip="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}">
           ${ICONS.archive}
         </button>
-        <button class="chip-action chip-close" type="button" data-action="close-single-tab" data-tab-id="${safeTabId}" data-tab-url="${safeUrl}" aria-label="${runtimeT ? runtimeT('closeThisTab') : 'Close this tab'}" data-tooltip="${runtimeT ? runtimeT('closeThisTab') : 'Close this tab'}">
+        <button class="chip-action chip-close" data-action="close-single-tab" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" aria-label="${runtimeT ? runtimeT('closeThisTab') : 'Close this tab'}" data-tooltip="${runtimeT ? runtimeT('closeThisTab') : 'Close this tab'}">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
         </button>
       </div>
     </div>`;
-  }).join('');
+}
 
+function buildOverflowChips(extraCount) {
   return `
-    <div class="page-chips-overflow" style="display:none">${hiddenChips}</div>
-    <div class="page-chip page-chip-overflow clickable" data-action="expand-chips">
-      <span class="chip-text">${runtimeT ? runtimeT('moreCount', { count: hiddenTabs.length }) : `+${hiddenTabs.length} more`}</span>
-    </div>`;
+    <button type="button" class="page-chip page-chip-overflow clickable" data-action="expand-chips">
+      <span class="chip-text">${runtimeT ? runtimeT('moreCount', { count: extraCount }) : `+${extraCount} more`}</span>
+    </button>`;
 }
 
 
@@ -3050,50 +3089,16 @@ function renderDomainCard(group) {
     : '';
 
   const orderedTabs = getOrderedUniqueTabsForGroup(group);
-  const visibleTabs = orderedTabs.slice(0, 8);
-  const extraCount  = orderedTabs.length - visibleTabs.length;
+  const extraCount  = Math.max(0, orderedTabs.length - 8);
 
-  const pageChips = visibleTabs.map(tab => {
-    let label = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), group.domain);
-    // For localhost tabs, prepend port number so you can tell projects apart
-    try {
-      const parsed = new URL(tab.url);
-      if (parsed.hostname === 'localhost' && parsed.port) label = `${parsed.port} ${label}`;
-    } catch {}
-    const count    = urlCounts[tab.url];
-    const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
-    const chipClass = `${count > 1 ? ' chip-has-dupes' : ''}${tab.discarded ? ' page-chip--discarded' : ''}${selectedPageChipIds.has(String(getPrimaryTabOrderToken(tab))) ? ' is-selected' : ''}`;
-    const safeUrl   = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(tab.url || '') : (tab.url || '').replace(/"/g, '&quot;');
-    const safeTitle = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(label) : label.replace(/"/g, '&quot;');
-    const safeLabel = runtimeEscapeHtml ? runtimeEscapeHtml(label) : label;
-    const sortId = getPrimaryTabOrderToken(tab);
-    const safeSortId = (runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(sortId) : String(sortId).replace(/"/g, '&quot;'));
-    const safeGroupId = (runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(group.domain) : String(group.domain).replace(/"/g, '&quot;'));
-    const iconData = runtimeGetIconSources(tab, 16);
-    const faviconUrl = iconData.sources[0] || '';
-    const fallbackUrl = iconData.sources[1] || '';
-    const fallbackLabel = runtimeGetFallbackLabel(label, iconData.hostname);
-    const safeFallbackUrl = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(fallbackUrl) : fallbackUrl.replace(/"/g, '&quot;');
-    return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" data-chip-sort-id="${safeSortId}" data-chip-group-id="${safeGroupId}" aria-label="${safeTitle}">
-      <button class="drawer-reorder-handle chip-reorder-handle" type="button" data-chip-drag-handle="tab" aria-pressed="${selectedPageChipIds.has(sortId) ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('dragReorderTabSelect') : 'Drag to reorder; Enter or Space to select'}">
-        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M8 6h.01M8 12h.01M8 18h.01M16 6h.01M16 12h.01M16 18h.01" /></svg>
-      </button>
-      ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" data-fallback-src="${safeFallbackUrl}" data-fallback-srcset="${runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(JSON.stringify(iconData.sources.slice(2))) : JSON.stringify(iconData.sources.slice(2)).replace(/"/g, '&quot;')}">` : ''}
-      <span class="chip-favicon chip-favicon-fallback"${faviconUrl ? ' style="display:none"' : ''}>${fallbackLabel}</span>
-      <span class="chip-text">${safeLabel}</span>${dupeTag}
-      <div class="chip-actions">
-        ${sleepControlEnabled && !tab.active ? `<button class="chip-action chip-discard" data-action="discard-tab" data-tab-id="${tab.id}" aria-label="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}" data-tooltip="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}">
-          ${ICONS.moon}
-        </button>` : ''}
-        <button class="chip-action chip-session-save" data-action="save-single-tab-session" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" aria-label="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}" data-tooltip="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}">
-          ${ICONS.archive}
-        </button>
-        <button class="chip-action chip-close" data-action="close-single-tab" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" aria-label="${runtimeT ? runtimeT('closeThisTab') : 'Close this tab'}" data-tooltip="${runtimeT ? runtimeT('closeThisTab') : 'Close this tab'}">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
-        </button>
-      </div>
-    </div>`;
-  }).join('') + (extraCount > 0 ? buildOverflowChips(orderedTabs.slice(8), urlCounts) : '');
+  // Every row (visible + overflow) goes through the same renderer, so the
+  // expanded "+N more" rows look and behave exactly like the first eight.
+  // Overflow rows are direct list children hidden with a CSS class — they
+  // keep their drag handles, sort ids and stored order. Cards whose overflow
+  // was expanded stay expanded across re-renders (drag commits, refreshes).
+  const isOverflowExpanded = expandedPageChipGroupKeys.has(String(group.domain));
+  const pageChips = orderedTabs.map((tab, index) => buildPageChipHtml(tab, group, urlCounts, index >= 8 && !isOverflowExpanded)).join('')
+    + (extraCount > 0 && !isOverflowExpanded ? buildOverflowChips(extraCount) : '');
 
   const saveGroupButton = `
       <button class="group-action-icon" type="button" data-action="save-domain-session" data-domain-id="${stableId}" aria-label="${runtimeT ? runtimeT('saveGroupSession') : 'Save group session'}" data-tooltip="${runtimeT ? runtimeT('saveGroupSession') : 'Save group session'}">
@@ -3726,7 +3731,11 @@ function renderOpenTabsArea(realTabs = getRealTabs()) {
   }
 
   // Re-apply the selection highlight and prune ids whose rows are gone; this
-  // also keeps the batch action bar in sync after any re-render.
+  // also keeps the batch action bar in sync after any re-render. Expanded
+  // overflow state for cards that no longer exist is dropped.
+  for (const key of expandedPageChipGroupKeys) {
+    if (!domainGroups.some(group => String(group.domain) === key)) expandedPageChipGroupKeys.delete(key);
+  }
   refreshPageChipSelectionClasses();
 }
 
@@ -4162,10 +4171,18 @@ document.addEventListener('click', async (e) => {
 
   // ---- Expand overflow chips ("+N more") ----
   if (action === 'expand-chips') {
-    const overflowContainer = actionEl.parentElement.querySelector('.page-chips-overflow');
-    if (overflowContainer) {
-      overflowContainer.style.display = 'contents';
-      actionEl.remove();
+    const cardEl = actionEl.closest('.mission-card');
+    const collapsed = cardEl ? [...cardEl.querySelectorAll('.page-chip--collapsed')] : [];
+    collapsed.forEach(chip => chip.classList.remove('page-chip--collapsed'));
+    actionEl.remove();
+    // Remember the expansion so drag commits and refreshes keep it open.
+    const groupKey = String(cardEl?.dataset?.groupId || '');
+    if (groupKey) expandedPageChipGroupKeys.add(groupKey);
+    // Keyboard activation should hand focus to the newly revealed rows
+    // instead of dropping it to the page body.
+    if (e.detail === 0) {
+      const firstHandle = collapsed[0]?.querySelector('[data-chip-drag-handle="tab"]');
+      if (firstHandle) firstHandle.focus();
     }
     return;
   }
@@ -4754,7 +4771,8 @@ function selectPageChipRange(targetId, anchorId) {
     return;
   }
   const card = targetEl.closest('.mission-card');
-  const rows = [...card.querySelectorAll('.page-chip[data-chip-sort-id]')];
+  // Collapsed overflow rows are not part of the visible range.
+  const rows = [...card.querySelectorAll('.page-chip[data-chip-sort-id]:not(.page-chip--collapsed)')];
   const start = rows.indexOf(anchorEl);
   const end = rows.indexOf(targetEl);
   if (start === -1 || end === -1) {
@@ -4816,15 +4834,13 @@ function syncPageChipBatchBar() {
 }
 
 // Escape clears the highlight-only selection; a drag in flight is cancelled
-// first so it cannot commit a stale batch. Space on a reorder handle must not
-// scroll the page before the toggle click fires.
+// first so it cannot commit a stale batch. Space on a focused reorder handle
+// is left to the native <button> activation (keyup → click), which already
+// suppresses page scrolling for buttons — preventing the keydown would cancel
+// that activation and break the keyboard toggle.
 let pageChipLastKeydownAt = 0;
 document.addEventListener('keydown', (e) => {
   pageChipLastKeydownAt = Date.now();
-  if (e.key === ' ' && e.target.closest?.('.chip-reorder-handle')) {
-    e.preventDefault();
-    return;
-  }
   if (e.key !== 'Escape') return;
   if (draggedPageChipId && pageChipDragState) {
     clearPageChipDragState({ removeNode: false });

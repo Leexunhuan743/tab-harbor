@@ -2052,6 +2052,12 @@ body.page-chip-list-dragging .page-chip.is-selected:not(.is-dragging) {
     border-bottom: none;
 }
 
+/* Overflow rows ("+N more" expansion) stay out of the list until expanded.
+   They are direct list children so drag/selection still see them. */
+.page-chip--collapsed {
+    display: none;
+}
+
 /* Favicon */
 .chip-favicon {
     width: 14px;

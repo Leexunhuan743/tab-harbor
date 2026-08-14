@@ -90,6 +90,15 @@ test('buildBatchOrderedIdsFromList places the whole batch at the drop point', ()
     fn(list([globalThis.pageChipPlaceholderEl, chipNode('A'), chipNode('B'), chipNode('C'), chipNode('D'), chipNode('E')]), ['C', 'D']),
     ['C', 'D', 'A', 'B', 'E']
   );
+
+  // Drop at the bottom of a card with collapsed overflow rows: the placeholder
+  // sits right before the collapsed block (index 8), so the batch lands as the
+  // last VISIBLE row and must not fall into the collapsed section.
+  globalThis.pageChipPlaceholderEl = placeholderNode();
+  assert.deepEqual(
+    fn(list([chipNode('c1'), chipNode('c2'), chipNode('c3'), chipNode('c4'), chipNode('c5'), chipNode('c6'), chipNode('c7'), chipNode('c8'), globalThis.pageChipPlaceholderEl, chipNode('c9'), chipNode('c10')]), ['c1']),
+    ['c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'c1', 'c9', 'c10']
+  );
 });
 
 test('buildBatchOrderedIdsFromList ignores non-chip children when computing the drop index', () => {
@@ -194,7 +203,7 @@ test('chip drags refuse a second pointer (re-entrancy guard)', () => {
 
 test('selection state is exposed via aria-pressed on the handle', () => {
   assert.match(runtimeJs, /handle\.setAttribute\('aria-pressed', selected \? 'true' : 'false'\)/);
-  assert.match(runtimeJs, /data-chip-drag-handle="tab" aria-pressed="\$\{selectedPageChipIds\.has\(sortId\) \? 'true' : 'false'\}"/);
+  assert.match(runtimeJs, /data-chip-drag-handle="tab" aria-pressed="\$\{isSelected \? 'true' : 'false'\}"/);
   assert.match(runtimeJs, /runtimeT\('dragReorderTabSelect'\)/);
 });
 
@@ -250,4 +259,58 @@ test('batch drag badge counts only rows that will actually reorder on the source
 test('selection clears after cross-group moves and new-group creation', () => {
   assert.match(runtimeJs, /logPageChipDragDebug\('finish-group-move', \{ groupKey: movedGroup\.groupKey, groupName: movedGroup\.groupName \}\);\s*(?:\/\/[^\n]*\n\s*)*clearPageChipSelection\(\);/);
   assert.match(runtimeJs, /logPageChipDragDebug\('finish-new-group', \{ groupName: createdGroup\.name \}\);\s*(?:\/\/[^\n]*\n\s*)*clearPageChipSelection\(\);/);
+});
+
+test('expanded overflow rows are full rows: handle, sort id, selection, drag', () => {
+  assert.match(runtimeJs, /function buildPageChipHtml\(tab, group, urlCounts = \{\}, collapsed = false\) \{/);
+  assert.match(runtimeJs, /data-chip-sort-id="\$\{safeSortId\}" data-chip-group-id="\$\{safeGroupId\}"/);
+  assert.match(runtimeJs, /const pageChips = orderedTabs\.map\(\(tab, index\) => buildPageChipHtml\(tab, group, urlCounts, index >= 8 && !isOverflowExpanded\)\)\.join\(''\)/);
+  // Overflow rows are direct list children collapsed with a CSS class — not a
+  // hidden wrapper that would break drag ordering and selection.
+  assert.doesNotMatch(runtimeJs, /page-chips-overflow/);
+  assert.match(runtimeJs, /\$\{collapsed \? ' page-chip--collapsed' : ''\}/);
+});
+
+test('expanded overflow state survives re-renders (drag commits, refreshes)', () => {
+  assert.match(runtimeJs, /let expandedPageChipGroupKeys = new Set\(\);/);
+  assert.match(runtimeJs, /const isOverflowExpanded = expandedPageChipGroupKeys\.has\(String\(group\.domain\)\);/);
+  assert.match(runtimeJs, /\(extraCount > 0 && !isOverflowExpanded \? buildOverflowChips\(extraCount\) : ''\)/);
+  assert.match(runtimeJs, /if \(groupKey\) expandedPageChipGroupKeys\.add\(groupKey\);/);
+  assert.match(runtimeJs, /for \(const key of expandedPageChipGroupKeys\) \{[\s\S]{0,200}expandedPageChipGroupKeys\.delete\(key\);/);
+});
+
+test('expand action reveals collapsed chips as regular list rows', () => {
+  assert.match(runtimeJs, /if \(action === 'expand-chips'\) \{[\s\S]{0,300}const collapsed = cardEl \? \[\.\.\.cardEl\.querySelectorAll\('\.page-chip--collapsed'\)\] : \[\];\s*collapsed\.forEach\(chip => chip\.classList\.remove\('page-chip--collapsed'\)\);/);
+});
+
+test('collapsed overflow rows are hidden with CSS only', () => {
+  const css = fs.readFileSync(path.join(__dirname, 'style.css'), 'utf8');
+  assert.match(css, /\.page-chip--collapsed \{\s*display: none;/);
+});
+
+test('drops at the bottom of a card stay in the visible section (overflow fix)', () => {
+  // Collapsed rows must never be placeholder insertion candidates, and a drop
+  // below the last visible row parks the placeholder before the collapsed block.
+  assert.match(runtimeJs, /\[\.\.\.listEl\.querySelectorAll\('\[data-chip-sort-id\]:not\(\.is-dragging\):not\(\.page-chip--collapsed\)'\)\]/);
+  assert.match(runtimeJs, /const firstCollapsed = listEl\.querySelector\('\.page-chip--collapsed'\);\s*if \(firstCollapsed\) listEl\.insertBefore\(placeholder, firstCollapsed\);/);
+});
+
+test('same-group commit falls back to a re-render when the placeholder is missing', () => {
+  assert.match(runtimeJs, /requiresOpenTabsRebuild = !pageChipPlaceholderEl;/);
+});
+
+test('dropping outside any target cancels the drag instead of removing rows', () => {
+  assert.match(runtimeJs, /logPageChipDragDebug\('finish-dead-zone-cancel', \{ moved \}\);\s*clearPageChipDragState\(\{ removeNode: false \}\);\s*return true;/);
+});
+
+test('range selection only walks visible rows (collapsed rows excluded)', () => {
+  assert.match(runtimeJs, /const rows = \[\.\.\.card\.querySelectorAll\('\.page-chip\[data-chip-sort-id\]:not\(\.page-chip--collapsed\)'\)\];/);
+});
+
+test('Space on a focused handle keeps the native button activation (no keydown preventDefault)', () => {
+  assert.match(runtimeJs, /document\.addEventListener\('keydown', \(e\) => \{\s*pageChipLastKeydownAt = Date\.now\(\);\s*if \(e\.key !== 'Escape'\) return;/);
+});
+
+test('keyboard expansion hands focus to the first revealed row', () => {
+  assert.match(runtimeJs, /if \(e\.detail === 0\) \{\s*const firstHandle = collapsed\[0\]\?\.querySelector\('\[data-chip-drag-handle="tab"\]'\);\s*if \(firstHandle\) firstHandle\.focus\(\);/);
 });

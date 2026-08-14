@@ -135,8 +135,8 @@ test('desk settings separates appearance and feature controls', () => {
 });
 
 test('manual sleep control places per-tab moon action first', () => {
-  assert.match(runtimeJs, /function buildOverflowChips[\s\S]*<div class="chip-actions">\s*\$\{sleepControlEnabled && !tab\.active \? `\s*<button class="chip-action chip-discard"[\s\S]*<button class="chip-action chip-session-save"/);
-  assert.match(runtimeJs, /function renderDomainCard[\s\S]*<div class="chip-actions">\s*\$\{sleepControlEnabled && !tab\.active \? `<button class="chip-action chip-discard"[\s\S]*<button class="chip-action chip-session-save"/);
+  assert.match(runtimeJs, /function buildPageChipHtml\(tab, group, urlCounts = \{\}, collapsed = false\) \{[\s\S]*<div class="chip-actions">\s*\$\{sleepControlEnabled && !tab\.active \? `<button class="chip-action chip-discard"[\s\S]*<button class="chip-action chip-session-save"/);
+  assert.match(runtimeJs, /const pageChips = orderedTabs\.map\(\(tab, index\) => buildPageChipHtml\(tab, group, urlCounts, index >= 8 && !isOverflowExpanded\)\)\.join\(''\)[\s\S]*buildOverflowChips\(extraCount\)/);
 });
 
 test('icon-only actions use themed tooltips instead of native title hovers', () => {
@@ -790,7 +790,7 @@ test('todo list and tab chips expose drag handles with drag-state styling', () =
   // dragged row's card — otherwise moved rows linger in their old cards.
   assert.match(appJs, /for \(const g of \(movedGroup\.sourceGroupKeys \|\| \[\]\)\) changedGroupKeys\.add\(g\);/);
   assert.match(appJs, /return \{ \.\.\.created\.group, sourceGroupKeys \};/);
-  assert.match(appJs, /selectedPageChipIds\.has\(String\(getPrimaryTabOrderToken\(tab\)\)\) \? ' is-selected' : ''/);
+  assert.match(appJs, /\$\{isSelected \? ' is-selected' : ''\}/);
   assert.match(css, /\.page-chip\.is-selected \{[\s\S]*background: color-mix\(in srgb, var\(--workspace-chip-bg\) 82%, var\(--workspace-accent-border\) 18%\);/);
   // Drag feedback: the rest of the selection dims and a count badge appears.
   assert.match(css, /body\.page-chip-list-dragging \.page-chip\.is-selected:not\(\.is-dragging\) \{\s*opacity: 0\.55;/);
@@ -834,7 +834,7 @@ test('todo list and tab chips expose drag handles with drag-state styling', () =
   assert.match(appJs, /dragHandleEl\.setPointerCapture\(e\.pointerId\)/);
   assert.match(appJs, /async function finishPageChipDrag\(\)/);
   assert.match(appJs, /let requiresOpenTabsRebuild = true;/);
-  assert.match(appJs, /requiresOpenTabsRebuild = false;/);
+  assert.match(appJs, /requiresOpenTabsRebuild = !pageChipPlaceholderEl;/);
   assert.match(appJs, /clearPageChipDragState\(\{ removeNode: requiresOpenTabsRebuild \}\)/);
   assert.match(appJs, /if \(!requiresOpenTabsRebuild\) \{[\s\S]*finish-local-reorder-commit[\s\S]*await syncChromeTabGroupsWithoutImportEcho\(\);/);
   assert.match(appJs, /document\.addEventListener\('pointercancel', async \(e\) => \{/);
