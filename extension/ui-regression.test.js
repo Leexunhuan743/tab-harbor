@@ -1139,8 +1139,8 @@ test('popup scrolls inside panels only, never the document', () => {
   // The popup clamps its height and hides document overflow so the native
   // window scrollbar never appears next to the panel scrollbars; the width
   // is fixed so switching views never resizes the popup window.
-  assert.match(popupCss, /html, body \{\s*[\s\S]*width: 400px;[\s\S]*height: fit-content;[\s\S]*max-height: 600px;[\s\S]*overflow: hidden;/);
-  assert.match(popupCss, /\.popup-app \{\s*[\s\S]*height: fit-content;[\s\S]*max-height: 600px;/);
+  assert.match(popupCss, /html, body \{\s*[\s\S]*width: 400px;[\s\S]*height: fit-content;[\s\S]*max-height: 520px;[\s\S]*overflow: hidden;/);
+  assert.match(popupCss, /\.popup-app \{\s*[\s\S]*height: fit-content;[\s\S]*max-height: 520px;/);
   assert.match(popupCss, /\.popup-tabs-list \{[\s\S]*overflow-y: auto;/);
   assert.match(popupCss, /\.popup-shortcuts-grid \{[\s\S]*overflow-y: auto;/);
   // Panel scrollbars are hidden like the nav's, so transient overflow (e.g.

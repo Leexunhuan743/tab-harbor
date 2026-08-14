@@ -11,7 +11,7 @@ html, body {
   /* Override style.css body { min-height: 100vh } so the window fits its
      content up to max-height instead of always filling the viewport. */
   min-height: 0;
-  max-height: 600px;
+  max-height: 520px;
   /* The inner panels (.popup-tabs-list, .popup-shortcuts-grid) own the
      vertical scroll; never let the popup document scroll too. */
   overflow: hidden;
@@ -39,7 +39,7 @@ body.popup-shell {
 .popup-app {
   width: 100%;
   height: fit-content;
-  max-height: 600px;
+  max-height: 520px;
   display: flex;
   flex-direction: column;
   padding: 14px 16px;
