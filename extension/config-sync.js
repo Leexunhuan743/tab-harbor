@@ -26,6 +26,7 @@
     'chromeTabGroupsMeta',
     'importedChromeSessionGroups',
     'deferredTriggerPosition',
+    'popupView',
   ];
 
   const STORAGE_DEFAULTS = {
@@ -44,6 +45,7 @@
     chromeTabGroupsMeta: null,
     importedChromeSessionGroups: { entries: [] },
     deferredTriggerPosition: { top: null },
+    popupView: 'shortcuts',
   };
 
   function isValidConfigObject(value) {
@@ -75,6 +77,7 @@
       return Array.isArray(value);
     }
     if (key === 'languagePreference') return typeof value === 'string';
+    if (key === 'popupView') return typeof value === 'string';
     if (key === 'chromeTabGroupsEnabled') return typeof value === 'boolean';
     return isValidConfigObject(value);
   }

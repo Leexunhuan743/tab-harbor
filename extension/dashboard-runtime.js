@@ -2565,10 +2565,12 @@ async function runDefaultSearch(query) {
       validSearchUrl = false;
     }
     if (validSearchUrl) {
-      await navigateCurrentTabToUrl(searchUrl);
-      return;
+      const navigated = await navigateCurrentTabToUrl(searchUrl).catch(() => false);
+      if (navigated) return;
+      // Navigation failed (rare) — fall through to the browser search path.
+    } else {
+      showToast(runtimeT ? runtimeT('toastInvalidCustomSearchUrl') : 'Invalid custom search URL, using browser default');
     }
-    showToast(runtimeT ? runtimeT('toastInvalidCustomSearchUrl') : 'Invalid custom search URL, using browser default');
   }
 
   if (chrome.search?.query) {
@@ -4914,10 +4916,13 @@ async function initializeDashboardRuntime() {
   if (navHost && !navHost.dataset.wheelHijackAttached) {
     navHost.dataset.wheelHijackAttached = '1';
     // The nav scrollbars are hidden; let the vertical wheel scroll the
-    // group lists horizontally (delegated so it survives re-renders).
+    // group lists horizontally (delegated so it survives re-renders) — but
+    // only when the list can actually scroll, so a wheel over a short nav
+    // passes through instead of trapping the page.
     navHost.addEventListener('wheel', (e) => {
       const list = e.target.closest('.group-nav-list');
       if (!list) return;
+      if (list.scrollWidth <= list.clientWidth) return;
       if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
         e.preventDefault();
         list.scrollLeft += e.deltaY;

@@ -260,10 +260,15 @@ test('toast helper tolerates missing optional action button node', () => {
   assert.match(helperJs, /\} else if \(toastAction\) \{/);
 });
 
-test('popup group nav keeps visible fallback labels and popup-local image fallback handling', () => {
+test('popup group nav fallback is consumed by the shared image fallback pipeline only', () => {
   assert.match(popupJs, /class="group-nav-fallback"/);
   assert.match(popupJs, /data-fallback-src=/);
-  assert.match(popupJs, /document\.addEventListener\('error', handlePopupGroupNavImageError, true\)/);
+  // The popup must NOT register its own document-level error handler: ui-helpers
+  // already owns a capture listener for the same data-fallback-* queue, and two
+  // consumers would skip fallback levels (double consumption).
+  assert.doesNotMatch(popupJs, /handlePopupGroupNavImageError/);
+  assert.match(helperJs, /__tabHarborImageFallbackBound/);
+  assert.match(popupHtml, /<script src="\.\.\/ui-helpers\.js"><\/script>/);
 });
 
 test('popup auto-refreshes when tabs and local storage change', () => {
@@ -274,9 +279,12 @@ test('popup auto-refreshes when tabs and local storage change', () => {
   assert.match(popupJs, /const POPUP_REFRESH_KEYS = new Set/);
 });
 
-test('popup opens tabs from other windows in the current window instead of focusing the old window', () => {
+test('popup activates a cross-window tab in its own window instead of duplicating it', () => {
   assert.match(popupJs, /targetTab\.windowId !== currentWindow\.id/);
-  assert.match(popupJs, /await chrome\.tabs\.create\(\{\s*windowId: currentWindow\.id,/);
+  // Mirrors the dashboard focus-tab behavior: activate the existing tab and
+  // focus its window, never copy the URL into the current window.
+  assert.match(popupJs, /await chrome\.tabs\.update\(targetTab\.id, \{ active: true \}\)/);
+  assert.match(popupJs, /await chrome\.windows\.update\(targetTab\.windowId, \{ focused: true \}\)/);
   assert.match(popupJs, /await openPopupTab\(tabId, actionEl\.dataset\.url \|\| ''\)/);
 });
 
@@ -1040,8 +1048,15 @@ test('quick links per row can be fixed to 4 or 5 columns in landscape only', () 
   assert.match(themeJs, /quickTabsList\.classList\.toggle\('is-fixed-cols-5', themePreferences\.quickShortcutCols === '5'\)/);
   // Landscape (>=961px) applies fixed tracks; portrait keeps auto-fill.
   assert.match(css, /@media \(min-width: 961px\)[\s\S]*\.quick-tabs-grid\.is-fixed-cols-4 \{\s*grid-template-columns: repeat\(4, 1fr\);[\s\S]*\.quick-tabs-grid\.is-fixed-cols-5 \{\s*grid-template-columns: repeat\(5, 1fr\);[\s\S]*\.quick-tabs-grid\.is-fixed-cols-4 \.quick-shortcut-card,[\s\S]*\.quick-tabs-grid\.is-fixed-cols-5 \.quick-shortcut-card \{\s*width: 100%;/);
-  // The fixed rules must NOT leak into the portrait (max-width: 960px) block.
-  assert.doesNotMatch(css, /@media \(max-width: 960px\)[\s\S]{0,600}is-fixed-cols/);
+  // The fixed rules must NOT leak into the portrait (max-width: 960px) block —
+  // scan the whole block, not just its head.
+  const portraitStart = css.indexOf('@media (max-width: 960px)');
+  const portraitEnd = css.indexOf('@media (prefers-reduced-motion');
+  const portraitBlock = portraitStart >= 0 && portraitEnd > portraitStart
+    ? css.slice(portraitStart, portraitEnd)
+    : '';
+  assert.ok(portraitBlock.length > 100, 'portrait media block should be present for the leak check');
+  assert.doesNotMatch(portraitBlock, /is-fixed-cols/);
   // The Appearance panel exposes an Auto / 4 / 5 choice row.
   assert.match(runtimeJs, /data-action="select-quick-shortcut-cols"[\s\S]*data-cols="auto"[\s\S]*data-cols="4"[\s\S]*data-cols="5"/);
   assert.match(runtimeJs, /const cols = \['auto', '4', '5'\]\.includes\(actionEl\.dataset\.cols\) \? actionEl\.dataset\.cols : 'auto';/);
@@ -1071,7 +1086,7 @@ test('search engine can be customized with presets or a custom URL', () => {
   assert.match(themeJs, /return `\$\{url\}\$\{encoded\}`;/);
   // runDefaultSearch prefers the configured engine, then falls back to chrome.search.
   assert.match(runtimeJs, /const searchUrl = runtimeBuildSearchUrlForQuery \? runtimeBuildSearchUrlForQuery\(text\) : '';/);
-  assert.match(runtimeJs, /if \(searchUrl\) \{\s*let validSearchUrl = false;[\s\S]*if \(validSearchUrl\) \{\s*await navigateCurrentTabToUrl\(searchUrl\);\s*return;\s*\}/);
+  assert.match(runtimeJs, /if \(searchUrl\) \{\s*let validSearchUrl = false;[\s\S]*if \(validSearchUrl\) \{\s*const navigated = await navigateCurrentTabToUrl\(searchUrl\)\.catch\(\(\) => false\);\s*if \(navigated\) return;/);
   // The Features panel exposes the engine choice row and the conditional custom URL row.
   assert.match(runtimeJs, /data-action="select-search-engine"[\s\S]*data-engine="default"[\s\S]*data-engine="google"[\s\S]*data-engine="bing"[\s\S]*data-engine="baidu"[\s\S]*data-engine="sogou"[\s\S]*data-engine="duckduckgo"[\s\S]*data-engine="brave"[\s\S]*data-engine="yandex"[\s\S]*data-engine="custom"/);
   assert.match(runtimeJs, /id="customSearchUrlSection"[\s\S]*data-action="change-custom-search-url"/);
@@ -1097,7 +1112,7 @@ test('search engine can be customized with presets or a custom URL', () => {
   assert.match(runtimeJs, /await loadThemePreferences\(\);\s*syncSearchPlaceholder\(\);/);
   assert.match(runtimeJs, /saveThemePreferences\(\{\s*searchEngine: engine\s*\}\);\s*syncSearchPlaceholder\(\);/);
   assert.match(runtimeJs, /customSection\.style\.display = engine === 'custom' \? '' : 'none';/);
-  assert.match(runtimeJs, /navHost\.addEventListener\('wheel', \(e\) => \{[\s\S]*e\.target\.closest\('\.group-nav-list'\)[\s\S]*if \(Math\.abs\(e\.deltaY\) > Math\.abs\(e\.deltaX\)\) \{[\s\S]*e\.preventDefault\(\);[\s\S]*list\.scrollLeft \+= e\.deltaY;/);
+  assert.match(runtimeJs, /navHost\.addEventListener\('wheel', \(e\) => \{[\s\S]*e\.target\.closest\('\.group-nav-list'\)[\s\S]*if \(list\.scrollWidth <= list\.clientWidth\) return;[\s\S]*if \(Math\.abs\(e\.deltaY\) > Math\.abs\(e\.deltaX\)\) \{[\s\S]*e\.preventDefault\(\);[\s\S]*list\.scrollLeft \+= e\.deltaY;/);
   assert.match(runtimeJs, /navHost\.dataset\.wheelHijackAttached = '1';/);
   // Malformed custom URLs must not replace the workspace with an error page.
   assert.match(runtimeJs, /validSearchUrl = \/\^https\?:\$\/\.test\(new URL\(searchUrl\)\.protocol\);/);
@@ -1133,8 +1148,9 @@ test('popup scrolls inside panels only, never the document', () => {
   assert.match(popupCss, /\.popup-group-nav-wrap::-webkit-scrollbar \{\s*display: none;/);
   // Nav chips keep their size and overflow horizontally instead of shrinking.
   assert.match(popupCss, /\.group-nav-button \{\s*width: 40px;[\s\S]*flex: 0 0 40px;/);
-  // With the nav scrollbar hidden, the vertical wheel scrolls it horizontally.
-  assert.match(popupJs, /groupNavWrap\.addEventListener\('wheel', \(e\) => \{[\s\S]*if \(Math\.abs\(e\.deltaY\) > Math\.abs\(e\.deltaX\)\) \{[\s\S]*e\.preventDefault\(\);[\s\S]*groupNavWrap\.scrollLeft \+= e\.deltaY;/);
+  // With the nav scrollbar hidden, the vertical wheel scrolls it horizontally —
+  // but only when the nav can actually overflow, so short navs pass wheels through.
+  assert.match(popupJs, /groupNavWrap\.addEventListener\('wheel', \(e\) => \{[\s\S]*if \(list\.scrollWidth <= list\.clientWidth\) return;[\s\S]*if \(Math\.abs\(e\.deltaY\) > Math\.abs\(e\.deltaX\)\) \{[\s\S]*e\.preventDefault\(\);[\s\S]*list\.scrollLeft \+= e\.deltaY;/);
   // The dashboard "quick links per row" setting drives the popup grid too.
   assert.match(popupJs, /const cols = popupTheme\.getQuickShortcutCols \? popupTheme\.getQuickShortcutCols\(\) : 'auto';/);
   assert.match(popupJs, /listEl\.classList\.toggle\('is-fixed-cols-4', cols === '4'\);/);
@@ -1147,9 +1163,31 @@ test('popup scrolls inside panels only, never the document', () => {
   // The popup entry animation replays only on view switches, not refreshes.
   assert.match(popupJs, /const viewChanged = lastSyncedPopupView !== popupState\.view;/);
   assert.match(popupJs, /if \(viewChanged\) \{\s*\[shortcutsList, tabsList, navEl\]\.forEach\(el => \{\s*el\?\.classList\.remove\('is-ready', 'is-entering'\);/);
+  // The incoming panel hides only on an actual view switch (is-entering added
+  // by syncPopupView); renderers must never add it on background refreshes.
+  assert.match(popupJs, /if \(viewChanged\) \{[\s\S]*shortcutsList\?\.classList\.add\('is-entering'\)/);
+  assert.match(popupJs, /if \(viewChanged\) \{[\s\S]*tabsList\?\.classList\.add\('is-entering'\)/);
+  assert.doesNotMatch(popupJs, /listEl\.classList\.add\('is-entering'\)/);
   // is-entering is transient: removed when the entry animation applies.
   assert.match(popupJs, /listEl\.classList\.remove\('is-entering'\);\s*listEl\.classList\.add\('is-ready'\);/);
   assert.match(popupJs, /navEl\.classList\.remove\('is-entering'\);\s*listEl\.classList\.remove\('is-entering'\);/);
+  // The popup window fits its content instead of inheriting min-height:100vh.
+  const htmlBodyStart = popupCss.indexOf('html, body {');
+  const htmlBodyEnd = popupCss.indexOf('\n}', htmlBodyStart);
+  const htmlBodyBlock = htmlBodyStart >= 0 && htmlBodyEnd > htmlBodyStart
+    ? popupCss.slice(htmlBodyStart, htmlBodyEnd)
+    : '';
+  assert.ok(htmlBodyBlock.length > 50, 'html,body rule block should be present');
+  assert.match(htmlBodyBlock, /min-height: 0;/);
+  // Suspended tabs unwrap to their original URL like the dashboard.
+  assert.match(popupJs, /parseSuspendedUrl\(rawUrl\)\.isSuspended\) return true/);
+  assert.match(popupHtml, /<script src="\.\.\/tab-url-utils\.js"><\/script>/);
+  // Session groups sort by createdAt like the dashboard.
+  assert.match(popupJs, /\.sort\(\(a, b\) => new Date\(a\.createdAt\) - new Date\(b\.createdAt\)\)/);
+  // The close path refreshes through the safe pipeline; double-click close
+  // cannot penetrate into the row's open handler.
+  assert.match(popupJs, /await refreshPopupSafely\(\);/);
+  assert.match(popupJs, /popup-tab-close-btn\.is-loading'\)\) return;/);
   // Renamed group labels reach the popup; grouping uses the primary domain.
   assert.match(popupJs, /GROUP_LABEL_OVERRIDES_KEY/);
   assert.match(popupJs, /popupState\.groupLabelOverrides\[group\.domain\]/);

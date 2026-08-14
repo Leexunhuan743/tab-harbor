@@ -145,6 +145,40 @@ test('refreshing popup state preserves the live view instead of resetting it', a
   }
 });
 
+test('loadPopupState unwraps suspended tabs to their original URL', async () => {
+  resetPopupTestState();
+  const originalGet = globalThis.chrome.storage.local.get;
+  const originalUtils = globalThis.TabHarborTabUrlUtils;
+  globalThis.chrome.storage.local.get = async () => ({});
+  globalThis.TabHarborTabUrlUtils = {
+    parseSuspendedTabUrl: url => {
+      const raw = String(url || '');
+      const uri = raw.includes('#uri=') ? decodeURIComponent(raw.split('#uri=')[1].split('&')[0]) : '';
+      return raw.includes('/suspended.html') && uri ? { isSuspended: true, originalUrl: uri, title: 'Suspended title' } : { isSuspended: false, originalUrl: '', title: '' };
+    },
+    getCanonicalTabUrl: url => {
+      const raw = String(url || '');
+      const uri = raw.includes('#uri=') ? decodeURIComponent(raw.split('#uri=')[1].split('&')[0]) : '';
+      return raw.includes('/suspended.html') && uri ? uri : raw;
+    },
+  };
+  try {
+    globalThis.chrome.tabs.query = async () => [
+      { id: 1, url: 'chrome-extension://suspender/suspended.html#uri=https%3A%2F%2Fgithub.com%2Fissue%2F42', title: 'Suspended tab', windowId: 1, active: false },
+      { id: 2, url: '', title: 'Loading', windowId: 1, active: false },
+    ];
+    await loadPopupState();
+    const urls = popupState.openTabs.map(t => t.url);
+    assert.ok(urls.includes('https://github.com/issue/42'), 'suspended tab unwraps to its original URL');
+    assert.equal(popupState.openTabs.find(t => t.id === 1).title, 'Suspended title', 'suspended title is used');
+    assert.ok(urls.includes(''), 'mid-load tab with empty URL stays visible');
+  } finally {
+    globalThis.chrome.tabs.query = async () => [];
+    globalThis.chrome.storage.local.get = originalGet;
+    globalThis.TabHarborTabUrlUtils = originalUtils;
+  }
+});
+
 // ---- popup shortcuts column setting ----
 
 test('renderPopupShortcuts applies the dashboard column setting to the grid', async () => {
@@ -414,7 +448,6 @@ test('buildPopupTabGroups groups session-assigned tabs', () => {
   globalThis.popupState.openTabs = [
     { id: 1, url: 'https://github.com', title: 'GitHub', windowId: 1, active: false, groupId: null },
   ];
-  globalThis.popupState.tabGroups = [];
   globalThis.popupState.sessionGroups = {
     groups: [{ id: 's1', name: 'Work' }],
     assignments: { '1': 's1' },
@@ -427,6 +460,29 @@ test('buildPopupTabGroups groups session-assigned tabs', () => {
   assert.equal(sessionGroup.tabs[0].id, 1);
 });
 
+test('buildPopupTabGroups orders session groups by createdAt like the dashboard', () => {
+  resetPopupTestState({ landingPatterns: [] });
+  globalThis.popupState.openTabs = [
+    { id: 1, url: 'https://a.com', title: 'A', windowId: 1, active: false, groupId: null },
+    { id: 2, url: 'https://b.com', title: 'B', windowId: 1, active: false, groupId: null },
+  ];
+  globalThis.popupState.sessionGroups = {
+    // Listed newest-first on purpose: only the createdAt sort (not insertion
+    // order) can produce the expected [older, newer] output.
+    groups: [
+      { id: 'newer', name: 'Newer', createdAt: '2026-02-01T00:00:00.000Z' },
+      { id: 'older', name: 'Older', createdAt: '2026-01-01T00:00:00.000Z' },
+    ],
+    assignments: { '1': 'newer', '2': 'older' },
+  };
+
+  const groups = globalThis.buildPopupTabGroups();
+  const sessionGroupsOrdered = groups.filter(g => g.kind === 'session');
+  assert.equal(sessionGroupsOrdered.length, 2, 'both session groups present');
+  assert.equal(sessionGroupsOrdered[0].manualGroupId, 'older', 'oldest session group comes first');
+  assert.equal(sessionGroupsOrdered[1].manualGroupId, 'newer', 'newest session group comes second');
+});
+
 test('buildPopupTabGroups groups domain tabs', () => {
   resetPopupTestState();
 
@@ -435,7 +491,6 @@ test('buildPopupTabGroups groups domain tabs', () => {
     { id: 2, url: 'https://github.com/org/team', title: 'Team', windowId: 1, active: false, groupId: null },
     { id: 3, url: 'https://google.com/search', title: 'Search', windowId: 1, active: false, groupId: null },
   ];
-  globalThis.popupState.tabGroups = [];
 
   const groups = globalThis.buildPopupTabGroups();
   const ghGroup = groups.find(g => g.domain === 'github.com');
@@ -453,7 +508,6 @@ test('buildPopupTabGroups places landing pages group at top', () => {
     { id: 1, url: 'https://github.com/', title: 'GitHub', windowId: 1, active: false, groupId: null },
     { id: 2, url: 'https://www.youtube.com/', title: 'YouTube', windowId: 1, active: false, groupId: null },
   ];
-  globalThis.popupState.tabGroups = [];
 
   const groups = globalThis.buildPopupTabGroups();
   assert.equal(groups[0].kind, 'landing', 'landing group should be first');
@@ -466,7 +520,6 @@ test('buildPopupTabGroups groups file:// URLs under local-files domain', () => {
   globalThis.popupState.openTabs = [
     { id: 1, url: 'file:///path/to/file', title: 'Local File', windowId: 1, active: false, groupId: null },
   ];
-  globalThis.popupState.tabGroups = [];
 
   const groups = globalThis.buildPopupTabGroups();
   const localGroup = groups.find(g => g.domain === 'local-files');
@@ -483,9 +536,6 @@ test('buildPopupTabGroups keeps tabs with unparseable URLs in an ungrouped bucke
   const tabA = { id: 1, url: '', title: 'Tab A', windowId: 1, active: false, groupId: 10 };
   const tabB = { id: 2, url: '', title: 'Tab B', windowId: 1, active: false, groupId: 10 };
   globalThis.popupState.openTabs = [tabA, tabB];
-  globalThis.popupState.tabGroups = [
-    { id: 10, title: 'Research', color: 'blue', collapsed: false, tabs: [tabA, tabB] },
-  ];
 
   const groups = globalThis.buildPopupTabGroups();
   assert.equal(groups.length, 1, 'unparseable tabs form a single ungrouped bucket');
@@ -533,7 +583,7 @@ test('getGroupDisplayLabel prefers the custom group label over the derived domai
   assert.equal(globalThis.getGroupDisplayLabel(group), 'GitHub Orgs');
 });
 
-test('renderPopupTabs removes is-entering once the entry animation applies', () => {
+test('renderPopupTabs updates content without replaying the entry animation', () => {
   globalThis._skipLoadPopupState = true;
   resetPopupTestState();
 
@@ -562,14 +612,70 @@ test('renderPopupTabs removes is-entering once the entry animation applies', () 
       { id: 1, url: 'https://example.com/', title: 'Example', windowId: 1, active: false },
     ];
     globalThis.renderPopupTabs();
-    assert.ok(classes.list.has('is-entering'), 'is-entering added on first render');
+    // Background refreshes must not hide the list: is-entering is only added
+    // by syncPopupView on an actual view switch.
+    assert.ok(!classes.list.has('is-entering'), 'content refresh must not add is-entering');
+    assert.ok(!classes.nav.has('is-entering'), 'nav refresh must not add is-entering');
     flushRaf();
     flushRaf();
-    assert.ok(!classes.list.has('is-entering'), 'is-entering removed after animation applies');
     assert.ok(classes.list.has('is-ready'), 'is-ready applied');
   } finally {
     globalThis.document.getElementById = originalGet;
     globalThis.document.body = originalBody;
+  }
+});
+
+test('syncPopupView adds is-entering to the incoming panel only on view switch', () => {
+  globalThis._skipLoadPopupState = true;
+  resetPopupTestState();
+
+  const classes = { shortcuts: new Set(), tabs: new Set(), nav: new Set() };
+  const makeEl = (name) => ({
+    innerHTML: '',
+    hidden: false,
+    classList: {
+      add: cls => classes[name].add(cls),
+      remove: cls => classes[name].delete(cls),
+      toggle: (cls, on) => { classes[name][on ? 'add' : 'delete'](cls); },
+      contains: cls => classes[name].has(cls),
+    },
+    setAttribute: () => {},
+  });
+  const originalGet = globalThis.document.getElementById;
+  const originalBody = globalThis.document.body;
+  globalThis.document.body = { classList: { add: () => {} } };
+  globalThis.document.getElementById = id => {
+    const map = {
+      popupShortcutsTab: 'shortcuts',
+      popupTabsTab: 'tabs',
+      popupShortcutsPanel: 'shortcuts',
+      popupTabsPanel: 'tabs',
+      popupShortcutsList: 'shortcuts',
+      popupTabsList: 'tabs',
+      popupGroupNav: 'nav',
+    };
+    return map[id] ? makeEl(map[id]) : null;
+  };
+  try {
+    flushRaf(); flushRaf(); flushRaf(); flushRaf();
+    globalThis.popupState.view = 'tabs';
+    globalThis.syncPopupView();
+    assert.ok(classes.tabs.has('is-entering'), 'incoming tabs panel is hidden until its animation starts');
+    assert.ok(classes.nav.has('is-entering'), 'incoming nav is hidden until its animation starts');
+    assert.ok(!classes.shortcuts.has('is-entering'), 'outgoing shortcuts panel is not hidden');
+    flushRaf();
+    flushRaf();
+    assert.ok(!classes.tabs.has('is-entering'), 'is-entering removed after animation applies');
+    assert.ok(classes.tabs.has('is-ready'), 'is-ready applied to the tabs panel');
+
+    // Same-view sync (background refresh) must not re-hide the panel.
+    classes.tabs.delete('is-entering');
+    globalThis.syncPopupView();
+    assert.ok(!classes.tabs.has('is-entering'), 'same-view sync must not add is-entering');
+  } finally {
+    globalThis.document.getElementById = originalGet;
+    globalThis.document.body = originalBody;
+    resetPopupTestState();
   }
 });
 
@@ -846,7 +952,6 @@ test('buildPopupTabGroups groups tabs by custom group rules', () => {
     { id: 2, url: 'https://gitlab.com/project', title: 'GitLab', windowId: 1, active: false, groupId: null },
     { id: 3, url: 'https://other.com/page', title: 'Other', windowId: 1, active: false, groupId: null },
   ];
-  globalThis.popupState.tabGroups = [];
 
   const groups = globalThis.buildPopupTabGroups();
   const gh = groups.find(g => g.kind === 'custom' && g.domain === 'github');
@@ -867,7 +972,6 @@ test('buildPopupTabGroups places landing pages before domain groups', () => {
     { id: 1, url: 'https://github.com/', title: 'GitHub Home', windowId: 1, active: false, groupId: null },
     { id: 2, url: 'https://other.com/page', title: 'Other', windowId: 1, active: false, groupId: null },
   ];
-  globalThis.popupState.tabGroups = [];
 
   const groups = globalThis.buildPopupTabGroups();
   assert.equal(groups[0].kind, 'landing', 'landing group should be first');
@@ -885,7 +989,6 @@ test('buildPopupTabGroups handles custom landing page patterns', () => {
   globalThis.popupState.openTabs = [
     { id: 1, url: 'https://news.ycombinator.com/news', title: 'HN', windowId: 1, active: false, groupId: null },
   ];
-  globalThis.popupState.tabGroups = [];
 
   const groups = globalThis.buildPopupTabGroups();
   const landing = groups.find(g => g.kind === 'landing');

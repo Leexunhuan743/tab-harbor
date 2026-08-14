@@ -44,6 +44,10 @@ async function withMockStorage(initial, fn) {
   }
 }
 
+test('STORAGE_KEYS includes popupView so popup view memory survives export/import', () => {
+  assert.ok(STORAGE_KEYS.includes('popupView'), 'popupView must round-trip through config export/import');
+});
+
 test('exportConfig returns the complete versioned configuration with custom icons', async () => {
   const initial = {
     themePreferences: { mode: 'dark', paletteId: 'sage' },
@@ -115,6 +119,7 @@ test('importConfig writes the complete configuration to storage', async () => {
     chromeTabGroupsMeta: null,
     importedChromeSessionGroups: { entries: [] },
     deferredTriggerPosition: { top: null },
+    popupView: 'tabs',
   };
   const jsonString = JSON.stringify(incoming);
 
