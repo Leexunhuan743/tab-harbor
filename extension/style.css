@@ -1978,13 +1978,60 @@ body.page-chip-list-dragging .page-chip.is-selected:not(.is-dragging) {
     background: var(--workspace-chip-bg-strong);
     border: 1px solid var(--workspace-chip-border);
     color: var(--workspace-chip-text);
-    font-size: 12px;
     font-size: var(--ui-font-12);
     font-weight: 600;
     padding: 2px 8px;
     border-radius: 999px;
     pointer-events: none;
     box-shadow: 0 2px 8px rgba(26, 22, 19, 0.18);
+}
+
+/* Batch actions replace the section header's icon actions while a
+   multi-selection exists — same row, same height, same quiet style. */
+.page-chip-batch-bar {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+}
+
+.page-chip-batch-action {
+    display: inline-flex;
+    align-items: center;
+    height: 30px;
+    padding: 0 8px;
+    border: none;
+    background: transparent;
+    color: color-mix(in srgb, var(--muted) 82%, var(--ink) 18%);
+    font-family: "Public Sans", sans-serif;
+    font-size: 11px;
+    font-size: var(--ui-font-11);
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    transition:
+        color 0.15s ease,
+        opacity 0.15s ease;
+}
+
+.page-chip-batch-action:hover {
+    color: var(--ink);
+}
+
+.page-chip-batch-action[data-action="batch-close-tabs"]:hover {
+    color: var(--status-abandoned);
+}
+
+.page-chip-batch-action:focus-visible {
+    outline: 2px solid var(--workspace-accent-border);
+    outline-offset: 1px;
+}
+
+/* The selection count replaces the section title; let it size to its own
+   content instead of the fixed 13ch column. */
+#openTabsSection.has-chip-selection .section-header h2 {
+    width: auto;
+    flex: 0 0 auto;
 }
 
 /* The grip is a pure drag surface: no scrolling/selection gestures on touch. */

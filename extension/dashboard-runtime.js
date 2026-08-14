@@ -142,6 +142,12 @@ let suppressPageChipClickUntil = 0;
 // selection; dragging a selected row then reorders the whole selection
 // together within its group.
 let selectedPageChipIds = new Set();
+// Last toggled/selected row id — the anchor for Shift+click / Shift+Space
+// range selection within the same card.
+let pageChipSelectionAnchorId = '';
+// Suppresses the synthesized click (detail 0 on some touch/pen devices) that
+// follows a pointerup toggle, so a tap does not toggle the row twice.
+let pageChipPointerToggleGuard = { key: '', until: 0 };
 let draggedGroupButtonEl = null;
 let dragPlaceholderEl = null;
 let draggedDrawerItemId = '';
@@ -481,23 +487,55 @@ function findGroupKeyForChip(chipId) {
 }
 
 /**
+ * orderChipIdsByDom(ids)
+ *
+ * Returns the given chip ids ordered by their current visual (DOM) position,
+ * card by card. Same-group reorders and cross-group moves then share the same
+ * "visual order" semantics for a batch (a batch never flips the order the user
+ * sees, regardless of the order rows were toggled).
+ */
+function orderChipIdsByDom(ids) {
+  const set = new Set((ids || []).map(String).filter(Boolean));
+  if (!set.size) return [];
+  const ordered = [];
+  const seen = new Set();
+  document.querySelectorAll('.mission-card').forEach(card => {
+    card.querySelectorAll('.page-chip[data-chip-sort-id]').forEach(row => {
+      const id = String(row.dataset.chipSortId || '');
+      if (set.has(id) && !seen.has(id)) {
+        ordered.push(id);
+        seen.add(id);
+      }
+    });
+  });
+  // Ids with no rendered row (rare) keep their original relative order at the end.
+  for (const id of set) {
+    if (!seen.has(id)) ordered.push(id);
+  }
+  return ordered;
+}
+
+/**
  * getMovingPageChipIds()
  *
  * The chips participating in the current drag: the whole highlight-only
  * selection when the dragged row is part of it, otherwise just the dragged
- * row. Same-group reorders and cross-group moves all use this set.
+ * row. Same-group reorders and cross-group moves all use this set, always in
+ * visual (DOM) order.
  */
 function getMovingPageChipIds() {
   const draggedChipId = String(draggedPageChipId || '');
   // Prefer the snapshot captured when the drag armed — the selection must
   // not change mid-drag, so commit-time logic uses the same set throughout.
+  let ids;
   if (pageChipDragState?.movingChipIds?.length) {
-    return [...pageChipDragState.movingChipIds];
+    ids = [...pageChipDragState.movingChipIds];
+  } else if (selectedPageChipIds.size > 0 && selectedPageChipIds.has(draggedChipId)) {
+    ids = [...selectedPageChipIds].map(String).filter(Boolean);
+  } else {
+    ids = [draggedChipId].filter(Boolean);
   }
-  if (selectedPageChipIds.size > 0 && selectedPageChipIds.has(draggedChipId)) {
-    return [...selectedPageChipIds].map(String).filter(Boolean);
-  }
-  return [draggedChipId].filter(Boolean);
+  return orderChipIdsByDom(ids);
 }
 
 /**
@@ -554,10 +592,12 @@ function buildBatchOrderedIdsFromList(listEl, movingIds) {
     else if (id) rest.push(id);
   }
   const placeholderIdx = children.findIndex(node => node === pageChipPlaceholderEl);
+  // Count only id-bearing nodes that will stay in the final order, so non-chip
+  // children (e.g. the overflow "+N more" row) cannot skew the insert index.
   const dropPos = placeholderIdx === -1
     ? rest.length
     : children.slice(0, placeholderIdx)
-        .filter(n => n !== pageChipPlaceholderEl && !movingSet.has(String(n.dataset?.chipSortId || '')))
+        .filter(n => n !== pageChipPlaceholderEl && rest.includes(String(n.dataset?.chipSortId || '')))
         .length;
   rest.splice(dropPos, 0, ...moving);
   return rest;
@@ -2166,6 +2206,16 @@ function syncPageChipDropTarget(clientX, clientY) {
     listEl,
   };
   setPageChipDropPreview(cardEl);
+  // Keep the count badge honest per drop context: when dropping back on the
+  // source group only the rows present in this list actually reorder, while a
+  // cross-group drop moves the whole batch.
+  if (groupKey === pageChipDragState.sourceGroupKey) {
+    const movingIds = Array.isArray(pageChipDragState.movingChipIds) ? pageChipDragState.movingChipIds : [];
+    const inListCount = movingIds.filter(id => [...listEl.children].some(n => String(n.dataset?.chipSortId || '') === String(id))).length;
+    updatePageChipDragBadge(inListCount);
+  } else {
+    updatePageChipDragBadge(Array.isArray(pageChipDragState.movingChipIds) ? pageChipDragState.movingChipIds.length : 1);
+  }
   const signature = `group:${groupKey}`;
   if (pageChipDragState.debugTargetSignature !== signature) {
     pageChipDragState.debugTargetSignature = signature;
@@ -2254,10 +2304,24 @@ async function saveCrossGroupTabRowOrder(sourceGroupKey, targetGroupKey, targetL
 
 function buildCrossGroupTargetOrder(targetListEl, movingIds) {
   const children = [...targetListEl.children];
-  const targetIds = children.filter(n => n.dataset?.chipSortId).map(n => String(n.dataset.chipSortId));
+  const movingSet = new Set((movingIds || []).map(String).filter(Boolean));
+  // Chips already in the target card are part of the batch: remove them from
+  // the pre-existing order so the whole batch lands contiguously at the drop
+  // point without duplicates (the batch order wins over the old position).
+  const targetIds = children
+    .filter(n => n.dataset?.chipSortId)
+    .map(n => String(n.dataset.chipSortId))
+    .filter(id => !movingSet.has(id));
   const placeholderIdx = children.findIndex(n => n === pageChipPlaceholderEl);
-  const insertAt = placeholderIdx === -1 ? targetIds.length : Math.min(placeholderIdx, targetIds.length);
-  targetIds.splice(insertAt, 0, ...movingIds.map(String).filter(Boolean));
+  const insertAt = placeholderIdx === -1
+    ? targetIds.length
+    : Math.min(
+        children.slice(0, placeholderIdx)
+          .filter(n => n.dataset?.chipSortId && !movingSet.has(String(n.dataset.chipSortId)))
+          .length,
+        targetIds.length
+      );
+  targetIds.splice(insertAt, 0, ...(movingIds || []).map(String).filter(Boolean));
   return targetIds;
 }
 
@@ -2367,12 +2431,10 @@ async function finishPageChipDrag() {
     let requiresOpenTabsRebuild = true;
     if (moved) {
       if (targetGroupKey && targetGroupKey === sourceGroupKey && targetListEl) {
-        // Batch reorder: when the dragged row belongs to a selection, the
-        // whole selection moves together to the drop point.
-        const draggedSelected = selectedPageChipIds.size > 0 && selectedPageChipIds.has(String(draggedPageChipId || ''));
-        const movingIds = draggedSelected
-          ? [...selectedPageChipIds].map(String).filter(Boolean)
-          : [String(draggedPageChipId || '')];
+        // Batch reorder: the whole selection (snapshot taken when the drag
+        // armed) moves together to the drop point. Rows from other cards are
+        // simply not present in this list, so they are ignored here.
+        const movingIds = getMovingPageChipIds();
         const orderIds = buildBatchOrderedIdsFromList(targetListEl, movingIds);
         logPageChipDragDebug('finish-reorder-save', { orderCount: orderIds.length, moving: movingIds.join(',') });
         await saveGroupTabRowOrder(sourceGroupKey, orderIds);
@@ -2397,6 +2459,9 @@ async function finishPageChipDrag() {
           logPageChipDragDebug('finish-save-cross-order', { groupKey: movedGroup.groupKey });
           await saveCrossGroupTabRowOrder(sourceGroupKey, movedGroup.groupKey, targetListEl, getMovingPageChipIds());
           logPageChipDragDebug('finish-group-move', { groupKey: movedGroup.groupKey, groupName: movedGroup.groupName });
+          // The rows left their cards — clear the selection so no residual
+          // highlight lingers in the new group and invites an accidental re-drag.
+          clearPageChipSelection();
         }
       } else if (createNewGroup) {
         const createdGroup = await createSessionGroupFromDraggedPageChip();
@@ -2415,6 +2480,9 @@ async function finishPageChipDrag() {
             orderCount: nextGroupOrder.length,
           });
           logPageChipDragDebug('finish-new-group', { groupName: createdGroup.name });
+          // Same as cross-group moves: the batch now lives in a fresh group,
+          // so drop the selection to avoid residual highlights.
+          clearPageChipSelection();
         }
       }
 
@@ -3007,7 +3075,7 @@ function renderDomainCard(group) {
     const fallbackLabel = runtimeGetFallbackLabel(label, iconData.hostname);
     const safeFallbackUrl = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(fallbackUrl) : fallbackUrl.replace(/"/g, '&quot;');
     return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" data-chip-sort-id="${safeSortId}" data-chip-group-id="${safeGroupId}" aria-label="${safeTitle}">
-      <button class="drawer-reorder-handle chip-reorder-handle" type="button" data-chip-drag-handle="tab" aria-label="${runtimeT ? runtimeT('dragReorderTab') : 'Drag to reorder tab'}">
+      <button class="drawer-reorder-handle chip-reorder-handle" type="button" data-chip-drag-handle="tab" aria-pressed="${selectedPageChipIds.has(sortId) ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('dragReorderTabSelect') : 'Drag to reorder; Enter or Space to select'}">
         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M8 6h.01M8 12h.01M8 18h.01M16 6h.01M16 12h.01M16 18h.01" /></svg>
       </button>
       ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" data-fallback-src="${safeFallbackUrl}" data-fallback-srcset="${runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(JSON.stringify(iconData.sources.slice(2))) : JSON.stringify(iconData.sources.slice(2)).replace(/"/g, '&quot;')}">` : ''}
@@ -3656,6 +3724,10 @@ function renderOpenTabsArea(realTabs = getRealTabs()) {
       }
     });
   }
+
+  // Re-apply the selection highlight and prune ids whose rows are gone; this
+  // also keeps the batch action bar in sync after any re-render.
+  refreshPageChipSelectionClasses();
 }
 
 async function renderOpenTabsLayout({ rebuildGroups = true, syncChrome = false, patchDom = false, changedGroupKeys = [] } = {}) {
@@ -3665,6 +3737,7 @@ async function renderOpenTabsLayout({ rebuildGroups = true, syncChrome = false, 
   }
   if (patchDom) {
     patchOpenTabsDomFromGroups(realTabs, changedGroupKeys);
+    refreshPageChipSelectionClasses();
   } else {
     renderOpenTabsArea(realTabs);
   }
@@ -3797,12 +3870,30 @@ function updateBackToTopVisibility() {
    ---------------------------------------------------------------- */
 
 document.addEventListener('click', async (e) => {
-  // Clicking outside the tab cards clears the highlight-only selection.
-  if (selectedPageChipIds.size > 0 && !e.target.closest('.mission-card')) {
-    selectedPageChipIds.clear();
-    refreshPageChipSelectionClasses();
+  // Clicking outside the tab cards (and the batch action bar) clears the
+  // highlight-only selection.
+  if (selectedPageChipIds.size > 0 && !e.target.closest('.mission-card') && !e.target.closest('#pageChipBatchBar')) {
+    clearPageChipSelection();
   }
-  if (e.target.closest('.chip-reorder-handle')) return;
+  if (e.target.closest('.chip-reorder-handle')) {
+    // Keyboard activation (Enter/Space) toggles the row in the selection;
+    // pointer clicks are already handled by the pointerup path.
+    if (e.detail === 0 && !(draggedPageChipId && pageChipDragState)) {
+      const chip = e.target.closest('[data-chip-sort-id]');
+      if (chip) {
+        const key = String(chip.dataset.chipSortId || '');
+        // A touch/pen tap already toggled this row in the pointerup path — the
+        // synthesized click must not toggle it a second time. Keyboard clicks
+        // are preceded by a keydown, so they never hit this guard.
+        if (pageChipPointerToggleGuard.key === key
+          && Date.now() < pageChipPointerToggleGuard.until
+          && Date.now() - pageChipLastKeydownAt > 120) return;
+        if (e.shiftKey && pageChipSelectionAnchorId) selectPageChipRange(key, pageChipSelectionAnchorId);
+        else togglePageChipSelection(key);
+      }
+    }
+    return;
+  }
   // Walk up the DOM to find the nearest element with data-action
   const actionEl = e.target.closest('[data-action]');
   if (!actionEl) return;
@@ -4086,8 +4177,7 @@ document.addEventListener('click', async (e) => {
     const tabId = actionEl.dataset.tabId || '';
     // A plain row click activates the tab and clears the selection.
     if (selectedPageChipIds.size > 0) {
-      selectedPageChipIds.clear();
-      refreshPageChipSelectionClasses();
+      clearPageChipSelection();
     }
     if (tabUrl || tabId) await focusTab(tabUrl, tabId);
     return;
@@ -4209,6 +4299,79 @@ document.addEventListener('click', async (e) => {
       initialTabIds: [tabId],
       scopeTabIds: [tabId],
     });
+    return;
+  }
+
+  // ---- Batch actions for the handle multi-selection ----
+  if (action === 'batch-close-tabs') {
+    e.stopPropagation();
+    window.__suppressAutoRefreshUntil = Date.now() + 2000;
+    const collected = collectMovingTabIds([...selectedPageChipIds], '');
+    const tabIds = [...new Set(collected.tabIds.map(Number).filter(Number.isFinite))];
+    let closedCount = 0;
+    if (tabIds.length) {
+      // Never close a window's last tab (that would close the window); mirror
+      // the close-all path.
+      const allTabs = await queryTabsForDashboardWindow();
+      const toClose = ensureWindowsKeepLastTab(allTabs, tabIds);
+      for (const tabId of toClose) {
+        try { await chrome.tabs.remove(tabId); closedCount += 1; } catch { /* tab may already be gone */ }
+      }
+      if (closedCount > 0) playCloseSound();
+    }
+    clearPageChipSelection();
+    await renderDashboard();
+    updateBackToTopVisibility();
+    window.__suppressAutoRefreshUntil = 0;
+    showToast(runtimeT ? runtimeT('toastBatchClosed', { count: closedCount }) : `${closedCount} tabs closed`);
+    return;
+  }
+
+  if (action === 'batch-discard-tabs') {
+    e.stopPropagation();
+    if (!sleepControlEnabled) return;
+    window.__suppressAutoRefreshUntil = Date.now() + 2000;
+    const collected = collectMovingTabIds([...selectedPageChipIds], '');
+    const tabIds = [...new Set(collected.tabIds.map(Number).filter(Number.isFinite))];
+    let discarded = 0;
+    let failed = 0;
+    let skippedActive = 0;
+    for (const tabId of tabIds) {
+      const tab = openTabs.find(t => Number(t?.id) === tabId);
+      if (tab?.active) { skippedActive += 1; continue; }
+      if (await discardTab(tabId)) discarded += 1;
+      else failed += 1;
+    }
+    clearPageChipSelection();
+    await renderDashboard();
+    updateBackToTopVisibility();
+    window.__suppressAutoRefreshUntil = 0;
+    if (discarded > 0) {
+      showToast(runtimeT ? runtimeT('toastTabsDiscarded', { count: discarded }) : `${discarded} tabs sleeping`);
+    } else if (failed > 0) {
+      showToast(runtimeT ? runtimeT('toastTabDiscardFailed') : 'Failed to sleep tab');
+    } else if (skippedActive > 0) {
+      showToast(runtimeT ? runtimeT('toastBatchSleepNone') : 'Selected tabs are active');
+    }
+    return;
+  }
+
+  if (action === 'batch-save-session') {
+    e.stopPropagation();
+    const collected = collectMovingTabIds([...selectedPageChipIds], '');
+    const tabIds = [...new Set(collected.tabIds.map(Number).filter(Number.isFinite).map(String))];
+    if (!tabIds.length) return;
+    await openTabSessionPicker({
+      source: 'selected',
+      initialTabIds: tabIds,
+      scopeTabIds: tabIds,
+    });
+    return;
+  }
+
+  if (action === 'clear-chip-selection') {
+    e.stopPropagation();
+    clearPageChipSelection();
     return;
   }
 
@@ -4529,6 +4692,7 @@ document.addEventListener('click', (e) => {
   });
 });
 
+// @lat: [[features#Tab row multi-select and batch drag]]
 /**
  * togglePageChipSelection(chipId)
  *
@@ -4540,20 +4704,133 @@ function togglePageChipSelection(chipId) {
   if (!key) return;
   if (selectedPageChipIds.has(key)) selectedPageChipIds.delete(key);
   else selectedPageChipIds.add(key);
+  pageChipSelectionAnchorId = key;
   refreshPageChipSelectionClasses();
 }
 
 function refreshPageChipSelectionClasses() {
+  const seen = new Set();
   document.querySelectorAll('.page-chip[data-chip-sort-id]').forEach(row => {
-    row.classList.toggle('is-selected', selectedPageChipIds.has(String(row.dataset.chipSortId || '')));
+    const id = String(row.dataset.chipSortId || '');
+    seen.add(id);
+    const selected = selectedPageChipIds.has(id);
+    row.classList.toggle('is-selected', selected);
+    const handle = row.querySelector('[data-chip-drag-handle="tab"]');
+    if (handle) handle.setAttribute('aria-pressed', selected ? 'true' : 'false');
   });
+  // Prune ids whose rows are gone (closed tabs) so stale selections cannot
+  // linger, inflate the batch count, or highlight an unrelated tab later.
+  for (const id of selectedPageChipIds) {
+    if (!seen.has(id)) {
+      selectedPageChipIds.delete(id);
+      if (pageChipSelectionAnchorId === id) pageChipSelectionAnchorId = '';
+    }
+  }
+  syncPageChipBatchBar();
 }
 
-// Escape clears the highlight-only selection.
+function clearPageChipSelection() {
+  selectedPageChipIds.clear();
+  pageChipSelectionAnchorId = '';
+  refreshPageChipSelectionClasses();
+}
+
+/**
+ * selectPageChipRange(targetId, anchorId)
+ *
+ * Shift+click / Shift+Space selects every row between the anchor (last toggled
+ * row) and the target within the same card, inclusive. Cross-card targets fall
+ * back to a plain toggle.
+ */
+function selectPageChipRange(targetId, anchorId) {
+  const targetKey = String(targetId || '');
+  const anchorKey = String(anchorId || '');
+  if (!targetKey) return;
+  const targetEl = document.querySelector(`.page-chip[data-chip-sort-id="${CSS.escape(targetKey)}"]`);
+  const anchorEl = anchorKey ? document.querySelector(`.page-chip[data-chip-sort-id="${CSS.escape(anchorKey)}"]`) : null;
+  if (!targetEl) return;
+  if (!anchorEl || targetEl.closest('.mission-card') !== anchorEl.closest('.mission-card')) {
+    togglePageChipSelection(targetKey);
+    return;
+  }
+  const card = targetEl.closest('.mission-card');
+  const rows = [...card.querySelectorAll('.page-chip[data-chip-sort-id]')];
+  const start = rows.indexOf(anchorEl);
+  const end = rows.indexOf(targetEl);
+  if (start === -1 || end === -1) {
+    togglePageChipSelection(targetKey);
+    return;
+  }
+  const lo = Math.min(start, end);
+  const hi = Math.max(start, end);
+  for (let i = lo; i <= hi; i += 1) {
+    selectedPageChipIds.add(String(rows[i].dataset.chipSortId));
+  }
+  pageChipSelectionAnchorId = targetKey;
+  refreshPageChipSelectionClasses();
+}
+
+/**
+ * syncPageChipBatchBar()
+ *
+ * While a multi-selection exists, the open-tabs section header transforms in
+ * place: the title becomes the selection count and the three icon actions
+ * (sleep / save / close all) are replaced by the batch actions (close / sleep
+ * / save / clear selection). The row keeps the section header's height and
+ * quiet style — no separate strip is appended.
+ */
+function syncPageChipBatchBar() {
+  const count = selectedPageChipIds.size;
+  const section = document.getElementById('openTabsSection');
+  const header = section ? section.querySelector('.section-header') : null;
+  const titleEl = document.getElementById('openTabsSectionTitle');
+  const countEl = document.getElementById('openTabsSectionCount');
+  if (!section || !header || !titleEl || !countEl) return;
+  // The title carries the selection count while selected; announce the swap.
+  titleEl.setAttribute('aria-live', 'polite');
+  let bar = document.getElementById('pageChipBatchBar');
+  if (count === 0) {
+    section.classList.remove('has-chip-selection');
+    if (bar) bar.remove();
+    titleEl.textContent = runtimeT ? runtimeT('openTabsSectionTitle') : 'Open tabs';
+    countEl.style.display = '';
+    return;
+  }
+  section.classList.add('has-chip-selection');
+  titleEl.textContent = runtimeT ? runtimeT('batchSelectedCount', { count }) : `${count} selected`;
+  countEl.style.display = 'none';
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'pageChipBatchBar';
+    bar.className = 'page-chip-batch-bar';
+    bar.setAttribute('role', 'toolbar');
+    bar.setAttribute('aria-label', runtimeT ? runtimeT('batchBarLabel') : 'Selected tabs');
+    bar.innerHTML = `
+      <button type="button" class="page-chip-batch-action" data-action="batch-close-tabs">${runtimeT ? runtimeT('batchCloseTabs') : 'Close selected'}</button>
+      ${sleepControlEnabled ? `<button type="button" class="page-chip-batch-action" data-action="batch-discard-tabs">${runtimeT ? runtimeT('batchSleepTabs') : 'Sleep selected'}</button>` : ''}
+      <button type="button" class="page-chip-batch-action" data-action="batch-save-session">${runtimeT ? runtimeT('batchSaveSession') : 'Save session'}</button>
+      <button type="button" class="page-chip-batch-action" data-action="clear-chip-selection">${runtimeT ? runtimeT('batchClearSelection') : 'Clear selection'}</button>
+    `;
+    header.insertBefore(bar, countEl);
+  }
+}
+
+// Escape clears the highlight-only selection; a drag in flight is cancelled
+// first so it cannot commit a stale batch. Space on a reorder handle must not
+// scroll the page before the toggle click fires.
+let pageChipLastKeydownAt = 0;
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && selectedPageChipIds.size > 0) {
-    selectedPageChipIds.clear();
-    refreshPageChipSelectionClasses();
+  pageChipLastKeydownAt = Date.now();
+  if (e.key === ' ' && e.target.closest?.('.chip-reorder-handle')) {
+    e.preventDefault();
+    return;
+  }
+  if (e.key !== 'Escape') return;
+  if (draggedPageChipId && pageChipDragState) {
+    clearPageChipDragState({ removeNode: false });
+  }
+  if (selectedPageChipIds.size > 0) {
+    clearPageChipSelection();
   }
 });
 
@@ -4672,6 +4949,9 @@ document.addEventListener('pointerdown', (e) => {
   // its plain click behavior (activate the tab) — arming a drag from the
   // body would jump to the link on release after a drag gesture.
   if (chipHandle && chipItem && !chipAction && e.button === 0) {
+    // Re-entrancy guard: a second pointer must not clobber an in-flight drag
+    // (first drag would be silently lost and its capture never released).
+    if (pageChipDragState || draggedPageChipId) return;
     const item = chipItem;
     const listEl = item?.parentElement;
     const groupKey = item?.dataset.chipGroupId || '';
@@ -4791,10 +5071,18 @@ document.addEventListener('pointerup', async (e) => {
       moved: pageChipDragState.moved,
     });
     // A handle press that never moved is a click: toggle the row in the
-    // highlight-only selection instead of starting a drag.
+    // highlight-only selection (Shift extends the range from the anchor).
+    // A drag that ended near its start point is a completed drag, not a click.
     const finalDistance = Math.hypot(e.clientX - pageChipDragState.x, e.clientY - pageChipDragState.y);
-    if (finalDistance < 4) {
-      togglePageChipSelection(draggedPageChipId);
+    if (!pageChipDragState.moved && finalDistance < 4) {
+      // Guard the synthesized click that follows on touch/pen devices so the
+      // row is not toggled twice.
+      pageChipPointerToggleGuard = { key: String(draggedPageChipId || ''), until: Date.now() + 400 };
+      if (e.shiftKey && pageChipSelectionAnchorId) {
+        selectPageChipRange(draggedPageChipId, pageChipSelectionAnchorId);
+      } else {
+        togglePageChipSelection(draggedPageChipId);
+      }
       clearPageChipDragState({ removeNode: false });
       return;
     }
@@ -4811,7 +5099,10 @@ document.addEventListener('pointerup', async (e) => {
       || (stickyTarget.kind === 'group' && stickyTarget.groupKey && stickyTarget.groupKey !== pageChipDragState.sourceGroupKey)
     );
     if (!stickyIsNonSource) {
-      syncPageChipDropTarget(e.clientX, e.clientY);
+      // Resolve the drop target and park the placeholder at the actual release
+      // point even when no pointermove preceded (fast flick), so the batch
+      // lands where the pointer was released instead of at the list end.
+      previewPageChipOrder(e.clientX, e.clientY);
     } else {
       logPageChipDragDebug('pointerup-keep-target', {
         kind: stickyTarget.kind,

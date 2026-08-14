@@ -774,9 +774,9 @@ test('todo list and tab chips expose drag handles with drag-state styling', () =
   // Handle-click toggles a row into the highlight-only selection; dragging a
   // selected row reorders the whole selection together within its group.
   assert.match(appJs, /function togglePageChipSelection\(chipId\) \{[\s\S]*selectedPageChipIds\.add\(key\);/);
-  assert.match(appJs, /row\.classList\.toggle\('is-selected', selectedPageChipIds\.has\(String\(row\.dataset\.chipSortId \|\| ''\)\)\)/);
-  assert.match(appJs, /if \(selectedPageChipIds\.size > 0 && !e\.target\.closest\('\.mission-card'\)\) \{\s*selectedPageChipIds\.clear\(\);\s*refreshPageChipSelectionClasses\(\);/);
-  assert.match(appJs, /const finalDistance = Math\.hypot\(e\.clientX - pageChipDragState\.x, e\.clientY - pageChipDragState\.y\);\s*if \(finalDistance < 4\) \{\s*togglePageChipSelection\(draggedPageChipId\);/);
+  assert.match(appJs, /row\.classList\.toggle\('is-selected', selected\);/);
+  assert.match(appJs, /if \(selectedPageChipIds\.size > 0 && !e\.target\.closest\('\.mission-card'\) && !e\.target\.closest\('#pageChipBatchBar'\)\) \{\s*clearPageChipSelection\(\);/);
+  assert.match(appJs, /const finalDistance = Math\.hypot\(e\.clientX - pageChipDragState\.x, e\.clientY - pageChipDragState\.y\);\s*if \(!pageChipDragState\.moved && finalDistance < 4\) \{[\s\S]*togglePageChipSelection\(draggedPageChipId\);/);
   assert.match(appJs, /function buildBatchOrderedIdsFromList\(listEl, movingIds\) \{[\s\S]*rest\.splice\(dropPos, 0, \.\.\.moving\);/);
   assert.match(appJs, /const orderIds = buildBatchOrderedIdsFromList\(targetListEl, movingIds\);/);
   // Cross-group moves and new-group creation move the whole selection when
@@ -798,7 +798,7 @@ test('todo list and tab chips expose drag handles with drag-state styling', () =
   assert.match(css, /\.chip-reorder-handle \{\s*touch-action: none;/);
   assert.match(appJs, /function updatePageChipDragBadge\(count\) \{[\s\S]*badge\.textContent = count > 1 \? `×\$\{count\}` : '';/);
   assert.match(appJs, /if \(chipItem && !chipAction && e\.button === 0\) \{\s*e\.preventDefault\(\);/);
-  assert.match(appJs, /if \(e\.key === 'Escape' && selectedPageChipIds\.size > 0\) \{\s*selectedPageChipIds\.clear\(\);/);
+  assert.match(appJs, /if \(e\.key !== 'Escape'\) return;[\s\S]{0,300}if \(draggedPageChipId && pageChipDragState\) \{\s*clearPageChipDragState\(\{ removeNode: false \}\);/);
   assert.match(appJs, /movingChipIds: getMovingPageChipIds\(\),/);
   assert.match(appJs, /e\.stopPropagation\(\);/);
   assert.match(appJs, /document\.body\.classList\.add\('page-chip-drag-armed'\)/);
@@ -848,7 +848,7 @@ test('todo list and tab chips expose drag handles with drag-state styling', () =
   assert.match(appJs, /if \(!movedGroup\.targetWasManualGroup\) \{[\s\S]*buildPersistentGroupOrderReplacingKey\(movedGroup\.groupKey, targetGroupKey\)/);
   assert.match(appJs, /const clampedPoint = clampPageChipClientPoint\(clientX, clientY\);/);
   assert.match(appJs, /if \(!pageChipDragState\.moved\) \{[\s\S]*const distance = Math\.hypot\(e\.clientX - pageChipDragState\.x, e\.clientY - pageChipDragState\.y\);[\s\S]*if \(distance >= 4\) \{/);
-  assert.match(appJs, /updateDraggedPageChipPosition\(e\.clientX, e\.clientY\);[\s\S]*syncPageChipDropTarget\(e\.clientX, e\.clientY\);/);
+  assert.match(appJs, /updateDraggedPageChipPosition\(e\.clientX, e\.clientY\);[\s\S]*if \(!stickyIsNonSource\) \{\s*(?:\/\/[^\n]*\n\s*)*previewPageChipOrder\(e\.clientX, e\.clientY\);/);
   assert.match(appJs, /clearPageChipDragState\(\{ removeNode: moved \}\)/);
   assert.match(appJs, /let suppressPageChipClickUntil = 0;/);
   assert.match(appJs, /if \(Date\.now\(\) < suppressPageChipClickUntil\) return;/);
