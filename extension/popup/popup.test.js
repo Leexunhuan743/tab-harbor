@@ -23,6 +23,15 @@ globalThis.flushRaf = () => {
   snapshot.forEach(({ fn }) => fn());
 };
 
+// popup.js resolves the remembered view synchronously from localStorage at
+// module load — mock it so the require-time read is safe and predictable.
+globalThis.localStorage = {
+  _store: {},
+  getItem: key => (key in globalThis.localStorage._store ? globalThis.localStorage._store[key] : null),
+  setItem: (key, value) => { globalThis.localStorage._store[key] = String(value); },
+  removeItem: key => { delete globalThis.localStorage._store[key]; },
+};
+
 globalThis.document = {
   addEventListener: () => {},
   querySelector: () => null,
@@ -665,13 +674,15 @@ test('syncPopupView adds is-entering to the incoming panel only on view switch',
     assert.ok(!classes.shortcuts.has('is-entering'), 'outgoing shortcuts panel is not hidden');
     flushRaf();
     flushRaf();
-    assert.ok(!classes.tabs.has('is-entering'), 'is-entering removed after animation applies');
+    assert.ok(classes.tabs.has('is-entering'), 'is-entering stays while the entrance animation plays');
     assert.ok(classes.tabs.has('is-ready'), 'is-ready applied to the tabs panel');
 
-    // Same-view sync (background refresh) must not re-hide the panel.
-    classes.tabs.delete('is-entering');
+    // Same-view sync (background refresh) clears is-entering so replaced
+    // content never replays the entrance animation.
     globalThis.syncPopupView();
-    assert.ok(!classes.tabs.has('is-entering'), 'same-view sync must not add is-entering');
+    assert.ok(!classes.tabs.has('is-entering'), 'same-view sync clears is-entering');
+    assert.ok(!classes.nav.has('is-entering'), 'same-view sync clears nav is-entering');
+    assert.ok(classes.tabs.has('is-ready'), 'is-ready is preserved across refreshes');
   } finally {
     globalThis.document.getElementById = originalGet;
     globalThis.document.body = originalBody;

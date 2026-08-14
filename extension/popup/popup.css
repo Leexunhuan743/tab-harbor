@@ -357,7 +357,6 @@ body.popup-shell {
   flex-direction: column;
   gap: 8px;
   padding-right: 2px;
-  scrollbar-width: thin;
 }
 
 .popup-tab-group {
@@ -489,15 +488,18 @@ body.popup-shell {
 }
 
 /* ── Scrollbars ──────────────────────────────────────────────── */
-.popup-shortcuts-grid::-webkit-scrollbar,
-.popup-tabs-list::-webkit-scrollbar {
-  width: 4px;
+/* Scrollbars are hidden everywhere (like the group nav): the panels still
+   scroll with the wheel and keyboard, and transient overflow (e.g. during
+   the entry animation) can never flash a visible scrollbar. */
+.popup-shortcuts-grid,
+.popup-tabs-list {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
 
-.popup-shortcuts-grid::-webkit-scrollbar-thumb,
-.popup-tabs-list::-webkit-scrollbar-thumb {
-  background: var(--warm-gray);
-  border-radius: 999px;
+.popup-shortcuts-grid::-webkit-scrollbar,
+.popup-tabs-list::-webkit-scrollbar {
+  display: none;
 }
 
 /* ── Empty State ─────────────────────────────────────────────── */
@@ -559,8 +561,9 @@ body.popup-shell {
   }
 }
 
-/* Animation base classes — start invisible */
-.is-entering,
+/* Animation base classes — children start invisible; the container itself
+   stays visible so a lingering .is-entering (cleared on the next same-view
+   sync) can never blank the whole panel. */
 .is-entering .group-nav-button,
 .is-entering .popup-tab-group,
 .is-entering .popup-tab-row,
@@ -573,22 +576,25 @@ body.popup-shell.is-ready {
   animation: popup-rise 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
+/* Entrance animations run only during an actual view switch: the
+   .is-entering class exists only then (added by syncPopupView), so content
+   replaced by a background refresh never replays them from opacity 0. */
 /* Shortcuts */
-.popup-shortcuts-grid.is-ready .popup-shortcut-card {
+.popup-shortcuts-grid.is-entering.is-ready .popup-shortcut-card {
   animation: shortcut-rise 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 /* Tabs — nav buttons stagger */
-.popup-group-nav-wrap.is-ready .group-nav-button {
+.popup-group-nav-wrap.is-entering.is-ready .group-nav-button {
   animation: nav-rise 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 /* Tabs — groups stagger, rows cascade after */
-.popup-tabs-list.is-ready .popup-tab-group {
+.popup-tabs-list.is-entering.is-ready .popup-tab-group {
   animation: popup-rise 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
-.popup-tabs-list.is-ready .popup-tab-row {
+.popup-tabs-list.is-entering.is-ready .popup-tab-row {
   animation: tab-rise 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
@@ -602,16 +608,15 @@ body.popup-shell.is-ready {
     transition: none !important;
     transform: none !important;
   }
-  .is-entering,
   .is-entering .group-nav-button,
   .is-entering .popup-tab-group,
   .is-entering .popup-tab-row,
   .is-entering .popup-shortcut-card,
   body.popup-shell.is-ready,
-  .popup-shortcuts-grid.is-ready .popup-shortcut-card,
-  .popup-group-nav-wrap.is-ready .group-nav-button,
-  .popup-tabs-list.is-ready .popup-tab-group,
-  .popup-tabs-list.is-ready .popup-tab-row {
+  .popup-shortcuts-grid.is-entering.is-ready .popup-shortcut-card,
+  .popup-group-nav-wrap.is-entering.is-ready .group-nav-button,
+  .popup-tabs-list.is-entering.is-ready .popup-tab-group,
+  .popup-tabs-list.is-entering.is-ready .popup-tab-row {
     opacity: 1 !important;
     animation: none !important;
     transform: none !important;

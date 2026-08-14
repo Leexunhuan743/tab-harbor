@@ -1143,6 +1143,11 @@ test('popup scrolls inside panels only, never the document', () => {
   assert.match(popupCss, /\.popup-app \{\s*[\s\S]*height: fit-content;[\s\S]*max-height: 600px;/);
   assert.match(popupCss, /\.popup-tabs-list \{[\s\S]*overflow-y: auto;/);
   assert.match(popupCss, /\.popup-shortcuts-grid \{[\s\S]*overflow-y: auto;/);
+  // Panel scrollbars are hidden like the nav's, so transient overflow (e.g.
+  // during the entry animation) can never flash a visible scrollbar.
+  assert.match(popupCss, /\.popup-shortcuts-grid,\s*\.popup-tabs-list \{\s*scrollbar-width: none;/);
+  assert.match(popupCss, /\.popup-shortcuts-grid::-webkit-scrollbar,\s*\.popup-tabs-list::-webkit-scrollbar \{\s*display: none;/);
+  assert.doesNotMatch(popupCss, /\.popup-tabs-list \{[\s\S]*scrollbar-width: thin;/);
   // The top group nav keeps horizontal scrolling but never shows a scrollbar.
   assert.match(popupCss, /\.popup-group-nav-wrap \{\s*[\s\S]*flex-wrap: nowrap;[\s\S]*flex: 0 0 auto;[\s\S]*overflow-x: auto;[\s\S]*overflow-y: hidden;[\s\S]*scrollbar-width: none;/);
   assert.match(popupCss, /\.popup-group-nav-wrap::-webkit-scrollbar \{\s*display: none;/);
@@ -1163,14 +1168,26 @@ test('popup scrolls inside panels only, never the document', () => {
   // The popup entry animation replays only on view switches, not refreshes.
   assert.match(popupJs, /const viewChanged = lastSyncedPopupView !== popupState\.view;/);
   assert.match(popupJs, /if \(viewChanged\) \{\s*\[shortcutsList, tabsList, navEl\]\.forEach\(el => \{\s*el\?\.classList\.remove\('is-ready', 'is-entering'\);/);
+  // The remembered view is shown before the async refresh resolves, so the
+  // popup never flashes the default shortcuts panel when opened on tabs.
+  assert.match(popupJs, /localStorage\.getItem\(POPUP_VIEW_KEY\) === 'tabs' \? 'tabs' : 'shortcuts'/);
+  assert.match(popupJs, /localStorage\.setItem\(POPUP_VIEW_KEY, popupState\.view\)/);
+  assert.match(popupJs, /\/\/ Apply the remembered view before the first paint[\s\S]*syncPopupView\(\);/);
+  assert.match(popupJs, /loadPopupView\(\)\s*\.then\(\(\) => \{\s*syncPopupView\(\);\s*return refreshPopupSafely\(\);/);
   // The incoming panel hides only on an actual view switch (is-entering added
   // by syncPopupView); renderers must never add it on background refreshes.
   assert.match(popupJs, /if \(viewChanged\) \{[\s\S]*shortcutsList\?\.classList\.add\('is-entering'\)/);
   assert.match(popupJs, /if \(viewChanged\) \{[\s\S]*tabsList\?\.classList\.add\('is-entering'\)/);
   assert.doesNotMatch(popupJs, /listEl\.classList\.add\('is-entering'\)/);
-  // is-entering is transient: removed when the entry animation applies.
-  assert.match(popupJs, /listEl\.classList\.remove\('is-entering'\);\s*listEl\.classList\.add\('is-ready'\);/);
-  assert.match(popupJs, /navEl\.classList\.remove\('is-entering'\);\s*listEl\.classList\.remove\('is-entering'\);/);
+  // Entrance animations are bound to .is-entering.is-ready, so refresh
+  // content (is-entering cleared by same-view sync) never replays them.
+  assert.match(popupJs, /if \(!viewChanged\) \{\s*\[shortcutsList, tabsList, navEl\]\.forEach\(el => \{\s*el\?\.classList\.remove\('is-entering'\)/);
+  assert.doesNotMatch(popupJs, /classList\.remove\('is-entering'\);\s*listEl\.classList\.add\('is-ready'\)/);
+  assert.match(popupCss, /\.popup-tabs-list\.is-entering\.is-ready \.popup-tab-group \{/);
+  assert.match(popupCss, /\.popup-tabs-list\.is-entering\.is-ready \.popup-tab-row \{/);
+  assert.match(popupCss, /\.popup-group-nav-wrap\.is-entering\.is-ready \.group-nav-button \{/);
+  assert.match(popupCss, /\.popup-shortcuts-grid\.is-entering\.is-ready \.popup-shortcut-card \{/);
+  assert.doesNotMatch(popupCss, /\.popup-tabs-list\.is-ready \.popup-tab-group \{/);
   // The popup window fits its content instead of inheriting min-height:100vh.
   const htmlBodyStart = popupCss.indexOf('html, body {');
   const htmlBodyEnd = popupCss.indexOf('\n}', htmlBodyStart);

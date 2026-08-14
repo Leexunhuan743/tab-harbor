@@ -22,6 +22,16 @@ const popupState = {
   groupLabelOverrides: {},
 };
 
+// Resolve the remembered view synchronously (localStorage is sync) so the
+// very first paint shows the correct panel. chrome.storage is async and only
+// reconciles later; without this the popup flashes the default shortcuts
+// view for the first frame(s) when the remembered view is tabs.
+try {
+  popupState.view = localStorage.getItem(POPUP_VIEW_KEY) === 'tabs' ? 'tabs' : 'shortcuts';
+} catch {
+  popupState.view = 'shortcuts';
+}
+
 // Test exposure
 globalThis.popupState = popupState;
 globalThis.loadPopupView = loadPopupView;
@@ -377,7 +387,6 @@ function renderPopupShortcuts() {
   emptyEl.hidden = popupState.quickShortcuts.length > 0;
 
   requestAnimationFrame(() => requestAnimationFrame(() => {
-    listEl.classList.remove('is-entering');
     listEl.classList.add('is-ready');
   }));
 }
@@ -508,8 +517,6 @@ function renderPopupTabs() {
   }
 
   requestAnimationFrame(() => requestAnimationFrame(() => {
-    navEl.classList.remove('is-entering');
-    listEl.classList.remove('is-entering');
     navEl.classList.add('is-ready');
     listEl.classList.add('is-ready');
   }));
@@ -561,20 +568,26 @@ function syncPopupView() {
 
   // Re-trigger animation for the incoming active panel (skip when the
   // class is already present so background refreshes cause no mutations).
-  // is-entering is transient: the double-rAF below clears it once the
-  // animation has started, so the panel never stays hidden after a switch.
+  // is-entering (set above on view switch) stays on while the entrance
+  // animation plays; only the same-view sync below clears it.
   if (!isTabs && shortcutsList && !shortcutsList.classList.contains('is-ready')) {
     requestAnimationFrame(() => requestAnimationFrame(() => {
-      shortcutsList.classList.remove('is-entering');
       shortcutsList.classList.add('is-ready');
     }));
   } else if (isTabs && tabsList && navEl) {
     requestAnimationFrame(() => requestAnimationFrame(() => {
       if (!tabsList.classList.contains('is-ready')) tabsList.classList.add('is-ready');
       if (!navEl.classList.contains('is-ready')) navEl.classList.add('is-ready');
-      tabsList.classList.remove('is-entering');
-      navEl.classList.remove('is-entering');
     }));
+  }
+
+  // Background refreshes must not replay the entrance animation: the child
+  // animations are bound to .is-entering.is-ready, so clearing is-entering
+  // here (and on every later same-view sync) keeps replaced content visible.
+  if (!viewChanged) {
+    [shortcutsList, tabsList, navEl].forEach(el => {
+      el?.classList.remove('is-entering');
+    });
   }
 }
 
@@ -748,6 +761,7 @@ function initializePopup() {
       popupState.view = actionEl.dataset.view === 'tabs' ? 'tabs' : 'shortcuts';
       syncPopupView();
       void chrome.storage.local.set({ [POPUP_VIEW_KEY]: popupState.view });
+      try { localStorage.setItem(POPUP_VIEW_KEY, popupState.view); } catch { /* storage unavailable */ }
       return;
     }
 
@@ -811,8 +825,17 @@ function initializePopup() {
     }
   });
 
+  // Apply the remembered view before the first paint (scripts run during
+  // parse, ahead of any frame) so opening on the tabs view never flashes
+  // the default shortcuts panel. loadPopupView below reconciles with
+  // chrome.storage for imports/exports.
+  syncPopupView();
+
   loadPopupView()
-    .then(() => refreshPopupSafely())
+    .then(() => {
+      syncPopupView();
+      return refreshPopupSafely();
+    })
     .then(() => requestAnimationFrame(() => document.body.classList.add('is-ready')))
     .catch(() => {
       renderPopupShortcuts();
