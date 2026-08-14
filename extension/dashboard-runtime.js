@@ -81,8 +81,21 @@ const {
 } = globalThis.TabOutBackgroundImage || {};
 
 const {
+  SEARCH_ENGINE_PRESETS: runtimeSearchEnginePresets,
+  buildSearchUrlForQuery: runtimeBuildSearchUrlForQuery,
   getSavedSessionRestoreMode: runtimeGetSavedSessionRestoreMode,
+  getSearchEngine: runtimeGetSearchEngine,
 } = globalThis.TabOutThemeControls || {};
+
+const SEARCH_ENGINE_LABEL_KEYS = {
+  google: 'searchEngineGoogle',
+  bing: 'searchEngineBing',
+  baidu: 'searchEngineBaidu',
+  sogou: 'searchEngineSogou',
+  duckduckgo: 'searchEngineDuckDuckGo',
+  brave: 'searchEngineBrave',
+  yandex: 'searchEngineYandex',
+};
 
 const {
   getCanonicalTabUrl: runtimeGetCanonicalTabUrl,
@@ -2515,9 +2528,48 @@ async function openOrFocusUrl(url) {
   return true;
 }
 
+function syncSearchPlaceholder() {
+  const input = document.getElementById('headerSearchInput');
+  if (!input) return;
+  const engine = runtimeGetSearchEngine ? runtimeGetSearchEngine() : 'default';
+  let placeholder = '';
+  if (engine === 'custom') {
+    const customUrl = ((typeof themePreferences !== 'undefined' && themePreferences.customSearchUrl) || '').trim();
+    placeholder = customUrl
+      ? (runtimeT ? runtimeT('searchPlaceholderCustom') : 'Search with a custom engine...')
+      : (runtimeT ? runtimeT('searchPlaceholderDefault') : 'Search with your default engine...');
+  } else if (engine !== 'default') {
+    const labelKey = SEARCH_ENGINE_LABEL_KEYS[engine] || '';
+    const engineName = labelKey
+      ? (runtimeT ? runtimeT(labelKey) : (runtimeSearchEnginePresets?.[engine]?.name || ''))
+      : (runtimeSearchEnginePresets?.[engine]?.name || '');
+    placeholder = runtimeT
+      ? runtimeT('searchPlaceholderEngine', { engine: engineName })
+      : `Search with ${engineName}...`;
+  } else {
+    placeholder = runtimeT ? runtimeT('searchPlaceholderDefault') : 'Search with your default engine...';
+  }
+  input.setAttribute('placeholder', placeholder);
+}
+
 async function runDefaultSearch(query) {
   const text = String(query || '').trim();
   if (!text) return;
+
+  const searchUrl = runtimeBuildSearchUrlForQuery ? runtimeBuildSearchUrlForQuery(text) : '';
+  if (searchUrl) {
+    let validSearchUrl = false;
+    try {
+      validSearchUrl = /^https?:$/.test(new URL(searchUrl).protocol);
+    } catch {
+      validSearchUrl = false;
+    }
+    if (validSearchUrl) {
+      await navigateCurrentTabToUrl(searchUrl);
+      return;
+    }
+    showToast(runtimeT ? runtimeT('toastInvalidCustomSearchUrl') : 'Invalid custom search URL, using browser default');
+  }
 
   if (chrome.search?.query) {
     await chrome.search.query({
@@ -3019,6 +3071,31 @@ function renderWorkspaceThemeTools() {
               <button class="theme-toggle-switch ${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutOpenMode === 'current-tab') ? 'is-active' : ''}" type="button" data-action="toggle-quick-shortcut-open-mode" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.quickShortcutOpenMode === 'current-tab') ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('quickShortcutOpenModeLabel') : 'Open quick links in current tab'}"></button>
               <span class="theme-menu-label theme-menu-toggle-text">${runtimeT ? runtimeT('quickShortcutOpenModeLabel') : 'Open quick links in current tab'}</span>
             </label>
+          </div>
+          <div class="theme-menu-section">
+            <div class="theme-menu-row theme-menu-row-inline-choices">
+              <div class="theme-menu-label">${runtimeT ? runtimeT('searchEngineLabel') : 'Search engine'}</div>
+              <div class="theme-mode-options" role="group" aria-label="${runtimeT ? runtimeT('searchEngineLabel') : 'Search engine'}">
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'default') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="default" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'default') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineDefault') : 'Browser default'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'google') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="google" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'google') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineGoogle') : 'Google'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'bing') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="bing" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'bing') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineBing') : 'Bing'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'baidu') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="baidu" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'baidu') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineBaidu') : 'Baidu'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'sogou') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="sogou" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'sogou') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineSogou') : 'Sogou'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'duckduckgo') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="duckduckgo" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'duckduckgo') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineDuckDuckGo') : 'DuckDuckGo'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'brave') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="brave" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'brave') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineBrave') : 'Brave'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'yandex') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="yandex" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'yandex') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineYandex') : 'Yandex'}</button>
+                <button class="theme-mode-option ${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'custom') ? 'is-active' : ''}" type="button" data-action="select-search-engine" data-engine="custom" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'custom') ? 'true' : 'false'}">${runtimeT ? runtimeT('searchEngineCustom') : 'Custom'}</button>
+              </div>
+            </div>
+          </div>
+          <div class="theme-menu-section" id="customSearchUrlSection"${(typeof themePreferences !== 'undefined' && themePreferences.searchEngine === 'custom') ? '' : ' style="display:none"'}>
+            <div class="theme-menu-row theme-menu-row-inline-select">
+              <label class="theme-menu-label" for="customSearchUrlInput">${runtimeT ? runtimeT('customSearchUrlLabel') : 'Custom search URL'}</label>
+              <input class="theme-menu-text-input" id="customSearchUrlInput" type="text" data-action="change-custom-search-url" value="${runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(((typeof themePreferences !== 'undefined' && themePreferences.customSearchUrl) || '')) : ''}" placeholder="https://example.com/search?q={query}" aria-label="${runtimeT ? runtimeT('customSearchUrlLabel') : 'Custom search URL'}" aria-describedby="customSearchUrlHint" spellcheck="false">
+            </div>
+            <div class="theme-menu-row theme-menu-row-inline-select">
+              <div class="theme-menu-label theme-menu-hint" id="customSearchUrlHint">${runtimeT ? runtimeT('customSearchUrlHint') : 'Use {query} or %s as the placeholder'}</div>
+            </div>
           </div>
           <div class="theme-menu-section">
             <div class="theme-menu-label">${runtimeT ? runtimeT('settingsExportImport') : 'Export & import'}</div>
@@ -3575,6 +3652,21 @@ document.addEventListener('click', async (e) => {
       option.setAttribute('aria-pressed', String(isActive));
     });
     setThemeMenuOpen(false, { restoreFocus: true });
+    return;
+  }
+
+  if (action === 'select-search-engine') {
+    const engine = ['default', 'google', 'bing', 'baidu', 'sogou', 'duckduckgo', 'brave', 'yandex', 'custom'].includes(actionEl.dataset.engine) ? actionEl.dataset.engine : 'default';
+    await saveThemePreferences({ searchEngine: engine });
+    syncSearchPlaceholder();
+    // renderThemeMenu does not know about this choice row, so patch it in place.
+    document.querySelectorAll('[data-action="select-search-engine"]').forEach(option => {
+      const isActive = option.dataset.engine === engine;
+      option.classList.toggle('is-active', isActive);
+      option.setAttribute('aria-pressed', String(isActive));
+    });
+    const customSection = document.getElementById('customSearchUrlSection');
+    if (customSection) customSection.style.display = engine === 'custom' ? '' : 'none';
     return;
   }
 
@@ -4551,6 +4643,17 @@ document.addEventListener('click', (e) => {
 
 // ---- Archive search — filter archived items as user types ----
 document.addEventListener('input', async (e) => {
+  const customSearchUrlInput = e.target.closest('[data-action="change-custom-search-url"]');
+  if (customSearchUrlInput) {
+    themePreferences = normalizeThemePreferences({
+      ...themePreferences,
+      customSearchUrl: customSearchUrlInput.value,
+    });
+    await chrome.storage.local.set({ [THEME_PREFERENCES_KEY]: themePreferences });
+    syncSearchPlaceholder();
+    return;
+  }
+
   if (e.target.id === 'themeTransparencyRange') {
     themePreferences = normalizeThemePreferences({
       ...themePreferences,
@@ -4803,6 +4906,7 @@ async function initializeDashboardRuntime() {
     Date.now() + 2000
   );
   await loadThemePreferences();
+  syncSearchPlaceholder();
   sleepControlEnabled = (typeof themePreferences !== 'undefined' && themePreferences.sleepControlEnabled === true);
   if (typeof loadChromeTabGroupsSetting === 'function') {
     chromeTabGroupsEnabled = await loadChromeTabGroupsSetting();

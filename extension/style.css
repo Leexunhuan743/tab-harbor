@@ -2851,6 +2851,40 @@ body.group-dragging .group-nav-button {
     box-shadow: var(--focus-ring-shadow);
 }
 
+.theme-menu-text-input {
+    width: 100%;
+    min-height: 34px;
+    border: 1px solid
+        color-mix(
+            in srgb,
+            var(--workspace-accent-border) 28%,
+            var(--warm-gray) 72%
+        );
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--card-bg) 92%, transparent);
+    color: var(--ink);
+    padding: 0 10px;
+    font-family: "Public Sans", sans-serif;
+    font-size: var(--ui-font-12);
+    outline: none;
+}
+
+.theme-menu-text-input:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
+    box-shadow: var(--focus-ring-shadow);
+}
+
+.theme-menu-text-input::placeholder {
+    color: var(--muted);
+}
+
+.theme-menu-hint {
+    font-size: var(--ui-font-10);
+    color: var(--muted);
+    line-height: 1.45;
+}
+
 .saved-session-nav-button.is-name-mode {
     width: auto;
     max-width: 220px;

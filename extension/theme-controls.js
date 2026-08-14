@@ -64,12 +64,23 @@ const SAVED_SESSION_RESTORE_MODE_ORDER = ['current-window', 'new-window'];
 const SAVED_SESSION_NAV_DISPLAY_MODE_ORDER = ['icon', 'name'];
 const QUICK_SHORTCUT_OPEN_MODE_ORDER = ['new-tab', 'current-tab'];
 const QUICK_SHORTCUT_COLS_ORDER = ['auto', '4', '5'];
+const SEARCH_ENGINE_PRESETS = {
+  google: { name: 'Google', url: 'https://www.google.com/search?q=' },
+  bing: { name: 'Bing', url: 'https://www.bing.com/search?q=' },
+  baidu: { name: 'Baidu', url: 'https://www.baidu.com/s?wd=' },
+  sogou: { name: 'Sogou', url: 'https://www.sogou.com/web?query=' },
+  duckduckgo: { name: 'DuckDuckGo', url: 'https://duckduckgo.com/?q=' },
+  brave: { name: 'Brave Search', url: 'https://search.brave.com/search?q=' },
+  yandex: { name: 'Yandex', url: 'https://yandex.com/search/?text=' },
+};
+const SEARCH_ENGINE_ORDER = ['default', ...Object.keys(SEARCH_ENGINE_PRESETS), 'custom'];
 const VALID_THEME_MODES = new Set(THEME_MODE_ORDER);
 const VALID_THEME_PALETTES = new Set(THEME_PALETTE_ORDER);
 const VALID_SAVED_SESSION_RESTORE_MODES = new Set(SAVED_SESSION_RESTORE_MODE_ORDER);
 const VALID_SAVED_SESSION_NAV_DISPLAY_MODES = new Set(SAVED_SESSION_NAV_DISPLAY_MODE_ORDER);
 const VALID_QUICK_SHORTCUT_OPEN_MODES = new Set(QUICK_SHORTCUT_OPEN_MODE_ORDER);
 const VALID_QUICK_SHORTCUT_COLS = new Set(QUICK_SHORTCUT_COLS_ORDER);
+const VALID_SEARCH_ENGINES = new Set(SEARCH_ENGINE_ORDER);
 const THEME_MODE_LABEL_KEYS = {
   system: 'themeModeSystem',
   light: 'themeModeLight',
@@ -259,6 +270,8 @@ let themePreferences = {
   savedSessionNavDisplayMode: 'name',
   quickShortcutOpenMode: 'new-tab',
   quickShortcutCols: 'auto',
+  searchEngine: 'default',
+  customSearchUrl: '',
 };
 
 let systemThemeMediaQuery = null;
@@ -286,6 +299,7 @@ function normalizeThemePreferences(input) {
   const rawSavedSessionNavDisplayMode = String(next.savedSessionNavDisplayMode || 'name');
   const rawQuickShortcutOpenMode = String(next.quickShortcutOpenMode || 'new-tab');
   const rawQuickShortcutCols = String(next.quickShortcutCols || 'auto');
+  const rawSearchEngine = String(next.searchEngine || 'default');
   return {
     mode: VALID_THEME_MODES.has(rawMode) ? rawMode : 'system',
     paletteId: VALID_THEME_PALETTES.has(rawPaletteId) ? rawPaletteId : 'paper',
@@ -300,6 +314,8 @@ function normalizeThemePreferences(input) {
     savedSessionNavDisplayMode: VALID_SAVED_SESSION_NAV_DISPLAY_MODES.has(rawSavedSessionNavDisplayMode) ? rawSavedSessionNavDisplayMode : 'name',
     quickShortcutOpenMode: VALID_QUICK_SHORTCUT_OPEN_MODES.has(rawQuickShortcutOpenMode) ? rawQuickShortcutOpenMode : 'new-tab',
     quickShortcutCols: VALID_QUICK_SHORTCUT_COLS.has(rawQuickShortcutCols) ? rawQuickShortcutCols : 'auto',
+    searchEngine: VALID_SEARCH_ENGINES.has(rawSearchEngine) ? rawSearchEngine : 'default',
+    customSearchUrl: typeof next.customSearchUrl === 'string' ? next.customSearchUrl : '',
   };
 }
 
@@ -309,6 +325,31 @@ function getQuickShortcutOpenMode(preferences = themePreferences) {
 
 function getQuickShortcutCols(preferences = themePreferences) {
   return normalizeThemePreferences(preferences).quickShortcutCols;
+}
+
+function getSearchEngine(preferences = themePreferences) {
+  return normalizeThemePreferences(preferences).searchEngine;
+}
+
+function getCustomSearchUrl(preferences = themePreferences) {
+  return normalizeThemePreferences(preferences).customSearchUrl;
+}
+
+function buildSearchUrlForQuery(query, preferences = themePreferences) {
+  const text = String(query || '').trim();
+  if (!text) return '';
+  const prefs = normalizeThemePreferences(preferences);
+  let url = '';
+  if (prefs.searchEngine === 'custom') {
+    url = String(prefs.customSearchUrl || '').trim();
+  } else if (prefs.searchEngine !== 'default') {
+    url = SEARCH_ENGINE_PRESETS[prefs.searchEngine]?.url || '';
+  }
+  if (!url) return '';
+  const encoded = encodeURIComponent(text);
+  if (url.includes('{query}')) return url.replace(/\{query\}/g, encoded);
+  if (url.includes('%s')) return url.replace(/%s/g, encoded);
+  return `${url}${encoded}`;
 }
 
 function getSavedSessionRestoreMode(preferences = themePreferences) {
@@ -2183,11 +2224,15 @@ async function saveSavedSessionNavDisplayMode(mode) {
 }
 
 globalThis.TabOutThemeControls = {
+  SEARCH_ENGINE_PRESETS,
+  buildSearchUrlForQuery,
   filterRealTabs,
+  getCustomSearchUrl,
   getQuickShortcutCols,
   getQuickShortcutOpenMode,
   getSavedSessionNavDisplayMode,
   getSavedSessionRestoreMode,
+  getSearchEngine,
   getResolvedThemeDefinition,
   getResolvedTone,
   getQuickShortcuts,

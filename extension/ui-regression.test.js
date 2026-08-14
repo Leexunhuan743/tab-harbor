@@ -1019,7 +1019,7 @@ test('quick shortcuts default to a new active tab and can opt into the current t
   assert.match(runtimeJs, /saveThemePreferences\(\{\s*quickShortcutOpenMode: nextMode\s*\}\)/);
   assert.match(runtimeJs, /toggleSwitch\.classList\.toggle\('is-active', nextMode === 'current-tab'\)/);
   assert.match(runtimeJs, /toggleSwitch\.setAttribute\('aria-pressed', String\(nextMode === 'current-tab'\)\)/);
-  assert.match(themeJs, /globalThis\.TabOutThemeControls = \{\s*filterRealTabs,\s*getQuickShortcutCols,\s*getQuickShortcutOpenMode,/);
+  assert.match(themeJs, /globalThis\.TabOutThemeControls = \{\s*SEARCH_ENGINE_PRESETS,\s*buildSearchUrlForQuery,\s*filterRealTabs,\s*getCustomSearchUrl,\s*getQuickShortcutCols,\s*getQuickShortcutOpenMode,/);
   assert.match(i18nJs, /quickShortcutOpenModeLabel: 'Open quick links in current tab'/);
   assert.match(i18nJs, /quickShortcutOpenModeLabel: '在当前标签页打开快捷链接'/);
 });
@@ -1050,6 +1050,66 @@ test('quick links per row can be fixed to 4 or 5 columns in landscape only', () 
   assert.match(i18nJs, /quickShortcutColsAuto: '自动'/);
   assert.match(i18nJs, /quickShortcutCols4: '4 列'/);
   assert.match(i18nJs, /quickShortcutCols5: '5 列'/);
+});
+
+test('search engine can be customized with presets or a custom URL', () => {
+  // Browser default stays the default so existing search behavior is preserved.
+  assert.match(themeJs, /searchEngine:\s*'default'/);
+  assert.match(themeJs, /customSearchUrl:\s*''/);
+  assert.match(themeJs, /searchEngine: VALID_SEARCH_ENGINES\.has\(rawSearchEngine\) \? rawSearchEngine : 'default',/);
+  // Presets use the correct per-engine query params (Baidu uses wd=, Sogou query=, Yandex text=).
+  assert.match(themeJs, /SEARCH_ENGINE_PRESETS = \{[\s\S]*google: \{ name: 'Google', url: 'https:\/\/www\.google\.com\/search\?q=' \},[\s\S]*baidu: \{ name: 'Baidu', url: 'https:\/\/www\.baidu\.com\/s\?wd=' \},[\s\S]*sogou: \{ name: 'Sogou', url: 'https:\/\/www\.sogou\.com\/web\?query=' \},[\s\S]*brave: \{ name: 'Brave Search', url: 'https:\/\/search\.brave\.com\/search\?q=' \},[\s\S]*yandex: \{ name: 'Yandex', url: 'https:\/\/yandex\.com\/search\/\?text=' \}/);
+  // The builder supports {query}, %s and append semantics.
+  assert.match(themeJs, /if \(url\.includes\('\{query\}'\)\) return url\.replace\(\/\\\{query\\\}\/g, encoded\);/);
+  assert.match(themeJs, /if \(url\.includes\('%s'\)\) return url\.replace\(\/%s\/g, encoded\);/);
+  assert.match(themeJs, /return `\$\{url\}\$\{encoded\}`;/);
+  // runDefaultSearch prefers the configured engine, then falls back to chrome.search.
+  assert.match(runtimeJs, /const searchUrl = runtimeBuildSearchUrlForQuery \? runtimeBuildSearchUrlForQuery\(text\) : '';/);
+  assert.match(runtimeJs, /if \(searchUrl\) \{\s*let validSearchUrl = false;[\s\S]*if \(validSearchUrl\) \{\s*await navigateCurrentTabToUrl\(searchUrl\);\s*return;\s*\}/);
+  // The Features panel exposes the engine choice row and the conditional custom URL row.
+  assert.match(runtimeJs, /data-action="select-search-engine"[\s\S]*data-engine="default"[\s\S]*data-engine="google"[\s\S]*data-engine="bing"[\s\S]*data-engine="baidu"[\s\S]*data-engine="sogou"[\s\S]*data-engine="duckduckgo"[\s\S]*data-engine="brave"[\s\S]*data-engine="yandex"[\s\S]*data-engine="custom"/);
+  assert.match(runtimeJs, /id="customSearchUrlSection"[\s\S]*data-action="change-custom-search-url"/);
+  assert.match(runtimeJs, /const engine = \['default', 'google', 'bing', 'baidu', 'sogou', 'duckduckgo', 'brave', 'yandex', 'custom'\]\.includes\(actionEl\.dataset\.engine\) \? actionEl\.dataset\.engine : 'default';/);
+  assert.match(runtimeJs, /saveThemePreferences\(\{\s*searchEngine: engine\s*\}\);\s*syncSearchPlaceholder\(\);/);
+  assert.match(runtimeJs, /querySelectorAll\('\[data-action="select-search-engine"\]'\)\.forEach\(option => \{[\s\S]*option\.dataset\.engine === engine[\s\S]*option\.classList\.toggle\('is-active', isActive\)[\s\S]*option\.setAttribute\('aria-pressed', String\(isActive\)\)/);
+  assert.match(runtimeJs, /themePreferences = normalizeThemePreferences\(\{\s*\.\.\.themePreferences,\s*customSearchUrl: customSearchUrlInput\.value,\s*\}\);\s*await chrome\.storage\.local\.set\(\{ \[THEME_PREFERENCES_KEY\]: themePreferences \}\);\s*syncSearchPlaceholder\(\);/);
+  assert.match(i18nJs, /searchEngineLabel: 'Search engine'/);
+  assert.match(i18nJs, /searchEngineDefault: 'Browser default'/);
+  assert.match(i18nJs, /searchEngineBaidu: 'Baidu'/);
+  assert.match(i18nJs, /searchEngineLabel: '搜索引擎'/);
+  assert.match(i18nJs, /searchEngineDefault: '浏览器默认'/);
+  assert.match(i18nJs, /searchEngineBaidu: 'Baidu'/);
+  assert.match(i18nJs, /customSearchUrlHint: 'Use \{query\} or %s as the placeholder'/);
+  assert.match(i18nJs, /customSearchUrlHint: '用 \{query\} 或 %s 作为占位符'/);
+  // The search box placeholder follows the selected engine.
+  assert.match(runtimeJs, /function syncSearchPlaceholder\(\) \{/);
+  assert.match(runtimeJs, /placeholder = runtimeT[\s\S]*\? runtimeT\('searchPlaceholderEngine', \{ engine: engineName \}\)[\s\S]*: `Search with \$\{engineName\}\.\.\.`;/);
+  // Empty custom URL falls back to the default placeholder so UI matches behavior.
+  assert.match(runtimeJs, /const customUrl = \(\(typeof themePreferences !== 'undefined' && themePreferences\.customSearchUrl\) \|\| ''\)\.trim\(\);/);
+  assert.match(runtimeJs, /placeholder = customUrl[\s\S]*\? \(runtimeT \? runtimeT\('searchPlaceholderCustom'\) : 'Search with a custom engine\.\.\.'\)[\s\S]*: \(runtimeT \? runtimeT\('searchPlaceholderDefault'\) : 'Search with your default engine\.\.\.'\);/);
+  assert.match(runtimeJs, /placeholder = runtimeT \? runtimeT\('searchPlaceholderDefault'\) : 'Search with your default engine\.\.\.';/);
+  assert.match(runtimeJs, /await loadThemePreferences\(\);\s*syncSearchPlaceholder\(\);/);
+  assert.match(runtimeJs, /saveThemePreferences\(\{\s*searchEngine: engine\s*\}\);\s*syncSearchPlaceholder\(\);/);
+  assert.match(runtimeJs, /customSection\.style\.display = engine === 'custom' \? '' : 'none';/);
+  // Malformed custom URLs must not replace the workspace with an error page.
+  assert.match(runtimeJs, /validSearchUrl = \/\^https\?:\$\/\.test\(new URL\(searchUrl\)\.protocol\);/);
+  assert.match(runtimeJs, /showToast\(runtimeT \? runtimeT\('toastInvalidCustomSearchUrl'\) : 'Invalid custom search URL, using browser default'\);/);
+  // The custom URL input escapes its value and points at the hint.
+  assert.match(runtimeJs, /value="\$\{runtimeEscapeHtmlAttribute \? runtimeEscapeHtmlAttribute\(\(\(typeof themePreferences !== 'undefined' && themePreferences\.customSearchUrl\) \|\| ''\)\) : ''\}" placeholder="https:\/\/example\.com\/search\?q=\{query\}"[\s\S]*aria-describedby="customSearchUrlHint"/);
+  assert.match(runtimeJs, /theme-menu-hint" id="customSearchUrlHint">\$\{runtimeT \? runtimeT\('customSearchUrlHint'\) : 'Use \{query\} or %s as the placeholder'\}/);
+  assert.match(i18nJs, /searchPlaceholderEngine: 'Search with \{engine\}\.\.\.'/);
+  assert.match(i18nJs, /searchPlaceholderEngine: '用\{engine\}搜索\.\.\.'/);
+  assert.match(i18nJs, /searchPlaceholderCustom: '用自定义搜索引擎搜索\.\.\.'/);
+  assert.match(i18nJs, /toastInvalidCustomSearchUrl: 'Invalid custom search URL, using browser default'/);
+  assert.match(i18nJs, /toastInvalidCustomSearchUrl: '自定义搜索 URL 无效，已改用浏览器默认'/);
+  // Bing and DuckDuckGo preset URLs are pinned too.
+  assert.match(themeJs, /bing: \{ name: 'Bing', url: 'https:\/\/www\.bing\.com\/search\?q=' \},[\s\S]*duckduckgo: \{ name: 'DuckDuckGo', url: 'https:\/\/duckduckgo\.com\/\?q=' \},/);
+  assert.match(i18nJs, /searchEngineBrave: 'Brave'/);
+  assert.match(i18nJs, /searchEngineSogou: 'Sogou'/);
+  assert.match(i18nJs, /searchEngineYandex: 'Yandex'/);
+  assert.match(i18nJs, /searchEngineCustom: '自定义'/);
+  assert.match(i18nJs, /customSearchUrlLabel: '自定义搜索 URL'/);
+  assert.match(i18nJs, /searchPlaceholderDefault: '用默认搜索引擎搜索\.\.\.'/);
 });
 
 test('keyboard focus receives explicit visible treatment', () => {

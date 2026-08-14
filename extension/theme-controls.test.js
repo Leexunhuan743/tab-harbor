@@ -24,6 +24,7 @@ globalThis.window = {
 require('./theme-controls.js');
 
 const {
+  buildSearchUrlForQuery,
   filterRealTabs,
   getResolvedThemeDefinition,
   getResolvedTone,
@@ -120,6 +121,55 @@ test('normalizeThemePreferences preserves quick shortcut columns when fixed', ()
 test('normalizeThemePreferences falls back to auto for invalid quick shortcut columns', () => {
   const result = normalizeThemePreferences({ quickShortcutCols: '6' });
   assert.equal(result.quickShortcutCols, 'auto');
+});
+
+test('normalizeThemePreferences defaults search engine to browser default', () => {
+  const result = normalizeThemePreferences({});
+  assert.equal(result.searchEngine, 'default');
+  assert.equal(result.customSearchUrl, '');
+});
+
+test('normalizeThemePreferences preserves search engine preset and custom URL', () => {
+  const result = normalizeThemePreferences({ searchEngine: 'baidu', customSearchUrl: 'https://example.com/search?q={query}' });
+  assert.equal(result.searchEngine, 'baidu');
+  assert.equal(result.customSearchUrl, 'https://example.com/search?q={query}');
+});
+
+test('normalizeThemePreferences falls back to default for invalid search engine', () => {
+  const result = normalizeThemePreferences({ searchEngine: 'yahoo' });
+  assert.equal(result.searchEngine, 'default');
+});
+
+test('buildSearchUrlForQuery returns empty for browser default engine', () => {
+  assert.equal(buildSearchUrlForQuery('hello', { searchEngine: 'default' }), '');
+  assert.equal(buildSearchUrlForQuery(''), '');
+});
+
+test('buildSearchUrlForQuery uses preset search URLs with encoded query', () => {
+  const googleUrl = buildSearchUrlForQuery('hello world', { searchEngine: 'google' });
+  assert.equal(googleUrl, 'https://www.google.com/search?q=hello%20world');
+  const baiduUrl = buildSearchUrlForQuery('测试', { searchEngine: 'baidu' });
+  assert.equal(baiduUrl, 'https://www.baidu.com/s?wd=' + encodeURIComponent('测试'));
+});
+
+test('buildSearchUrlForQuery replaces placeholders in custom URL', () => {
+  const braces = buildSearchUrlForQuery('a b', { searchEngine: 'custom', customSearchUrl: 'https://x.example/s?q={query}' });
+  assert.equal(braces, 'https://x.example/s?q=a%20b');
+  const percent = buildSearchUrlForQuery('a b', { searchEngine: 'custom', customSearchUrl: 'https://x.example/s?q=%s' });
+  assert.equal(percent, 'https://x.example/s?q=a%20b');
+  const appended = buildSearchUrlForQuery('a b', { searchEngine: 'custom', customSearchUrl: 'https://x.example/s?q=' });
+  assert.equal(appended, 'https://x.example/s?q=a%20b');
+});
+
+test('buildSearchUrlForQuery uses per-engine params for sogou and yandex', () => {
+  const sogouUrl = buildSearchUrlForQuery('测试', { searchEngine: 'sogou' });
+  assert.equal(sogouUrl, 'https://www.sogou.com/web?query=' + encodeURIComponent('测试'));
+  const yandexUrl = buildSearchUrlForQuery('test query', { searchEngine: 'yandex' });
+  assert.equal(yandexUrl, 'https://yandex.com/search/?text=test%20query');
+});
+
+test('buildSearchUrlForQuery returns empty when custom URL is unset', () => {
+  assert.equal(buildSearchUrlForQuery('hello', { searchEngine: 'custom', customSearchUrl: '' }), '');
 });
 
 test('normalizeThemePreferences defaults closeDuplicateNewTabsEnabled to false', () => {
