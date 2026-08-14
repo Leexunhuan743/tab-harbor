@@ -4908,6 +4908,21 @@ async function initializeDashboardRuntime() {
   await loadThemePreferences();
   syncSearchPlaceholder();
   sleepControlEnabled = (typeof themePreferences !== 'undefined' && themePreferences.sleepControlEnabled === true);
+
+  const navHost = getWorkspaceTopNavHost();
+  if (navHost && !navHost.dataset.wheelHijackAttached) {
+    navHost.dataset.wheelHijackAttached = '1';
+    // The nav scrollbars are hidden; let the vertical wheel scroll the
+    // group lists horizontally (delegated so it survives re-renders).
+    navHost.addEventListener('wheel', (e) => {
+      const list = e.target.closest('.group-nav-list');
+      if (!list) return;
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+        e.preventDefault();
+        list.scrollLeft += e.deltaY;
+      }
+    }, { passive: false });
+  }
   if (typeof loadChromeTabGroupsSetting === 'function') {
     chromeTabGroupsEnabled = await loadChromeTabGroupsSetting();
   }

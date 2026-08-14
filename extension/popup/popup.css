@@ -8,6 +8,10 @@ html, body {
   min-width: 380px;
   max-width: 420px;
   height: fit-content;
+  max-height: 600px;
+  /* The inner panels (.popup-tabs-list, .popup-shortcuts-grid) own the
+     vertical scroll; never let the popup document scroll too. */
+  overflow: hidden;
   margin: 0;
   padding: 0;
   /* subtle paper grain */
@@ -31,7 +35,8 @@ body.popup-shell {
 /* ── App Container ─────────────────────────────────────────── */
 .popup-app {
   width: 100%;
-  height: 100%;
+  height: fit-content;
+  max-height: 600px;
   display: flex;
   flex-direction: column;
   padding: 14px 16px;
@@ -266,24 +271,26 @@ body.popup-shell {
 /* ── Group Navigation ─────────────────────────────────────────── */
 .popup-group-nav-wrap {
   display: flex;
+  flex-wrap: nowrap;
+  flex: 0 0 auto;
+  align-items: center;
   overflow-x: auto;
+  overflow-y: hidden;
   gap: 6px;
   padding-bottom: 6px;
-  scrollbar-width: thin;
+  /* Keep horizontal scrolling, but never show the nav scrollbar. */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
 
 .popup-group-nav-wrap::-webkit-scrollbar {
-  height: 3px;
-}
-
-.popup-group-nav-wrap::-webkit-scrollbar-thumb {
-  background: var(--warm-gray);
-  border-radius: 999px;
+  display: none;
 }
 
 .group-nav-button {
   width: 40px;
   height: 40px;
+  flex: 0 0 40px;
   border-radius: 999px;
   border: 1px solid color-mix(in srgb, var(--warm-gray) 70%, var(--workspace-accent-border) 30%);
   background: color-mix(in srgb, var(--card-bg) calc(var(--custom-surface-opacity) + 64%), transparent);

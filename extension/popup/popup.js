@@ -9,6 +9,7 @@ const popupI18n = globalThis.TabHarborI18n || {};
 const SESSION_GROUPS_KEY = 'sessionGroups';
 const GROUP_ORDER_KEY = 'groupOrder';
 const GROUP_TAB_ORDER_KEY = 'groupTabOrder';
+const POPUP_VIEW_KEY = 'popupView';
 
 const popupState = {
   view: 'shortcuts',
@@ -22,6 +23,8 @@ const popupState = {
 
 // Test exposure
 globalThis.popupState = popupState;
+globalThis.loadPopupView = loadPopupView;
+globalThis.loadPopupState = loadPopupState;
 globalThis.buildPopupTabGroups = buildPopupTabGroups;
 globalThis.getGroupDisplayLabel = getGroupDisplayLabel;
 globalThis.escapeAttr = escapeAttr;
@@ -192,9 +195,18 @@ function getOrderedUniqueTabsForGroup(group) {
   });
 }
 
+async function loadPopupView() {
+  try {
+    const stored = await chrome.storage.local.get(POPUP_VIEW_KEY);
+    popupState.view = stored[POPUP_VIEW_KEY] === 'tabs' ? 'tabs' : 'shortcuts';
+  } catch {
+    popupState.view = 'shortcuts';
+  }
+  return popupState.view;
+}
+
 async function loadPopupState() {
-  if (globalThis._skipLoadPopupState) return;
-  const shortcutsGetter = popupTheme.getQuickShortcuts;
+  if (globalThis._skipLoadPopupState) return;  const shortcutsGetter = popupTheme.getQuickShortcuts;
   if (typeof shortcutsGetter === 'function') {
     popupState.quickShortcuts = await shortcutsGetter();
   }
@@ -662,6 +674,17 @@ function initializePopup() {
   document.addEventListener('error', handlePopupGroupNavImageError, true);
   registerPopupAutoRefresh();
 
+  const groupNavWrap = document.getElementById('popupGroupNav');
+  if (groupNavWrap) {
+    // The nav scrollbar is hidden; let the vertical wheel scroll it horizontally.
+    groupNavWrap.addEventListener('wheel', (e) => {
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+        e.preventDefault();
+        groupNavWrap.scrollLeft += e.deltaY;
+      }
+    }, { passive: false });
+  }
+
   document.addEventListener('click', async e => {
     const actionEl = e.target.closest('[data-action]');
     if (!actionEl) return;
@@ -670,6 +693,7 @@ function initializePopup() {
     if (action === 'switch-popup-view') {
       popupState.view = actionEl.dataset.view === 'tabs' ? 'tabs' : 'shortcuts';
       syncPopupView();
+      void chrome.storage.local.set({ [POPUP_VIEW_KEY]: popupState.view });
       return;
     }
 
@@ -727,7 +751,8 @@ function initializePopup() {
     }
   });
 
-  refreshPopupSafely()
+  loadPopupView()
+    .then(() => refreshPopupSafely())
     .then(() => requestAnimationFrame(() => document.body.classList.add('is-ready')))
     .catch(() => {
       renderPopupShortcuts();

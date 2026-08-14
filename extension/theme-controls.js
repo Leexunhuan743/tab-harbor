@@ -1921,6 +1921,14 @@ document.addEventListener('click', async (e) => {
     if (Date.now() < quickShortcutSuppressClickUntil) return;
     const url = actionEl.dataset.shortcutUrl;
     if (!url) return;
+    if (e.ctrlKey || e.metaKey) {
+      await chrome.tabs.create({ url, active: false });
+      return;
+    }
+    if (e.shiftKey) {
+      await chrome.windows.create({ url, focused: true });
+      return;
+    }
     if (getQuickShortcutOpenMode() === 'current-tab') {
       if (typeof navigateCurrentTabToUrl === 'function') {
         const navigated = await navigateCurrentTabToUrl(url).catch(() => false);

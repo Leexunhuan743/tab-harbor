@@ -99,6 +99,52 @@ function resetPopupTestState(opts = {}) {
   }
 }
 
+// ---- popup view persistence ----
+
+test('loadPopupView restores the saved tabs view', async () => {
+  resetPopupTestState();
+  const originalGet = globalThis.chrome.storage.local.get;
+  globalThis.chrome.storage.local.get = async key => (key === 'popupView' ? { popupView: 'tabs' } : {});
+  try {
+    const view = await loadPopupView();
+    assert.equal(view, 'tabs');
+    assert.equal(popupState.view, 'tabs');
+  } finally {
+    globalThis.chrome.storage.local.get = originalGet;
+  }
+});
+
+test('loadPopupView falls back to shortcuts for missing or invalid values', async () => {
+  resetPopupTestState();
+  const originalGet = globalThis.chrome.storage.local.get;
+  globalThis.chrome.storage.local.get = async () => ({});
+  try {
+    assert.equal(await loadPopupView(), 'shortcuts');
+  } finally {
+    globalThis.chrome.storage.local.get = originalGet;
+  }
+  globalThis.chrome.storage.local.get = async key => (key === 'popupView' ? { popupView: 'garbage' } : {});
+  try {
+    assert.equal(await loadPopupView(), 'shortcuts');
+    assert.equal(popupState.view, 'shortcuts');
+  } finally {
+    globalThis.chrome.storage.local.get = originalGet;
+  }
+});
+
+test('refreshing popup state preserves the live view instead of resetting it', async () => {
+  resetPopupTestState();
+  popupState.view = 'tabs';
+  const originalGet = globalThis.chrome.storage.local.get;
+  globalThis.chrome.storage.local.get = async () => ({ popupView: 'shortcuts' });
+  try {
+    await loadPopupState();
+    assert.equal(popupState.view, 'tabs');
+  } finally {
+    globalThis.chrome.storage.local.get = originalGet;
+  }
+});
+
 // ---- escapeAttr ----
 
 test('escapeAttr escapes & < > "', () => {

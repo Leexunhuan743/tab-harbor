@@ -1572,6 +1572,7 @@ body.theme-tone-dark .deferred-shell {
 .group-nav-button {
     width: 40px;
     height: 40px;
+    flex-shrink: 0;
     border-radius: 999px;
     border: 1px solid
         color-mix(

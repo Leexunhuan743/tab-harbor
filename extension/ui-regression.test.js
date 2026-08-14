@@ -20,6 +20,7 @@ const sessionManagerJs = fs.existsSync(path.join(__dirname, 'session-manager.js'
   ? fs.readFileSync(path.join(__dirname, 'session-manager.js'), 'utf8')
   : '';
 const popupJs = fs.readFileSync(path.join(__dirname, 'popup', 'popup.js'), 'utf8');
+const popupCss = fs.readFileSync(path.join(__dirname, 'popup', 'popup.css'), 'utf8');
 const popupHtml = fs.readFileSync(path.join(__dirname, 'popup', 'popup.html'), 'utf8');
 const configJs = fs.readFileSync(path.join(__dirname, 'config.js'), 'utf8');
 const configLoaderJs = fs.readFileSync(path.join(__dirname, 'config-loader.js'), 'utf8');
@@ -991,6 +992,8 @@ test('saved session restore supports both current-window and new-window modes', 
 test('saved tabs top nav supports icon and name display modes', () => {
   const css = fs.readFileSync(path.join(__dirname, 'style.css'), 'utf8');
 
+  // Nav chips keep their circular size and scroll instead of squeezing.
+  assert.match(css, /\.group-nav-button \{\s*width: 40px;[\s\S]*flex-shrink: 0;/);
   assert.match(sessionManagerJs, /const navDisplayMode = getSavedSessionNavDisplayModeValue\(\);/);
   assert.match(sessionManagerJs, /if \(navDisplayMode === 'name'\)/);
   assert.match(sessionManagerJs, /class="group-nav-button saved-session-nav-button is-name-mode"/);
@@ -1012,6 +1015,9 @@ test('quick shortcuts default to a new active tab and can opt into the current t
   assert.match(themeJs, /getQuickShortcutOpenMode\(\) === 'current-tab'/);
   assert.match(themeJs, /typeof navigateCurrentTabToUrl === 'function'/);
   assert.match(themeJs, /await navigateCurrentTabToUrl\(url\)\.catch\(\(\) => false\)/);
+  // Ctrl/Cmd+click opens in a background tab; Shift+click opens a new window.
+  assert.match(themeJs, /if \(e\.ctrlKey \|\| e\.metaKey\) \{\s*await chrome\.tabs\.create\(\{ url, active: false \}\);\s*return;\s*\}/);
+  assert.match(themeJs, /if \(e\.shiftKey\) \{\s*await chrome\.windows\.create\(\{ url, focused: true \}\);\s*return;\s*\}/);
   assert.match(themeJs, /await openOrFocusUrl\(url\);\s*return;\s*}\s*if \(action === 'close-shortcut-editor'\)/);
   // The Features panel exposes a switch for the mode and persists it.
   assert.match(runtimeJs, /id="themeMenuFeaturesPanel"[\s\S]*toggle-quick-shortcut-open-mode/);
@@ -1091,6 +1097,8 @@ test('search engine can be customized with presets or a custom URL', () => {
   assert.match(runtimeJs, /await loadThemePreferences\(\);\s*syncSearchPlaceholder\(\);/);
   assert.match(runtimeJs, /saveThemePreferences\(\{\s*searchEngine: engine\s*\}\);\s*syncSearchPlaceholder\(\);/);
   assert.match(runtimeJs, /customSection\.style\.display = engine === 'custom' \? '' : 'none';/);
+  assert.match(runtimeJs, /navHost\.addEventListener\('wheel', \(e\) => \{[\s\S]*e\.target\.closest\('\.group-nav-list'\)[\s\S]*if \(Math\.abs\(e\.deltaY\) > Math\.abs\(e\.deltaX\)\) \{[\s\S]*e\.preventDefault\(\);[\s\S]*list\.scrollLeft \+= e\.deltaY;/);
+  assert.match(runtimeJs, /navHost\.dataset\.wheelHijackAttached = '1';/);
   // Malformed custom URLs must not replace the workspace with an error page.
   assert.match(runtimeJs, /validSearchUrl = \/\^https\?:\$\/\.test\(new URL\(searchUrl\)\.protocol\);/);
   assert.match(runtimeJs, /showToast\(runtimeT \? runtimeT\('toastInvalidCustomSearchUrl'\) : 'Invalid custom search URL, using browser default'\);/);
@@ -1110,6 +1118,22 @@ test('search engine can be customized with presets or a custom URL', () => {
   assert.match(i18nJs, /searchEngineCustom: '自定义'/);
   assert.match(i18nJs, /customSearchUrlLabel: '自定义搜索 URL'/);
   assert.match(i18nJs, /searchPlaceholderDefault: '用默认搜索引擎搜索\.\.\.'/);
+});
+
+test('popup scrolls inside panels only, never the document', () => {
+  // The popup clamps its height and hides document overflow so the native
+  // window scrollbar never appears next to the panel scrollbars.
+  assert.match(popupCss, /html, body \{\s*[\s\S]*height: fit-content;[\s\S]*max-height: 600px;[\s\S]*overflow: hidden;/);
+  assert.match(popupCss, /\.popup-app \{\s*[\s\S]*height: fit-content;[\s\S]*max-height: 600px;/);
+  assert.match(popupCss, /\.popup-tabs-list \{[\s\S]*overflow-y: auto;/);
+  assert.match(popupCss, /\.popup-shortcuts-grid \{[\s\S]*overflow-y: auto;/);
+  // The top group nav keeps horizontal scrolling but never shows a scrollbar.
+  assert.match(popupCss, /\.popup-group-nav-wrap \{\s*[\s\S]*flex-wrap: nowrap;[\s\S]*flex: 0 0 auto;[\s\S]*overflow-x: auto;[\s\S]*overflow-y: hidden;[\s\S]*scrollbar-width: none;/);
+  assert.match(popupCss, /\.popup-group-nav-wrap::-webkit-scrollbar \{\s*display: none;/);
+  // Nav chips keep their size and overflow horizontally instead of shrinking.
+  assert.match(popupCss, /\.group-nav-button \{\s*width: 40px;[\s\S]*flex: 0 0 40px;/);
+  // With the nav scrollbar hidden, the vertical wheel scrolls it horizontally.
+  assert.match(popupJs, /groupNavWrap\.addEventListener\('wheel', \(e\) => \{[\s\S]*if \(Math\.abs\(e\.deltaY\) > Math\.abs\(e\.deltaX\)\) \{[\s\S]*e\.preventDefault\(\);[\s\S]*groupNavWrap\.scrollLeft \+= e\.deltaY;/);
 });
 
 test('keyboard focus receives explicit visible treatment', () => {
