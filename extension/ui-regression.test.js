@@ -206,6 +206,13 @@ test('new tab dashboard scopes visible open tabs to its own browser window', () 
   assert.match(runtimeJs, /async function closeTabsByUrls\(urls\) \{[\s\S]*const allTabs = await queryTabsForDashboardWindow\(\);/);
   assert.match(runtimeJs, /async function closeTabsExact\(urls\) \{[\s\S]*const allTabs = await queryTabsForDashboardWindow\(\);/);
   assert.match(runtimeJs, /async function closeDuplicateTabs\(urls, keepOne = true\) \{[\s\S]*const allTabs = await queryTabsForDashboardWindow\(\);/);
+  // Closing tabs must never remove a window's last tab: that would close
+  // the window and, for the last window, exit the browser.
+  assert.match(runtimeJs, /function ensureWindowsKeepLastTab\(allTabs, toCloseIds\) \{[\s\S]*winTabs\.every\(t => toCloseSet\.has\(t\.id\)\)[\s\S]*const keep = winTabs\.find\(t => t\.active\) \|\| winTabs\[0\];[\s\S]*toCloseSet\.delete\(keep\.id\);/);
+  assert.match(runtimeJs, /const toClose = ensureWindowsKeepLastTab\(allTabs, matched\);/);
+  // Closing a domain group starts the card exit immediately (instant visual
+  // feedback), closes the tabs in the background, then rebuilds the area.
+  assert.match(runtimeJs, /if \(action === 'close-domain-tabs'\) \{[\s\S]*animateCardOut\(card\);[\s\S]*if \(idx !== -1\) domainGroups\.splice\(idx, 1\);[\s\S]*if \(useExact\) \{\s*await closeTabsExact\(urls\);\s*\} else \{\s*await closeTabsByUrls\(urls\);[\s\S]*await renderDashboard\(\);/);
   assert.doesNotMatch(runtimeJs, /await loadSessionGroups\(openTabs\.map\(tab => tab\.id\)\)/);
   assert.doesNotMatch(runtimeJs, /await loadSessionGroups\(realTabs\.map\(tab => tab\.id\)\)/);
 });
@@ -1121,7 +1128,7 @@ test('search engine can be customized with presets or a custom URL', () => {
   assert.match(runtimeJs, /value="\$\{runtimeEscapeHtmlAttribute \? runtimeEscapeHtmlAttribute\(\(\(typeof themePreferences !== 'undefined' && themePreferences\.customSearchUrl\) \|\| ''\)\) : ''\}" placeholder="https:\/\/example\.com\/search\?q=\{query\}"[\s\S]*aria-describedby="customSearchUrlHint"/);
   assert.match(runtimeJs, /theme-menu-hint" id="customSearchUrlHint">\$\{runtimeT \? runtimeT\('customSearchUrlHint'\) : 'Use \{query\} or %s as the placeholder'\}/);
   assert.match(i18nJs, /searchPlaceholderEngine: 'Search with \{engine\}\.\.\.'/);
-  assert.match(i18nJs, /searchPlaceholderEngine: '用\{engine\}搜索\.\.\.'/);
+  assert.match(i18nJs, /searchPlaceholderEngine: '用 \{engine\} 搜索\.\.\.'/);
   assert.match(i18nJs, /searchPlaceholderCustom: '用自定义搜索引擎搜索\.\.\.'/);
   assert.match(i18nJs, /toastInvalidCustomSearchUrl: 'Invalid custom search URL, using browser default'/);
   assert.match(i18nJs, /toastInvalidCustomSearchUrl: '自定义搜索 URL 无效，已改用浏览器默认'/);

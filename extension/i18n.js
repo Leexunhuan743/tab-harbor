@@ -402,7 +402,7 @@
       customSearchUrlLabel: '自定义搜索 URL',
       customSearchUrlHint: '用 {query} 或 %s 作为占位符',
       searchPlaceholderDefault: '用默认搜索引擎搜索...',
-      searchPlaceholderEngine: '用{engine}搜索...',
+      searchPlaceholderEngine: '用 {engine} 搜索...',
       searchPlaceholderCustom: '用自定义搜索引擎搜索...',
       toastInvalidCustomSearchUrl: '自定义搜索 URL 无效，已改用浏览器默认',
       settingsExportImport: '配置备份',

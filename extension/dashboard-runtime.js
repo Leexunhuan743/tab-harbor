@@ -2414,6 +2414,26 @@ async function removeTabAssignments(tabIds = []) {
  *
  * Special case: file:// URLs are matched exactly (they have no hostname).
  */
+/**
+ * ensureWindowsKeepLastTab(allTabs, toCloseIds)
+ *
+ * Never close the last tab of any window: removing a window's final tab
+ * closes the window, and removing the final tab of the last window exits
+ * the browser. Returns the ids that may safely be closed.
+ */
+function ensureWindowsKeepLastTab(allTabs, toCloseIds) {
+  const toCloseSet = new Set(toCloseIds || []);
+  const winIds = new Set(allTabs.filter(t => toCloseSet.has(t.id)).map(t => t.windowId));
+  for (const winId of winIds) {
+    const winTabs = allTabs.filter(t => t.windowId === winId);
+    if (winTabs.length > 0 && winTabs.every(t => toCloseSet.has(t.id))) {
+      const keep = winTabs.find(t => t.active) || winTabs[0];
+      toCloseSet.delete(keep.id);
+    }
+  }
+  return [...toCloseSet];
+}
+
 async function closeTabsByUrls(urls) {
   if (!urls || urls.length === 0) return;
 
@@ -2432,7 +2452,7 @@ async function closeTabsByUrls(urls) {
   }
 
   const allTabs = await queryTabsForDashboardWindow();
-  const toClose = allTabs
+  const matched = allTabs
     .filter(tab => {
       const tabUrl = getTabCanonicalUrl(tab);
       if (tabUrl.startsWith('file://') && exactUrls.has(tabUrl)) return true;
@@ -2442,6 +2462,9 @@ async function closeTabsByUrls(urls) {
       } catch { return false; }
     })
     .map(tab => tab.id);
+  // Keep at least one tab per window so closing tabs never closes the
+  // window (or, for the last window, the browser).
+  const toClose = ensureWindowsKeepLastTab(allTabs, matched);
 
   if (toClose.length > 0) await chrome.tabs.remove(toClose);
   await fetchOpenTabs();
@@ -2458,7 +2481,10 @@ async function closeTabsExact(urls) {
   if (!urls || urls.length === 0) return;
   const urlSet = new Set(urls.map(url => runtimeGetCanonicalTabUrl ? runtimeGetCanonicalTabUrl(url) : url));
   const allTabs = await queryTabsForDashboardWindow();
-  const toClose = allTabs.filter(t => urlSet.has(getTabCanonicalUrl(t))).map(t => t.id);
+  const matched = allTabs.filter(t => urlSet.has(getTabCanonicalUrl(t))).map(t => t.id);
+  // Keep at least one tab per window so closing tabs never closes the
+  // window (or, for the last window, the browser).
+  const toClose = ensureWindowsKeepLastTab(allTabs, matched);
   if (toClose.length > 0) await chrome.tabs.remove(toClose);
   await fetchOpenTabs();
   await loadSessionGroups(getOpenTabIdsForSessionPruning());
@@ -4032,12 +4058,8 @@ document.addEventListener('click', async (e) => {
     // must use exact URL matching to avoid closing unrelated tabs
     const useExact  = group.domain === '__landing-pages__' || !!group.label;
 
-    if (useExact) {
-      await closeTabsExact(urls);
-    } else {
-      await closeTabsByUrls(urls);
-    }
-
+    // Start the card exit immediately so the close feels instant; the tabs
+    // close in the background below (the suppressed refresh syncs the rest).
     if (card) {
       playCloseSound();
       animateCardOut(card);
@@ -4046,6 +4068,17 @@ document.addEventListener('click', async (e) => {
     // Remove from in-memory groups
     const idx = domainGroups.indexOf(group);
     if (idx !== -1) domainGroups.splice(idx, 1);
+
+    // Close the tabs in the background (the card is already exiting), then
+    // rebuild so the nav and remaining cards reflect the closed group.
+    try {
+      if (useExact) {
+        await closeTabsExact(urls);
+      } else {
+        await closeTabsByUrls(urls);
+      }
+    } catch { /* swallow: tabs may already be gone */ }
+    await renderDashboard();
 
     const groupLabel = group.domain === '__landing-pages__'
       ? (runtimeT ? runtimeT('homepagesLabel') : 'Homepages')
