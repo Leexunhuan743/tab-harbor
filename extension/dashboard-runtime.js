@@ -3278,11 +3278,12 @@ function patchOpenTabsDomFromGroups(realTabs = getRealTabs(), changedGroupKeys =
 }
 
 async function buildDomainGroups(realTabs = getRealTabs()) {
-  // Landing pages (Gmail inbox, Twitter home, etc.) get their own special group
+  // Landing pages (Gmail front page, Twitter home, etc.) get their own special group
   // so they can be closed together without affecting content tabs on the same domain.
+  // Gmail inbox/sent/search views count as content tabs, not landing pages.
   const LANDING_PAGE_PATTERNS = [
     { hostname: 'mail.google.com', test: (p, h) =>
-        !h.includes('#inbox/') && !h.includes('#sent/') && !h.includes('#search/') },
+        !h.includes('#inbox') && !h.includes('#sent') && !h.includes('#search/') },
     { hostname: 'x.com',               pathExact: ['/home'] },
     { hostname: 'www.linkedin.com',    pathExact: ['/'] },
     { hostname: 'github.com',          pathExact: ['/'] },

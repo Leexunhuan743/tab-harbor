@@ -4,7 +4,7 @@
    ============================================================ */
 
 html, body {
-  width: 100%;
+  width: 400px;
   min-width: 380px;
   max-width: 420px;
   height: fit-content;
@@ -170,6 +170,22 @@ body.popup-shell {
   overflow-y: auto;
   padding-right: 2px;
   align-content: start;
+}
+
+/* Fixed column counts follow the dashboard "quick links per row" setting. */
+.popup-shortcuts-grid.is-fixed-cols-4 {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+}
+
+.popup-shortcuts-grid.is-fixed-cols-5 {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+}
+
+.popup-shortcuts-grid.is-fixed-cols-4 .popup-shortcut-card,
+.popup-shortcuts-grid.is-fixed-cols-5 .popup-shortcut-card {
+  width: 100%;
 }
 
 /* Shortcut card — matches dashboard quick-shortcut-card */

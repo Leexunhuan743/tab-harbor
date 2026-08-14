@@ -1431,11 +1431,16 @@ function renderQuickShortcutAddCard() {
   `;
 }
 
+let lastQuickShortcutsRenderKey = '';
+
 async function renderQuickShortcuts() {
   const list = document.getElementById('quickTabsList');
   if (!list) return;
 
   const shortcuts = await getQuickShortcuts();
+  const renderKey = `${JSON.stringify(shortcuts)}|${getQuickShortcutCols()}`;
+  if (renderKey === lastQuickShortcutsRenderKey && list.innerHTML) return;
+  lastQuickShortcutsRenderKey = renderKey;
   list.innerHTML = `${shortcuts.map(renderQuickShortcutCard).join('')}${renderQuickShortcutAddCard()}`;
 }
 

@@ -9,6 +9,7 @@ const popupI18n = globalThis.TabHarborI18n || {};
 const SESSION_GROUPS_KEY = 'sessionGroups';
 const GROUP_ORDER_KEY = 'groupOrder';
 const GROUP_TAB_ORDER_KEY = 'groupTabOrder';
+const GROUP_LABEL_OVERRIDES_KEY = 'groupLabelOverrides';
 const POPUP_VIEW_KEY = 'popupView';
 
 const popupState = {
@@ -19,12 +20,15 @@ const popupState = {
   sessionGroups: { groups: [], assignments: {} },
   groupOrder: { sessionOrder: [], pinnedOrder: [], pinEnabled: false },
   groupTabOrder: {},
+  groupLabelOverrides: {},
 };
 
 // Test exposure
 globalThis.popupState = popupState;
 globalThis.loadPopupView = loadPopupView;
 globalThis.loadPopupState = loadPopupState;
+globalThis.renderPopupShortcuts = renderPopupShortcuts;
+globalThis.renderPopupTabs = renderPopupTabs;
 globalThis.buildPopupTabGroups = buildPopupTabGroups;
 globalThis.getGroupDisplayLabel = getGroupDisplayLabel;
 globalThis.escapeAttr = escapeAttr;
@@ -35,11 +39,13 @@ globalThis.renderShortcutCard = renderShortcutCard;
 globalThis.renderTabGroup = renderTabGroup;
 globalThis.renderGroupNav = renderGroupNav;
 globalThis._resetPopupState = () => {
+  popupState.view = 'shortcuts';
   popupState.openTabs = [];
   popupState.tabGroups = [];
   popupState.sessionGroups = { groups: [], assignments: {} };
   popupState.groupOrder = { sessionOrder: [], pinnedOrder: [], pinEnabled: false };
   popupState.groupTabOrder = {};
+  popupState.groupLabelOverrides = {};
   popupState.quickShortcuts = [];
 };
 globalThis._skipLoadPopupState = false;
@@ -50,6 +56,7 @@ const POPUP_REFRESH_KEYS = new Set([
   'sessionGroups',
   'groupOrder',
   'groupTabOrder',
+  'groupLabelOverrides',
   'themePreferences',
   'languagePreference',
 ]);
@@ -97,8 +104,9 @@ const filterTabs = popupTheme.filterRealTabs || (tabs => Array.isArray(tabs) ? t
 
 function getLandingPatterns() {
   const base = [
+    // Gmail inbox/sent/search views are content tabs; only the bare front page is a landing.
     { hostname: 'mail.google.com', test: (_p, h) =>
-        !h.includes('#inbox/') && !h.includes('#sent/') && !h.includes('#search/') },
+        !h.includes('#inbox') && !h.includes('#sent') && !h.includes('#search/') },
     { hostname: 'x.com',               pathExact: ['/home'] },
     { hostname: 'www.linkedin.com',    pathExact: ['/'] },
     { hostname: 'github.com',          pathExact: ['/'] },
@@ -184,15 +192,9 @@ function reorderGroupTabsByStoredUrls(tabs, groupKey) {
 
 function getOrderedUniqueTabsForGroup(group) {
   const tabs = Array.isArray(group?.tabs) ? group.tabs : [];
-  const orderedTabs = reorderGroupTabsByStoredUrls(tabs, group?.domain);
-  const seenUrls = new Set();
-  return orderedTabs.filter(tab => {
-    const url = String(tab?.url || '').trim();
-    if (!url) return true;
-    if (seenUrls.has(url)) return false;
-    seenUrls.add(url);
-    return true;
-  });
+  // Reorder by the stored per-group order; every tab stays visible so
+  // duplicate URLs can be seen and closed, matching the dashboard.
+  return reorderGroupTabsByStoredUrls(tabs, group?.domain);
 }
 
 async function loadPopupView() {
@@ -205,20 +207,29 @@ async function loadPopupView() {
   return popupState.view;
 }
 
-async function loadPopupState() {
-  if (globalThis._skipLoadPopupState) return;  const shortcutsGetter = popupTheme.getQuickShortcuts;
-  if (typeof shortcutsGetter === 'function') {
-    popupState.quickShortcuts = await shortcutsGetter();
-  }
+function normalizeGroupLabelOverrides(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+  return Object.fromEntries(
+    Object.entries(input)
+      .filter(([, label]) => typeof label === 'string' && label.trim())
+      .map(([key, label]) => [String(key), label.trim()])
+  );
+}
 
-  const [tabs, tabGroups, sgResult, goResult, groupTabOrderResult] = await Promise.all([
+async function loadPopupState() {
+  if (globalThis._skipLoadPopupState) return;
+  const shortcutsGetter = popupTheme.getQuickShortcuts;
+
+  const [quickShortcuts, tabs, sgResult, goResult, groupTabOrderResult, labelOverridesResult] = await Promise.all([
+    typeof shortcutsGetter === 'function' ? shortcutsGetter() : Promise.resolve([]),
     chrome.tabs.query({}),
-    chrome.tabGroups.query({}),
     chrome.storage.local.get(SESSION_GROUPS_KEY),
     chrome.storage.local.get(GROUP_ORDER_KEY),
     chrome.storage.local.get(GROUP_TAB_ORDER_KEY),
+    chrome.storage.local.get(GROUP_LABEL_OVERRIDES_KEY),
   ]);
 
+  popupState.quickShortcuts = Array.isArray(quickShortcuts) ? quickShortcuts : [];
   popupState.openTabs = filterTabs(tabs).map(tab => ({
     id: tab.id,
     url: tab.url || '',
@@ -229,17 +240,7 @@ async function loadPopupState() {
     groupId: tab.groupId,
   }));
 
-  popupState.tabGroups = Array.isArray(tabGroups)
-    ? tabGroups
-        .map(group => ({
-          id: group.id,
-          title: group.title || '',
-          color: group.color || '',
-          collapsed: Boolean(group.collapsed),
-          tabs: popupState.openTabs.filter(tab => tab.groupId === group.id),
-        }))
-        .filter(group => group.tabs.length > 0)
-    : [];
+  popupState.groupLabelOverrides = normalizeGroupLabelOverrides(labelOverridesResult[GROUP_LABEL_OVERRIDES_KEY]);
 
   const normalizeFn = popupSessionGroups.normalizeSessionGroups;
   popupState.sessionGroups = normalizeFn ? normalizeFn(sgResult[SESSION_GROUPS_KEY]) : { groups: [], assignments: {} };
@@ -261,6 +262,7 @@ function buildPopupTabGroups() {
 
   const groupMap = {};
   const landingTabs = [];
+  const ungroupedTabs = [];
 
   for (const tab of openTabs) {
     const assignedGroupId = sessionGroups.assignments[String(tab.id)];
@@ -286,16 +288,25 @@ function buildPopupTabGroups() {
     try {
       hostname = tab.url.startsWith('file://') ? 'local-files' : new URL(tab.url).hostname;
     } catch {
+      ungroupedTabs.push(tab);
       continue;
     }
-    if (!hostname) continue;
+    if (!hostname) {
+      ungroupedTabs.push(tab);
+      continue;
+    }
 
-    if (!groupMap[hostname]) groupMap[hostname] = { domain: hostname, label: hostname, tabs: [], kind: 'domain' };
-    groupMap[hostname].tabs.push(tab);
+    const primaryDomain = popupIcons.getPrimaryDomain ? popupIcons.getPrimaryDomain(hostname) : hostname;
+    if (!groupMap[primaryDomain]) groupMap[primaryDomain] = { domain: primaryDomain, label: '', tabs: [], kind: 'domain' };
+    groupMap[primaryDomain].tabs.push(tab);
   }
 
   if (landingTabs.length > 0) {
     groupMap['__landing-pages__'] = { domain: '__landing-pages__', label: '__landing-pages__', tabs: landingTabs, kind: 'landing' };
+  }
+
+  if (ungroupedTabs.length > 0) {
+    groupMap['__ungrouped__'] = { domain: '__ungrouped__', label: '__ungrouped__', tabs: ungroupedTabs, kind: 'ungrouped' };
   }
 
   const landingHostnames = new Set(getLandingPatterns().map(p => p.hostname).filter(Boolean));
@@ -319,24 +330,37 @@ function buildPopupTabGroups() {
   });
 
   const applyOrderFn = popupGroupOrder.applyGroupOrder;
-  const orderedManual = applyOrderFn ? applyOrderFn(sessionGroupsList, groupOrder) : sessionGroupsList;
-  const orderedAuto = applyOrderFn ? applyOrderFn(sortedAutomatic, groupOrder) : sortedAutomatic;
-
-  return [...orderedManual, ...orderedAuto];
+  const mergedGroups = [...sessionGroupsList, ...sortedAutomatic];
+  return applyOrderFn ? applyOrderFn(mergedGroups, groupOrder) : mergedGroups;
 }
+
+let popupShortcutsRenderKey = '';
 
 function renderPopupShortcuts() {
   const listEl = document.getElementById('popupShortcutsList');
   const emptyEl = document.getElementById('popupShortcutsEmpty');
   if (!listEl || !emptyEl) return;
 
+  // Skip re-rendering when neither the shortcuts nor the column setting
+  // changed — background tab refreshes must not reset the grid.
+  const cols = popupTheme.getQuickShortcutCols ? popupTheme.getQuickShortcutCols() : 'auto';
+  const renderKey = `${JSON.stringify(popupState.quickShortcuts)}|${cols}`;
+  if (renderKey === popupShortcutsRenderKey) return;
+  popupShortcutsRenderKey = renderKey;
+
   listEl.classList.add('is-entering');
+  // The dashboard "quick links per row" setting controls the popup grid too.
+  listEl.classList.toggle('is-fixed-cols-4', cols === '4');
+  listEl.classList.toggle('is-fixed-cols-5', cols === '5');
   listEl.innerHTML = popupState.quickShortcuts.length
     ? popupState.quickShortcuts.map((s, i) => renderShortcutCard(s, i)).join('')
     : '';
   emptyEl.hidden = popupState.quickShortcuts.length > 0;
 
-  requestAnimationFrame(() => requestAnimationFrame(() => listEl.classList.add('is-ready')));
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    listEl.classList.remove('is-entering');
+    listEl.classList.add('is-ready');
+  }));
 }
 
 function renderShortcutCard(shortcut, index) {
@@ -377,12 +401,16 @@ function renderShortcutCard(shortcut, index) {
 function getGroupDisplayLabel(group) {
   const i18n = globalThis.TabHarborI18n || {};
   const t = i18n.t ? (key => i18n.t(key)) : (key => key);
+  if (!group) return 'Group';
+  if (popupState.groupLabelOverrides[group.domain]) {
+    return popupState.groupLabelOverrides[group.domain];
+  }
   switch (group.kind) {
     case 'landing':   return t('homepagesLabel');
     case 'session':   return group.label;
     case 'chrome-group': return group.label;
     case 'ungrouped': return t('ungroupedLabel');
-    default:          return friendlyDomain(group.domain) || group.domain;
+    default:          return group.label || (friendlyDomain(group.domain) || group.domain);
   }
 }
 
@@ -463,10 +491,14 @@ function renderPopupTabs() {
   }
 
   requestAnimationFrame(() => requestAnimationFrame(() => {
+    navEl.classList.remove('is-entering');
+    listEl.classList.remove('is-entering');
     navEl.classList.add('is-ready');
     listEl.classList.add('is-ready');
   }));
 }
+
+let lastSyncedPopupView = '';
 
 function syncPopupView() {
   const shortcutsTab = document.getElementById('popupShortcutsTab');
@@ -483,10 +515,15 @@ function syncPopupView() {
   tabsTab?.classList.toggle('is-active', isTabs);
   tabsTab?.setAttribute('aria-selected', String(isTabs));
 
-  // Strip animation classes so they replay on re-enter
-  [shortcutsList, tabsList, navEl].forEach(el => {
-    el?.classList.remove('is-ready', 'is-entering');
-  });
+  // Strip animation classes only when the view actually switched, so
+  // background refreshes do not replay the entry animation.
+  const viewChanged = lastSyncedPopupView !== popupState.view;
+  lastSyncedPopupView = popupState.view;
+  if (viewChanged) {
+    [shortcutsList, tabsList, navEl].forEach(el => {
+      el?.classList.remove('is-ready', 'is-entering');
+    });
+  }
 
   if (shortcutsPanel) {
     shortcutsPanel.hidden = isTabs;
@@ -497,13 +534,14 @@ function syncPopupView() {
     tabsPanel.classList.toggle('is-active', isTabs);
   }
 
-  // Re-trigger animation for the incoming active panel
-  if (!isTabs && shortcutsList) {
+  // Re-trigger animation for the incoming active panel (skip when the
+  // class is already present so background refreshes cause no mutations).
+  if (!isTabs && shortcutsList && !shortcutsList.classList.contains('is-ready')) {
     requestAnimationFrame(() => requestAnimationFrame(() => shortcutsList.classList.add('is-ready')));
   } else if (isTabs && tabsList && navEl) {
     requestAnimationFrame(() => requestAnimationFrame(() => {
-      tabsList.classList.add('is-ready');
-      navEl.classList.add('is-ready');
+      if (!tabsList.classList.contains('is-ready')) tabsList.classList.add('is-ready');
+      if (!navEl.classList.contains('is-ready')) navEl.classList.add('is-ready');
     }));
   }
 }
@@ -630,6 +668,9 @@ async function refreshPopupSafely() {
   popupRefreshInFlight = (async () => {
     try {
       await refreshPopup();
+    } catch (err) {
+      // A failed refresh keeps the previous snapshot; surface for debugging.
+      console.warn('[tab-harbor popup] refresh failed:', err?.message || err);
     } finally {
       popupRefreshInFlight = null;
       if (popupRefreshQueued) {
@@ -698,7 +739,7 @@ function initializePopup() {
     }
 
     if (action === 'refresh-popup') {
-      await refreshPopup();
+      await refreshPopupSafely();
       return;
     }
 

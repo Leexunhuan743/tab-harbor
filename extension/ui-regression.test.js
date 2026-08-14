@@ -1122,8 +1122,9 @@ test('search engine can be customized with presets or a custom URL', () => {
 
 test('popup scrolls inside panels only, never the document', () => {
   // The popup clamps its height and hides document overflow so the native
-  // window scrollbar never appears next to the panel scrollbars.
-  assert.match(popupCss, /html, body \{\s*[\s\S]*height: fit-content;[\s\S]*max-height: 600px;[\s\S]*overflow: hidden;/);
+  // window scrollbar never appears next to the panel scrollbars; the width
+  // is fixed so switching views never resizes the popup window.
+  assert.match(popupCss, /html, body \{\s*[\s\S]*width: 400px;[\s\S]*height: fit-content;[\s\S]*max-height: 600px;[\s\S]*overflow: hidden;/);
   assert.match(popupCss, /\.popup-app \{\s*[\s\S]*height: fit-content;[\s\S]*max-height: 600px;/);
   assert.match(popupCss, /\.popup-tabs-list \{[\s\S]*overflow-y: auto;/);
   assert.match(popupCss, /\.popup-shortcuts-grid \{[\s\S]*overflow-y: auto;/);
@@ -1134,6 +1135,37 @@ test('popup scrolls inside panels only, never the document', () => {
   assert.match(popupCss, /\.group-nav-button \{\s*width: 40px;[\s\S]*flex: 0 0 40px;/);
   // With the nav scrollbar hidden, the vertical wheel scrolls it horizontally.
   assert.match(popupJs, /groupNavWrap\.addEventListener\('wheel', \(e\) => \{[\s\S]*if \(Math\.abs\(e\.deltaY\) > Math\.abs\(e\.deltaX\)\) \{[\s\S]*e\.preventDefault\(\);[\s\S]*groupNavWrap\.scrollLeft \+= e\.deltaY;/);
+  // The dashboard "quick links per row" setting drives the popup grid too.
+  assert.match(popupJs, /const cols = popupTheme\.getQuickShortcutCols \? popupTheme\.getQuickShortcutCols\(\) : 'auto';/);
+  assert.match(popupJs, /listEl\.classList\.toggle\('is-fixed-cols-4', cols === '4'\);/);
+  assert.match(popupJs, /listEl\.classList\.toggle\('is-fixed-cols-5', cols === '5'\);/);
+  // Shortcut grids skip re-rendering when data and columns are unchanged.
+  assert.match(themeJs, /let lastQuickShortcutsRenderKey = '';/);
+  assert.match(themeJs, /if \(renderKey === lastQuickShortcutsRenderKey && list\.innerHTML\) return;/);
+  assert.match(popupJs, /let popupShortcutsRenderKey = '';/);
+  assert.match(popupJs, /if \(renderKey === popupShortcutsRenderKey\) return;/);
+  // The popup entry animation replays only on view switches, not refreshes.
+  assert.match(popupJs, /const viewChanged = lastSyncedPopupView !== popupState\.view;/);
+  assert.match(popupJs, /if \(viewChanged\) \{\s*\[shortcutsList, tabsList, navEl\]\.forEach\(el => \{\s*el\?\.classList\.remove\('is-ready', 'is-entering'\);/);
+  // is-entering is transient: removed when the entry animation applies.
+  assert.match(popupJs, /listEl\.classList\.remove\('is-entering'\);\s*listEl\.classList\.add\('is-ready'\);/);
+  assert.match(popupJs, /navEl\.classList\.remove\('is-entering'\);\s*listEl\.classList\.remove\('is-entering'\);/);
+  // Renamed group labels reach the popup; grouping uses the primary domain.
+  assert.match(popupJs, /GROUP_LABEL_OVERRIDES_KEY/);
+  assert.match(popupJs, /popupState\.groupLabelOverrides\[group\.domain\]/);
+  assert.match(popupJs, /popupIcons\.getPrimaryDomain \? popupIcons\.getPrimaryDomain\(hostname\) : hostname/);
+  assert.match(popupJs, /const mergedGroups = \[\.\.\.sessionGroupsList, \.\.\.sortedAutomatic\];/);
+  assert.match(popupJs, /ungroupedTabs\.length > 0/);
+  // A failed refresh keeps the previous snapshot instead of rejecting.
+  assert.match(popupJs, /console\.warn\('\[tab-harbor popup\] refresh failed:'/);
+  // Duplicate URLs stay visible (aligned with the dashboard) and Gmail's bare
+  // inbox is a content tab, not a landing page.
+  assert.doesNotMatch(popupJs, /seenUrls/);
+  assert.match(popupJs, /!h\.includes\('#inbox'\)/);
+  assert.match(runtimeJs, /!h\.includes\('#inbox'\)/);
+  assert.match(popupCss, /\.popup-shortcuts-grid\.is-fixed-cols-4 \{\s*display: grid;[\s\S]*grid-template-columns: repeat\(4, 1fr\);/);
+  assert.match(popupCss, /\.popup-shortcuts-grid\.is-fixed-cols-5 \{\s*display: grid;[\s\S]*grid-template-columns: repeat\(5, 1fr\);/);
+  assert.match(popupCss, /\.popup-shortcuts-grid\.is-fixed-cols-4 \.popup-shortcut-card,[\s\S]*\.popup-shortcuts-grid\.is-fixed-cols-5 \.popup-shortcut-card \{\s*width: 100%;/);
 });
 
 test('keyboard focus receives explicit visible treatment', () => {
