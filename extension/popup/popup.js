@@ -234,12 +234,14 @@ async function loadPopupState() {
 
   popupState.quickShortcuts = Array.isArray(quickShortcuts) ? quickShortcuts : [];
   // Suspended tabs (chrome-extension://…/suspended.html#uri=…) stay visible
-  // and group under their original URL, matching the dashboard. Mid-load tabs
-  // with an empty URL also stay visible in the ungrouped bucket.
+  // and group under their original URL, matching the dashboard — but only
+  // when the original URL exists. Uri-less suspended pages fall through to
+  // the normal filter and are dropped like other internal pages.
   popupState.openTabs = tabs.filter(tab => {
     const rawUrl = String(tab.url || '').trim();
     if (!rawUrl) return true;
-    if (parseSuspendedUrl(rawUrl).isSuspended) return true;
+    const suspended = parseSuspendedUrl(rawUrl);
+    if (suspended.isSuspended && suspended.originalUrl) return true;
     return filterTabs([tab]).length > 0;
   }).map(tab => {
     const rawUrl = String(tab.url || '').trim();
@@ -617,7 +619,6 @@ async function openPopupTab(tabId, fallbackUrl = '') {
     // dashboard focus-tab behavior (tabs.update + windows.update).
     try {
       await chrome.tabs.update(targetTab.id, { active: true });
-      await chrome.windows.update(targetTab.windowId, { focused: true });
     } catch {
       // The tab closed meanwhile — fall back to opening its URL here.
       const targetUrl = targetTab.url || fallbackUrl;
@@ -628,7 +629,12 @@ async function openPopupTab(tabId, fallbackUrl = '') {
           active: true,
         });
       }
+      window.close();
+      return;
     }
+    // Activating the tab is the essential step; focusing its window is
+    // best-effort — if it fails the tab is already active where it lives.
+    await chrome.windows.update(targetTab.windowId, { focused: true }).catch(() => {});
     window.close();
     return;
   }

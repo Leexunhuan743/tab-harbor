@@ -1179,8 +1179,10 @@ test('popup scrolls inside panels only, never the document', () => {
     : '';
   assert.ok(htmlBodyBlock.length > 50, 'html,body rule block should be present');
   assert.match(htmlBodyBlock, /min-height: 0;/);
-  // Suspended tabs unwrap to their original URL like the dashboard.
-  assert.match(popupJs, /parseSuspendedUrl\(rawUrl\)\.isSuspended\) return true/);
+  // Suspended tabs unwrap to their original URL like the dashboard — but only
+  // when the original URL exists (uri-less suspended pages fall through to
+  // the normal internal-page filter).
+  assert.match(popupJs, /suspended\.isSuspended && suspended\.originalUrl\) return true/);
   assert.match(popupHtml, /<script src="\.\.\/tab-url-utils\.js"><\/script>/);
   // Session groups sort by createdAt like the dashboard.
   assert.match(popupJs, /\.sort\(\(a, b\) => new Date\(a\.createdAt\) - new Date\(b\.createdAt\)\)/);
@@ -1188,6 +1190,16 @@ test('popup scrolls inside panels only, never the document', () => {
   // cannot penetrate into the row's open handler.
   assert.match(popupJs, /await refreshPopupSafely\(\);/);
   assert.match(popupJs, /popup-tab-close-btn\.is-loading'\)\) return;/);
+  // Deduplicating tabs re-renders the open-tabs area immediately instead of
+  // leaving stale duplicate chips until the next event-driven refresh.
+  assert.match(runtimeJs, /if \(action === 'dedup-keep-one'\) \{[\s\S]*await closeDuplicateTabs\(urls, true\);\s*playCloseSound\(\);[\s\S]*await renderDashboard\(\);/);
+  // Cards can merge all their tabs into one native Chrome tab group.
+  assert.match(runtimeJs, /data-action="group-card-tabs" data-domain-id="\$\{stableId\}"/);
+  assert.match(runtimeJs, /if \(action === 'group-card-tabs'\) \{[\s\S]*await chrome\.tabs\.group\(\{ tabIds \}\);\s*const label = getGroupDisplayLabel\(group\);[\s\S]*await chrome\.tabGroups\.update\(groupId, \{ title: label, color \}\)/);
+  assert.match(i18nJs, /groupCardTabsLabel: 'Merge into Chrome group'/);
+  assert.match(i18nJs, /groupCardTabsLabel: '合并为 Chrome 标签组'/);
+  assert.match(i18nJs, /toastGroupCreated: 'Created Chrome tab group'/);
+  assert.match(i18nJs, /toastGroupCreated: '已创建 Chrome 标签组'/);
   // Renamed group labels reach the popup; grouping uses the primary domain.
   assert.match(popupJs, /GROUP_LABEL_OVERRIDES_KEY/);
   assert.match(popupJs, /popupState\.groupLabelOverrides\[group\.domain\]/);

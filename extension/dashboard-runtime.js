@@ -60,6 +60,7 @@ const {
   queryExistingChromeGroups,
   setImportMode,
   subscribeToChromeTabGroupChanges,
+  assignGroupColor: runtimeAssignGroupColor,
 } = globalThis.TabOutChromeTabGroups || {};
 
 const {
@@ -2850,6 +2851,13 @@ function renderDomainCard(group) {
       </button>`;
 
   let actionsHtml = '';
+  // Merge every tab of this card into one native Chrome tab group.
+  actionsHtml += `
+    <button class="action-btn" type="button" data-action="group-card-tabs" data-domain-id="${stableId}">
+      ${runtimeT
+        ? runtimeT('groupCardTabsLabel')
+        : 'Merge into Chrome group'}
+    </button>`;
   if (hasDupes) {
     const dupeUrlsEncoded = dupeUrls.map(([url]) => encodeURIComponent(url)).join(',');
     actionsHtml += `
@@ -4126,6 +4134,38 @@ document.addEventListener('click', async (e) => {
     return;
   }
 
+  // ---- Merge all card tabs into one Chrome tab group ----
+  if (action === 'group-card-tabs') {
+    const domainId = actionEl.dataset.domainId || '';
+    const group = domainGroups.find(g => getStableGroupId(g.domain) === domainId);
+    if (!group) return;
+
+    const tabIds = getOrderedUniqueTabsForGroup(group)
+      .map(tab => Number(tab?.id))
+      .filter(id => Number.isInteger(id) && id > 0);
+    if (!tabIds.length) return;
+
+    // Suppress auto-refresh to prevent animation spam
+    window.__suppressAutoRefreshUntil = Date.now() + 2000;
+
+    try {
+      const groupId = await chrome.tabs.group({ tabIds });
+      const label = getGroupDisplayLabel(group);
+      const color = typeof runtimeAssignGroupColor === 'function'
+        ? runtimeAssignGroupColor(group.domain, 0)
+        : 'blue';
+      await chrome.tabGroups.update(groupId, { title: label, color });
+    } catch (err) {
+      showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not create Chrome tab group');
+      return;
+    }
+
+    // Rebuild so the card reflects the new native group right away.
+    await renderDashboard();
+    showToast(runtimeT ? runtimeT('toastGroupCreated') : 'Created Chrome tab group');
+    return;
+  }
+
   // ---- Close duplicates, keep one copy ----
   if (action === 'dedup-keep-one') {
     const urlsEncoded = actionEl.dataset.dupeUrls || '';
@@ -4138,26 +4178,11 @@ document.addEventListener('click', async (e) => {
     await closeDuplicateTabs(urls, true);
     playCloseSound();
 
-    // Hide the dedup button
-    actionEl.style.transition = 'opacity 0.2s';
-    actionEl.style.opacity    = '0';
-    setTimeout(() => actionEl.remove(), 200);
-
-    // Remove dupe badges from the card
-    if (card) {
-      card.querySelectorAll('.chip-dupe-badge').forEach(b => {
-        b.style.transition = 'opacity 0.2s';
-        b.style.opacity    = '0';
-        setTimeout(() => b.remove(), 200);
-      });
-      card.querySelectorAll('.duplicate-count-badge').forEach(badge => {
-        badge.style.transition = 'opacity 0.2s';
-        badge.style.opacity    = '0';
-        setTimeout(() => badge.remove(), 200);
-      });
-      card.classList.remove('has-amber-bar');
-      card.classList.add('has-neutral-bar');
-    }
+    // Rebuild the open-tabs area right away so the kept copy shows
+    // immediately. The suppression above deliberately drops the event-driven
+    // refresh, so without this call the stale duplicate chips would stay
+    // visible until the next unsuppressed tab event (~2s later).
+    await renderDashboard();
 
     showToast(runtimeT ? runtimeT('toastClosedDuplicatesKeptOne') : 'Closed duplicates, kept one copy each');
     return;
