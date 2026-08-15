@@ -59,6 +59,7 @@ const {
   populateChromeGroupMap,
   queryExistingChromeGroups,
   queryUserChromeGroups,
+  getChromeGroupsLastError,
   reorderGroupedTabs,
   muteChromeGroupEvents,
   setImportMode,
@@ -1060,14 +1061,18 @@ function ensureChromeTabGroupsSubscription() {
     // belongs to a native group, drop it from the manual session groups so the
     // next render cannot show it in two cards.
     const eventTab = event?.tab;
-    const eventGroupId = event?.tab?.groupId ?? event?.changeInfo?.groupId ?? event?.attachInfo?.groupId ?? -1;
-    // tabs.onAttached carries tabId + attachInfo (no tab object): resolve the
-    // id to a live tab once so cross-window attach-to-group is cleaned too.
+    const eventGroupId = eventTab?.groupId ?? event?.changeInfo?.groupId ?? event?.attachInfo?.groupId ?? -1;
+    // tabs.onAttached carries tabId + attachInfo (no tab object and no
+    // groupId): resolve the raw id against the live tab once so cross-window
+    // attach-to-group is cleaned too. Guard the lookup for that event source
+    // explicitly — attachInfo has no groupId, so a groupId-only guard makes
+    // the whole path unreachable.
     const rawTabId = eventTab?.id != null ? Number(eventTab.id) : (event?.tabId != null ? Number(event.tabId) : null);
+    const isAttachEvent = event?.source === 'tabs.onAttached';
     const resolveCleanup = async (tabId) => {
       if (tabId == null) return;
-      let liveGroupId = eventGroupId;
-      if (eventTab?.id == null && Number(eventGroupId) >= 0) {
+      let liveGroupId = Number(eventGroupId);
+      if (eventTab?.id == null) {
         try {
           const live = await chrome.tabs.get(tabId);
           liveGroupId = live?.groupId != null ? Number(live.groupId) : -1;
@@ -1083,7 +1088,7 @@ function ensureChromeTabGroupsSubscription() {
       // normalized shape or a newer state under race).
       void saveSessionGroups(nextState);
     };
-    if (rawTabId != null && Number(eventGroupId) >= 0) {
+    if (rawTabId != null && (Number(eventGroupId) >= 0 || isAttachEvent)) {
       void resolveCleanup(rawTabId);
     }
 
@@ -2677,7 +2682,7 @@ function buildCrossGroupTargetOrder(targetListEl, movingIds) {
   return targetIds;
 }
 
-async function moveDraggedPageChipToGroup(targetGroupKey) {
+async function moveDraggedPageChipToGroup(targetGroupKey, targetListEl = null) {
   const sourceGroupKey = pageChipDragState?.sourceGroupKey || '';
   const draggedChipId = draggedPageChipId;
   // Move the whole selection together when the dragged row is selected,
@@ -2704,14 +2709,22 @@ async function moveDraggedPageChipToGroup(targetGroupKey) {
     if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
     try {
       await chrome.tabs.group({ groupId: Number(targetGroup.chromeGroupId), tabIds: draggedTabIds });
-      // Persist the drop order into the native group too: chrome.tabs.group
-      // appends at the group tail, which would diverge from the panel order
-      // (C7). Reorder after the join so the strip matches the cards.
+      // Persist the FULL drop order into the native group too:
+      // chrome.tabs.group appends the batch at the group tail, which would
+      // diverge from the panel order when the drop lands mid-card. Build the
+      // whole target order (existing rows + batch at the placeholder) and
+      // reorder the native group to match it, so the strip follows the cards.
       const firstWindowId = draggedTabIds.length
         ? (await chrome.tabs.get(draggedTabIds[0]).catch(() => null))?.windowId
         : null;
       if (firstWindowId != null && typeof reorderGroupedTabs === 'function') {
-        await reorderGroupedTabs(Number(targetGroup.chromeGroupId), draggedTabIds.map(String), Number(firstWindowId));
+        const fullTargetOrder = targetListEl
+          ? buildCrossGroupTargetOrder(targetListEl, movingChipIds)
+          : [];
+        const orderForNative = fullTargetOrder.length
+          ? fullTargetOrder
+          : draggedTabIds.map(String);
+        await reorderGroupedTabs(Number(targetGroup.chromeGroupId), orderForNative.map(String), Number(firstWindowId));
       }
     } catch {
       // Tab(s) may have closed mid-drag; the re-render reconciles.
@@ -2863,7 +2876,7 @@ async function finishPageChipDrag() {
         // the DOM cannot diverge from the stored order.
         requiresOpenTabsRebuild = !pageChipPlaceholderEl;
       } else if (targetGroupKey) {
-        const movedGroup = await moveDraggedPageChipToGroup(targetGroupKey);
+        const movedGroup = await moveDraggedPageChipToGroup(targetGroupKey, targetListEl);
         if (movedGroup) {
           disableChromeTabGroupsImportModeForLocalEdits();
           changedGroupKeys.add(sourceGroupKey);
@@ -4016,6 +4029,15 @@ async function buildDomainGroups(realTabs = getRealTabs()) {
       console.warn('[tab-harbor] buildDomainGroups: Chrome group detection failed:', err);
     }
   }
+  // Distinguish "API failure" from "genuinely no groups": surface a throttled
+  // toast instead of silently collapsing every Chrome-group card.
+  if (typeof getChromeGroupsLastError === 'function' && getChromeGroupsLastError()) {
+    const lastToastAt = window.__chromeGroupsErrorToastAt || 0;
+    if (Date.now() - lastToastAt > 15000) {
+      window.__chromeGroupsErrorToastAt = Date.now();
+      showToast(runtimeT ? runtimeT('toastChromeGroupsUnavailable') : 'Could not read Chrome tab groups');
+    }
+  }
   const chromeOwnedTabIds = new Set((userChromeGroups || []).flatMap(g => g.tabIds || []));
   const manualGroupMap = Object.fromEntries(
     sessionGroupsState.groups.map(group => [
@@ -5100,6 +5122,9 @@ document.addEventListener('click', async (e) => {
 
     // Suppress auto-refresh to prevent animation spam
     window.__suppressAutoRefreshUntil = Date.now() + 2000;
+    // The dashboard's own group write must not echo through the event
+    // subscription (same mute contract as every other group write path).
+    if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
 
     try {
       const label = scope === 'all'

@@ -367,11 +367,12 @@ test('a tab dragged into a native group outside the dashboard drops its manual a
   // group, so the next render cannot show them in two cards. tabs.onAttached
   // has no tab object, so the callback also resolves a raw tabId live.
   assert.match(runtimeJs, /const eventTab = event\?\.tab;/);
-  assert.match(runtimeJs, /event\?\.tab\?\.groupId \?\? event\?\.changeInfo\?\.groupId \?\? event\?\.attachInfo\?\.groupId \?\? -1/);
+  assert.match(runtimeJs, /eventTab\?\.groupId \?\? event\?\.changeInfo\?\.groupId \?\? event\?\.attachInfo\?\.groupId \?\? -1/);
   assert.match(runtimeJs, /const rawTabId = eventTab\?\.id != null \? Number\(eventTab\.id\) : \(event\?\.tabId != null \? Number\(event\.tabId\) : null\);/);
+  assert.match(runtimeJs, /const isAttachEvent = event\?\.source === 'tabs\.onAttached';/);
   assert.match(runtimeJs, /const resolveCleanup = async \(tabId\) => \{/);
   assert.match(runtimeJs, /const live = await chrome\.tabs\.get\(tabId\);/);
-  assert.match(runtimeJs, /if \(rawTabId != null && Number\(eventGroupId\) >= 0\) \{\s*void resolveCleanup\(rawTabId\);/);
+  assert.match(runtimeJs, /if \(rawTabId != null && \(Number\(eventGroupId\) >= 0 \|\| isAttachEvent\)\) \{\s*void resolveCleanup\(rawTabId\);/);
   assert.match(runtimeJs, /clearTabsFromSessionGroups\(sessionGroupsState, \[tabId\]\);/);
   // C6: the cleanup does NOT write the raw nextState back in a .then — that
   // would clobber saveSessionGroups' normalized assignment.
@@ -379,12 +380,15 @@ test('a tab dragged into a native group outside the dashboard drops its manual a
   assert.doesNotMatch(runtimeJs, /void saveSessionGroups\(nextState\)\.then\(\(\) => \{\s*if \(sessionGroupsState\) sessionGroupsState = nextState;/);
 });
 
-test('cross-card drop into a Chrome group persists the drop order (C7)', () => {
-  // After chrome.tabs.group, the dropped tabs are reordered to the drop order
-  // so the native strip matches the panel; a stale windowId is never used.
+test('cross-card drop into a Chrome group persists the FULL drop order (C7)', () => {
+  // After chrome.tabs.group, the native group is reordered to the complete
+  // panel order (existing rows + batch at the placeholder), not just the batch
+  // tail order; a stale windowId is never used.
   assert.match(runtimeJs, /const firstWindowId = draggedTabIds\.length\s*\? \(await chrome\.tabs\.get\(draggedTabIds\[0\]\)\.catch\(\(\) => null\)\)\?\.windowId/);
   assert.match(runtimeJs, /if \(firstWindowId != null && typeof reorderGroupedTabs === 'function'\) \{/);
-  assert.match(runtimeJs, /reorderGroupedTabs\(Number\(targetGroup\.chromeGroupId\), draggedTabIds\.map\(String\), Number\(firstWindowId\)\)/);
+  assert.match(runtimeJs, /const fullTargetOrder = targetListEl\s*\?\s*buildCrossGroupTargetOrder\(targetListEl, movingChipIds\)\s*: \[\];/);
+  assert.match(runtimeJs, /const orderForNative = fullTargetOrder\.length\s*\?\s*fullTargetOrder\s*: draggedTabIds\.map\(String\);/);
+  assert.match(runtimeJs, /reorderGroupedTabs\(Number\(targetGroup\.chromeGroupId\), orderForNative\.map\(String\), Number\(firstWindowId\)\)/);
 });
 
 test('sleep/discard failures reset the refresh suppression window (C8)', () => {

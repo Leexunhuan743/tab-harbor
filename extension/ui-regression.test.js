@@ -207,16 +207,15 @@ test('new tab dashboard scopes visible open tabs to its own browser window', () 
   assert.match(runtimeJs, /async function queryTabsForDashboardWindow\(\) \{[\s\S]*chrome\.tabs\.query\(\{\s*windowId: currentWindowId\s*\}\)/);
   assert.doesNotMatch(runtimeJs, /if \(currentDashboardWindowId != null\) return currentDashboardWindowId;/);
   assert.match(runtimeJs, /await loadSessionGroups\(getOpenTabIdsForSessionPruning\(\)\)/);
-  assert.match(runtimeJs, /async function closeTabsByUrls\(urls\) \{[\s\S]*const allTabs = await queryTabsForDashboardWindow\(\);/);
-  assert.match(runtimeJs, /async function closeTabsExact\(urls\) \{[\s\S]*const allTabs = await queryTabsForDashboardWindow\(\);/);
-  assert.match(runtimeJs, /async function closeDuplicateTabs\(urls, keepOne = true\) \{[\s\S]*const allTabs = await queryTabsForDashboardWindow\(\);/);
+  assert.match(runtimeJs, /async function closeTabsByUrlsSafely\(urls,\s*\{ exact = false, playSound = true \} = \{\}\) \{[\s\S]*const allTabs = await queryTabsForDashboardWindow\(\);/);
+  assert.match(runtimeJs, /async function closeDuplicatesByUrls\(urls,\s*\{ keepOne = true, playSound = true \} = \{\}\) \{[\s\S]*const allTabs = await queryTabsForDashboardWindow\(\);/);
   // Closing tabs must never remove a window's last tab: that would close
   // the window and, for the last window, exit the browser.
   assert.match(runtimeJs, /function ensureWindowsKeepLastTab\(allTabs, toCloseIds\) \{[\s\S]*winTabs\.every\(t => toCloseSet\.has\(t\.id\)\)[\s\S]*const keep = winTabs\.find\(t => t\.active\) \|\| winTabs\[0\];[\s\S]*toCloseSet\.delete\(keep\.id\);/);
-  assert.match(runtimeJs, /const toClose = ensureWindowsKeepLastTab\(allTabs, matched\);/);
+  assert.match(runtimeJs, /const safeToClose = ensureWindowsKeepLastTab\(allTabs, tabIds\);/);
   // Closing a domain group starts the card exit immediately (instant visual
   // feedback), closes the tabs in the background, then rebuilds the area.
-  assert.match(runtimeJs, /if \(action === 'close-domain-tabs'\) \{[\s\S]*animateCardOut\(card\);[\s\S]*if \(idx !== -1\) domainGroups\.splice\(idx, 1\);[\s\S]*if \(useExact\) \{\s*await closeTabsExact\(urls\);\s*\} else \{\s*await closeTabsByUrls\(urls\);[\s\S]*await renderDashboard\(\);/);
+  assert.match(runtimeJs, /if \(action === 'close-domain-tabs'\) \{[\s\S]*animateCardOut\(card\);[\s\S]*if \(idx !== -1\) domainGroups\.splice\(idx, 1\);[\s\S]*await closeTabsByUrlsSafely\(urls, \{ exact: useExact, playSound: false \}\);[\s\S]*await renderDashboard\(\);/);
   assert.doesNotMatch(runtimeJs, /await loadSessionGroups\(openTabs\.map\(tab => tab\.id\)\)/);
   assert.doesNotMatch(runtimeJs, /await loadSessionGroups\(realTabs\.map\(tab => tab\.id\)\)/);
 });
@@ -1256,11 +1255,11 @@ test('popup scrolls inside panels only, never the document', () => {
   assert.match(popupJs, /popup-tab-close-btn\.is-loading'\)\) return;/);
   // Deduplicating tabs re-renders the open-tabs area immediately instead of
   // leaving stale duplicate chips until the next event-driven refresh.
-  assert.match(runtimeJs, /if \(action === 'dedup-keep-one'\) \{[\s\S]*await closeDuplicateTabs\(urls, true\);\s*playCloseSound\(\);[\s\S]*await renderDashboard\(\);/);
+  assert.match(runtimeJs, /if \(action === 'dedup-keep-one'\) \{[\s\S]*await closeDuplicatesByUrls\(urls, \{ keepOne: true, playSound: false \}\);\s*playCloseSound\(\);[\s\S]*await renderDashboard\(\);/);
   // Cards can merge all their tabs into one native Chrome tab group; the
   // section header reuses the action with scope="all" to group every card.
   assert.match(runtimeJs, /data-action="group-card-tabs" data-domain-id="\$\{stableId\}"/);
-  assert.match(runtimeJs, /if \(action === 'group-card-tabs'\) \{[\s\S]*const scope = actionEl\.dataset\.scope \|\| '';[\s\S]*await groupTabsWithStaleRetry\(tabIds\);\s*const label = scope === 'all'[\s\S]*getGroupDisplayLabel\(group\);[\s\S]*await chrome\.tabGroups\.update\(groupId, \{ title: label, color \}\)/);
+  assert.match(runtimeJs, /if \(action === 'group-card-tabs'\) \{[\s\S]*const scope = actionEl\.dataset\.scope \|\| '';[\s\S]*const label = scope === 'all'[\s\S]*getGroupDisplayLabel\(group\);[\s\S]*await mergeTabsIntoChromeGroup\(tabIds, \{ title: label, color \}\)/);
   assert.match(i18nJs, /groupCardTabsLabel: 'Merge into Chrome group'/);
   assert.match(i18nJs, /groupCardTabsLabel: '合并为 Chrome 标签组'/);
   assert.match(i18nJs, /toastGroupCreated: 'Created Chrome tab group'/);
