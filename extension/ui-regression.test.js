@@ -1391,6 +1391,13 @@ test('discard tab supports per-chip, group-level, and global sleep-all with gate
   assert.match(runtimeJs, /page-chip--discarded/);
   assert.match(runtimeJs, /if \(action === 'discard-tab'\)\s*\{[\s\S]*await fetchOpenTabs\(\);[\s\S]*await renderDashboard\(\);/);
   assert.match(runtimeJs, /if \(action === 'sleep-domain-tabs'\)\s*\{[\s\S]*await fetchOpenTabs\(\);[\s\S]*await renderDashboard\(\);/);
+  // The section-header sleep-all uses its own "all tabs" label; the per-group
+  // card keeps the "in group" label.
+  assert.match(runtimeJs, /data-action="sleep-all-open-tabs" aria-label="\$\{runtimeT \? runtimeT\('sleepAllOpenTabsButton'\) : 'Sleep all tabs'\}"/);
+  assert.match(runtimeJs, /data-action="sleep-domain-tabs"[\s\S]{0,120}aria-label="\$\{runtimeT \? runtimeT\('sleepAllTabsButton'\) : 'Sleep all tabs in group'\}"/);
+  const i18nJs = fs.readFileSync(path.join(__dirname, 'i18n.js'), 'utf8');
+  assert.match(i18nJs, /sleepAllOpenTabsButton: 'Sleep all tabs'/);
+  assert.match(i18nJs, /sleepAllOpenTabsButton: '休眠全部标签页'/);
 
   const css = fs.readFileSync(path.join(__dirname, 'style.css'), 'utf8');
   assert.match(css, /\.chip-discard:hover\s*\{[\s\S]*color:\s*var\(--muted\);/);
