@@ -366,6 +366,10 @@ test('background keeps the toolbar badge empty', () => {
   assert.doesNotMatch(backgroundJs, /String\(count\)/);
 });
 
+test('background notifies pages when a tab is replaced (stale chip root cause)', () => {
+  assert.match(backgroundJs, /chrome\.tabs\.onReplaced\.addListener\(\(addedTabId\) => \{\s*updateBadge\(\);\s*notifyTabHarborPages\(\{ source: "tabs\.onReplaced", triggerTabId: addedTabId \}\)/);
+});
+
 test('manifest keeps only permissions required by the shipped runtime', () => {
   const manifest = fs.readFileSync(path.join(__dirname, 'manifest.json'), 'utf8');
 

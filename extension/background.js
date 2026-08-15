@@ -129,6 +129,14 @@ chrome.tabs.onUpdated.addListener((tabId) => {
   notifyTabHarborPages({ source: "tabs.onUpdated", triggerTabId: tabId });
 });
 
+// A tab can be replaced with a different tab id (OAuth/redirect flows,
+// prerendering). Without this, pages keep chips for tab ids that no longer
+// exist, and actions on those stale chips corrupt grouping state.
+chrome.tabs.onReplaced.addListener((addedTabId) => {
+  updateBadge();
+  notifyTabHarborPages({ source: "tabs.onReplaced", triggerTabId: addedTabId });
+});
+
 // ─── Initial run ─────────────────────────────────────────────────────────────
 
 // Run once immediately when the service worker first loads

@@ -4291,6 +4291,22 @@ document.addEventListener('click', async (e) => {
 
     window.__suppressAutoRefreshUntil = Date.now() + 2000;
 
+    // A chip can outlive its tab when the tab is replaced/closed without a
+    // refresh (e.g. an OAuth/redirect flow swaps the tab id). Sleeping a ghost
+    // id would silently no-op, and the re-render would then drop the dangling
+    // manual-group assignment — making the card structure look wrong. Detect it
+    // up front: re-render to drop the ghost row, and let the refresh prune any
+    // dangling assignment.
+    let liveTab = null;
+    try { liveTab = await chrome.tabs.get(Number(tabId)); } catch { liveTab = null; }
+    if (!liveTab) {
+      await renderDashboard();
+      updateBackToTopVisibility();
+      window.__suppressAutoRefreshUntil = 0;
+      showToast(runtimeT ? runtimeT('toastTabAlreadyClosed') || 'Tab already closed' : 'Tab already closed');
+      return;
+    }
+
     const discarded = await discardTab(Number(tabId));
     if (!discarded) {
       showToast(runtimeT ? runtimeT('toastTabDiscardFailed') || 'Failed to sleep tab' : 'Failed to sleep tab');
@@ -4353,8 +4369,13 @@ document.addEventListener('click', async (e) => {
     let discarded = 0;
     let failed = 0;
     let skippedActive = 0;
+    let stale = 0;
     for (const tabId of tabIds) {
       const tab = openTabs.find(t => Number(t?.id) === tabId);
+      // Ghost chip: the tab is already gone (replaced/closed without a
+      // refresh). The re-render below drops the row and prunes any dangling
+      // manual-group assignment — do not count it as discarded.
+      if (!tab) { stale += 1; continue; }
       if (tab?.active) { skippedActive += 1; continue; }
       if (await discardTab(tabId)) discarded += 1;
       else failed += 1;
@@ -4369,6 +4390,8 @@ document.addEventListener('click', async (e) => {
       showToast(runtimeT ? runtimeT('toastTabDiscardFailed') : 'Failed to sleep tab');
     } else if (skippedActive > 0) {
       showToast(runtimeT ? runtimeT('toastBatchSleepNone') : 'Selected tabs are active');
+    } else if (stale > 0) {
+      showToast(runtimeT ? runtimeT('toastTabAlreadyClosed') : 'Tab already closed');
     }
     return;
   }

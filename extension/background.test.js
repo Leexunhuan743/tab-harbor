@@ -36,6 +36,7 @@ globalThis.chrome = {
     onCreated: { addListener: () => {} },
     onRemoved: { addListener: () => {} },
     onUpdated: { addListener: () => {} },
+    onReplaced: { addListener: () => {} },
   },
   action: {
     setBadgeText: async () => {},

@@ -38,6 +38,7 @@ function buildChrome() {
       onCreated: { addListener: (cb) => { captured.onCreated = cb; } },
       onRemoved: { addListener: (cb) => { captured.onRemoved = cb; } },
       onUpdated: { addListener: (cb) => { captured.onUpdated = cb; } },
+      onReplaced: { addListener: (cb) => { captured.onReplaced = cb; } },
     },
     storage: {
       local: { get: async () => ({}) },
@@ -108,4 +109,22 @@ test('non-connection errors from sendMessage are surfaced via console.warn', asy
 
   assert.strictEqual(state.warnCalls.length, 1);
   assert.match(state.warnCalls[0].join(' '), /unexpected broadcast failure/);
+});
+
+test('tab replacement broadcasts via chrome.runtime.sendMessage', async () => {
+  const { chrome, captured, state } = buildChrome();
+  chrome.runtime.sendMessage = async (msg) => {
+    state.sendMessageCalls.push(msg);
+  };
+  loadBackground(chrome);
+  assert.ok(captured.onReplaced, 'background should register a tabs.onReplaced listener');
+
+  await captured.onReplaced(123);
+
+  assert.strictEqual(state.sendMessageCalls.length, 1);
+  assert.deepStrictEqual(state.sendMessageCalls[0], {
+    action: 'tabs-changed',
+    source: 'tabs.onReplaced',
+    triggerTabId: 123,
+  });
 });

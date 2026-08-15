@@ -245,6 +245,15 @@ test('batch sleep distinguishes failed from skipped-active tabs', () => {
   assert.match(runtimeJs, /if \(discarded > 0\) \{[\s\S]{0,300}showToast\(runtimeT \? runtimeT\('toastTabsDiscarded', \{ count: discarded \}\)[\s\S]{0,200}toastTabDiscardFailed[\s\S]{0,300}toastBatchSleepNone/);
 });
 
+test('sleeping a stale (ghost) chip re-renders instead of silently corrupting grouping', () => {
+  // Per-chip sleep detects a tab id that no longer exists in Chrome and
+  // re-renders (dropping the ghost row and pruning its dangling assignment).
+  assert.match(runtimeJs, /let liveTab = null;\s*try \{ liveTab = await chrome\.tabs\.get\(Number\(tabId\)\); \} catch \{ liveTab = null; \}[\s\S]{0,300}if \(!liveTab\) \{\s*await renderDashboard\(\);\s*updateBackToTopVisibility\(\);\s*window\.__suppressAutoRefreshUntil = 0;\s*showToast\(runtimeT \? runtimeT\('toastTabAlreadyClosed'\)/);
+  // Batch sleep skips ghost ids instead of counting them as discarded.
+  assert.match(runtimeJs, /if \(!tab\) \{ stale \+= 1; continue; \}/);
+  assert.match(runtimeJs, /} else if \(stale > 0\) \{\s*showToast\(runtimeT \? runtimeT\('toastTabAlreadyClosed'\) : 'Tab already closed'\);/);
+});
+
 test('touch/pen synthesized clicks do not double-toggle the row', () => {
   assert.match(runtimeJs, /let pageChipPointerToggleGuard = \{ key: '', until: 0 \};/);
   assert.match(runtimeJs, /pageChipPointerToggleGuard = \{ key: String\(draggedPageChipId \|\| ''\), until: Date\.now\(\) \+ 400 \};/);
