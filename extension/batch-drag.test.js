@@ -302,9 +302,12 @@ test('close-single-tab tolerates a tab that vanished before the click', () => {
 });
 
 test('close-duplicates keeps every window\'s last tab like the other close paths', () => {
-  // closeDuplicateTabs routes its removals through ensureWindowsKeepLastTab so
-  // deduplication can never close a window (or, for the last window, Chrome).
-  assert.match(runtimeJs, /const safeToClose = ensureWindowsKeepLastTab\(allTabs, toClose\);\s*if \(safeToClose\.length > 0\) await chrome\.tabs\.remove\(safeToClose\);/);
+  // closeDuplicatesByUrls routes removals through closeTabsSafely, which uses
+  // ensureWindowsKeepLastTab, so deduplication can never close a window (or,
+  // for the last window, Chrome).
+  assert.match(runtimeJs, /async function closeTabsSafely\(tabIds,\s*\{ playSound = true \} = \{\}\) \{[\s\S]{0,400}const safeToClose = ensureWindowsKeepLastTab\(allTabs, tabIds\);/);
+  assert.match(runtimeJs, /async function closeDuplicatesByUrls\(urls,\s*\{ keepOne = true, playSound = true \} = \{\}\) \{/);
+  assert.match(runtimeJs, /return closeTabsSafely\(toClose, \{ playSound \}\);/);
 });
 
 test('the card-header actions wrapper left no orphaned .actions CSS rule', () => {
@@ -392,9 +395,9 @@ test('sleep/discard failures reset the refresh suppression window (C8)', () => {
   assert.ok(suppressSets >= 6, `expected >=6 suppress sets, got ${suppressSets}`);
   assert.ok(resets >= 6, `expected >=6 resets, got ${resets}`);
   // Failed single-tab discard resets.
-  assert.match(runtimeJs, /if \(!discarded\) \{\s*window\.__suppressAutoRefreshUntil = 0;/);
+  assert.match(runtimeJs, /if \(failed > 0 \|\| discarded === 0\) \{\s*window\.__suppressAutoRefreshUntil = 0;/);
   // Failed group/all sleep resets.
-  assert.match(runtimeJs, /if \(!succeeded\) \{\s*window\.__suppressAutoRefreshUntil = 0;/);
+  assert.match(runtimeJs, /if \(discarded === 0\) \{\s*window\.__suppressAutoRefreshUntil = 0;/);
 });
 
 test('chrome group cards survive a lagging tab snapshot with a placeholder row (C12)', () => {
@@ -537,13 +540,11 @@ test('batch dedup closes duplicates inside the selection only, keeping one per U
   // The handler scopes dedup to the selected tab ids (getTabsByIds), keeps the
   // active copy, and routes removals through ensureWindowsKeepLastTab.
   assert.match(runtimeJs, /if \(action === 'batch-dedup-selection'\) \{/);
-  assert.match(runtimeJs, /const selectedTabs = getTabsByIds\(tabIds\);/);
-  assert.match(runtimeJs, /const keep = tabs\.find\(t => t\.active\) \|\| tabs\[0\];/);
-  assert.match(runtimeJs, /const safeToClose = ensureWindowsKeepLastTab\(allTabs, toClose\);/);
-  assert.match(runtimeJs, /await chrome\.tabs\.remove\(tabId\);\s*closedCount \+= 1;\s*closedTabIds\.add\(Number\(tabId\)\);/);
+  assert.match(runtimeJs, /const tabIds = getSelectedBatchTabIds\(\);/);
+  assert.match(runtimeJs, /const \{ closedCount, closedTabIds \} = await closeDuplicatesInSelection\(tabIds\);/);
   assert.match(runtimeJs, /const chipTabIds = getPageChipTabIdMap\(\);/);
   assert.match(runtimeJs, /const keptChipIds = \[\.\.\.selectedPageChipIds\]\.filter\(chipId => \{/);
-  assert.match(runtimeJs, /selectedPageChipIds = new Set\(keptChipIds\);/);
+  assert.match(runtimeJs, /await finishBatchAction\(\{ keptChipIds \}\)/);
   assert.match(runtimeJs, /toastBatchClosedDuplicates', \{ count: closedCount \}\)/);
   assert.match(runtimeJs, /toastBatchNoDuplicates/);
   const i18nJs = fs.readFileSync(path.join(__dirname, 'i18n.js'), 'utf8');
@@ -601,8 +602,8 @@ test('batch merge names the group from the selected tabs content (domain heurist
 });
 
 test('batch close never closes a window\'s last tab', () => {
-  assert.match(runtimeJs, /async function closeTabsSafely\(tabIds\) \{[\s\S]{0,400}const allTabs = await queryTabsForDashboardWindow\(\);\s*const safeToClose = ensureWindowsKeepLastTab\(allTabs, tabIds\);/);
-  assert.match(runtimeJs, /if \(closedCount > 0\) playCloseSound\(\);/);
+  assert.match(runtimeJs, /async function closeTabsSafely\(tabIds,\s*\{ playSound = true \} = \{\}\) \{[\s\S]{0,400}const allTabs = await queryTabsForDashboardWindow\(\);\s*const safeToClose = ensureWindowsKeepLastTab\(allTabs, tabIds\);/);
+  assert.match(runtimeJs, /if \(closedCount > 0 && playSound\) playCloseSound\(\);/);
 });
 
 test('finishBatchAction syncs selection UI and always resets the refresh suppression', () => {
@@ -633,19 +634,22 @@ test('batch sleep distinguishes failed from skipped-active tabs', () => {
   // resolves through the DOM so chip sort ids from every card are preserved.
   assert.match(runtimeJs, /function getPageChipTabIdMap\(\) \{/);
   assert.match(runtimeJs, /const chipTabIds = getPageChipTabIdMap\(\);/);
-  assert.match(runtimeJs, /const keptChipIds = \[\];/);
-  assert.match(runtimeJs, /keptChipIds\.push\(String\(chipId\)\);/);
-  assert.match(runtimeJs, /selectedPageChipIds = new Set\(keptChipIds\);\s*pageChipSelectionAnchorId = '';/);
+  assert.match(runtimeJs, /const tabIds = \[\.\.\.selectedPageChipIds\]\s*\.map\(chipId => chipTabIds\.get\(String\(chipId\)\)\)\s*\.filter\(tabId => tabId != null\);/);
+  assert.match(runtimeJs, /const \{ discarded, failed, skippedActive, stale, resultsByTabId \} = await sleepTabsByIds\(tabIds, \{ skipActive: true \}\);/);
+  assert.match(runtimeJs, /const keptChipIds = \[\.\.\.selectedPageChipIds\]\.filter\(chipId => \{/);
+  assert.match(runtimeJs, /await finishBatchAction\(\{ keptChipIds \}\)/);
 });
 
 test('sleeping a stale (ghost) chip re-renders instead of silently corrupting grouping', () => {
-  // Per-chip sleep detects a tab id that no longer exists in Chrome and
-  // re-renders (dropping the ghost row and pruning its dangling assignment).
-  assert.match(runtimeJs, /let liveTab = null;\s*try \{ liveTab = await chrome\.tabs\.get\(Number\(tabId\)\); \} catch \{ liveTab = null; \}[\s\S]{0,300}if \(!liveTab\) \{\s*await renderDashboard\(\);\s*updateBackToTopVisibility\(\);\s*window\.__suppressAutoRefreshUntil = 0;\s*showToast\(runtimeT \? runtimeT\('toastTabAlreadyClosed'\)/);
-  // Batch sleep uses the SAME live pre-check (the in-memory openTabs snapshot
-  // still holds the ghost id, so a snapshot lookup can never classify it) and
-  // counts dead ids as stale instead of discarded.
-  assert.match(runtimeJs, /let liveTab = null;\s*try \{ liveTab = await chrome\.tabs\.get\(tabId\); \} catch \{ liveTab = null; \}[\s\S]{0,120}if \(!liveTab\) \{ stale \+= 1; continue; \}/);
+  // sleepTabsByIds detects a tab id that no longer exists in Chrome via a live
+  // chrome.tabs.get and counts it as stale; the per-chip handler re-renders to
+  // drop the ghost row and prune its dangling assignment.
+  assert.match(runtimeJs, /async function sleepTabsByIds\(tabIds,\s*\{ skipActive = true \} = \{\}\) \{/);
+  assert.match(runtimeJs, /let liveTab = null;\s*try \{ liveTab = await chrome\.tabs\.get\(tabId\); \} catch \{ liveTab = null; \}[\s\S]{0,120}if \(!liveTab\) \{\s*stale \+= 1;/);
+  assert.match(runtimeJs, /if \(stale > 0\) \{\s*await renderDashboard\(\);\s*updateBackToTopVisibility\(\);\s*window\.__suppressAutoRefreshUntil = 0;\s*showToast\(runtimeT \? runtimeT\('toastTabAlreadyClosed'\)/);
+  // Batch sleep uses the same helper and keeps only chips whose tab id is in
+  // resultsByTabId (stale ids are excluded by the helper).
+  assert.match(runtimeJs, /const \{ discarded, failed, skippedActive, stale, resultsByTabId \} = await sleepTabsByIds\(tabIds, \{ skipActive: true \}\);/);
   assert.match(runtimeJs, /} else if \(stale > 0\) \{\s*showToast\(runtimeT \? runtimeT\('toastTabAlreadyClosed'\) : 'Tab already closed'\);/);
 });
 

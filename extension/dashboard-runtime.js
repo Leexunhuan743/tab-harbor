@@ -1362,6 +1362,20 @@ function getSelectedBatchTabIds() {
   return [...new Set(collected.tabIds.map(Number).filter(Number.isFinite))];
 }
 
+async function refreshTabData() {
+  await fetchOpenTabs();
+  await loadSessionGroups(getOpenTabIdsForSessionPruning());
+}
+
+async function runWithSuppressedRefresh(task) {
+  window.__suppressAutoRefreshUntil = Date.now() + 2000;
+  try {
+    return await task();
+  } finally {
+    window.__suppressAutoRefreshUntil = 0;
+  }
+}
+
 function beginBatchAction() {
   window.__suppressAutoRefreshUntil = Date.now() + 2000;
 }
@@ -1386,7 +1400,7 @@ async function finishBatchAction({ clearSelection = false, keptChipIds = null } 
   }
 }
 
-async function closeTabsSafely(tabIds) {
+async function closeTabsSafely(tabIds, { playSound = true } = {}) {
   let closedCount = 0;
   const closedTabIds = new Set();
   if (tabIds.length) {
@@ -1402,9 +1416,131 @@ async function closeTabsSafely(tabIds) {
         // selection-preservation paths below keep it visible/selected.
       }
     }
-    if (closedCount > 0) playCloseSound();
+    if (closedCount > 0 && playSound) playCloseSound();
   }
   return { closedCount, closedTabIds };
+}
+
+async function closeTabsByUrlsSafely(urls, { exact = false, playSound = true } = {}) {
+  if (!urls || urls.length === 0) return { closedCount: 0, closedTabIds: new Set() };
+
+  const allTabs = await queryTabsForDashboardWindow();
+  let matched = [];
+
+  if (exact) {
+    const urlSet = new Set(urls.map(url => runtimeGetCanonicalTabUrl ? runtimeGetCanonicalTabUrl(url) : url));
+    matched = allTabs.filter(t => urlSet.has(getTabCanonicalUrl(t))).map(t => t.id);
+  } else {
+    // Separate file:// URLs (exact match) from regular URLs (hostname match).
+    const targetHostnames = [];
+    const exactUrls = new Set();
+    for (const u of urls) {
+      const canonicalUrl = runtimeGetCanonicalTabUrl ? runtimeGetCanonicalTabUrl(u) : u;
+      if (canonicalUrl.startsWith('file://')) {
+        exactUrls.add(canonicalUrl);
+      } else {
+        try { targetHostnames.push(new URL(canonicalUrl).hostname); }
+        catch { /* skip unparseable */ }
+      }
+    }
+    matched = allTabs
+      .filter(tab => {
+        const tabUrl = getTabCanonicalUrl(tab);
+        if (tabUrl.startsWith('file://') && exactUrls.has(tabUrl)) return true;
+        try {
+          const tabHostname = new URL(tabUrl).hostname;
+          return tabHostname && targetHostnames.includes(tabHostname);
+        } catch { return false; }
+      })
+      .map(tab => tab.id);
+  }
+
+  return closeTabsSafely(matched, { playSound });
+}
+
+async function closeDuplicatesByUrls(urls, { keepOne = true, playSound = true } = {}) {
+  if (!urls || urls.length === 0) return { closedCount: 0, closedTabIds: new Set() };
+  const allTabs = await queryTabsForDashboardWindow();
+  const toClose = [];
+
+  for (const url of urls) {
+    const targetUrl = runtimeGetCanonicalTabUrl ? runtimeGetCanonicalTabUrl(url) : url;
+    const matching = allTabs.filter(t => getTabCanonicalUrl(t) === targetUrl);
+    if (keepOne) {
+      const keep = matching.find(t => t.active) || matching[0];
+      for (const tab of matching) {
+        if (tab.id !== keep.id) toClose.push(tab.id);
+      }
+    } else {
+      for (const tab of matching) toClose.push(tab.id);
+    }
+  }
+
+  return closeTabsSafely(toClose, { playSound });
+}
+
+async function closeDuplicatesInSelection(tabIds, { playSound = true } = {}) {
+  const selectedTabs = getTabsByIds(tabIds);
+  const byUrl = new Map();
+  for (const tab of selectedTabs) {
+    const url = getTabCanonicalUrl(tab);
+    if (!url) continue;
+    if (!byUrl.has(url)) byUrl.set(url, []);
+    byUrl.get(url).push(tab);
+  }
+  const toClose = [];
+  for (const tabs of byUrl.values()) {
+    if (tabs.length < 2) continue;
+    const keep = tabs.find(t => t.active) || tabs[0];
+    for (const tab of tabs) {
+      if (tab.id !== keep.id) toClose.push(tab.id);
+    }
+  }
+  return closeTabsSafely(toClose, { playSound });
+}
+
+async function mergeTabsIntoChromeGroup(tabIds, { title, color }) {
+  // The write is muted so the dashboard's own group event cannot echo.
+  if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
+  const groupId = await groupTabsWithStaleRetry(tabIds);
+  await chrome.tabGroups.update(groupId, { title, color });
+  return groupId;
+}
+
+async function sleepTabsByIds(tabIds, { skipActive = true } = {}) {
+  let discarded = 0;
+  let failed = 0;
+  let skippedActive = 0;
+  let stale = 0;
+  const resultsByTabId = new Map();
+
+  for (const rawTabId of tabIds) {
+    const tabId = Number(rawTabId);
+    if (!Number.isFinite(tabId)) { stale += 1; continue; }
+
+    let liveTab = null;
+    try { liveTab = await chrome.tabs.get(tabId); } catch { liveTab = null; }
+    if (!liveTab) {
+      stale += 1;
+      resultsByTabId.set(tabId, { status: 'stale' });
+      continue;
+    }
+    if (skipActive && liveTab?.active) {
+      skippedActive += 1;
+      resultsByTabId.set(tabId, { status: 'skipped-active' });
+      continue;
+    }
+    const ok = await discardTab(tabId);
+    if (ok) {
+      discarded += 1;
+      resultsByTabId.set(tabId, { status: 'discarded' });
+    } else {
+      failed += 1;
+      resultsByTabId.set(tabId, { status: 'failed' });
+    }
+  }
+
+  return { discarded, failed, skippedActive, stale, resultsByTabId };
 }
 
 function getTabGroupLookup(groups = domainGroups) {
@@ -2962,40 +3098,9 @@ function ensureWindowsKeepLastTab(allTabs, toCloseIds) {
 }
 
 async function closeTabsByUrls(urls) {
-  if (!urls || urls.length === 0) return;
-
-  // Separate file:// URLs (exact match) from regular URLs (hostname match)
-  const targetHostnames = [];
-  const exactUrls = new Set();
-
-  for (const u of urls) {
-    const canonicalUrl = runtimeGetCanonicalTabUrl ? runtimeGetCanonicalTabUrl(u) : u;
-    if (canonicalUrl.startsWith('file://')) {
-      exactUrls.add(canonicalUrl);
-    } else {
-      try { targetHostnames.push(new URL(canonicalUrl).hostname); }
-      catch { /* skip unparseable */ }
-    }
-  }
-
-  const allTabs = await queryTabsForDashboardWindow();
-  const matched = allTabs
-    .filter(tab => {
-      const tabUrl = getTabCanonicalUrl(tab);
-      if (tabUrl.startsWith('file://') && exactUrls.has(tabUrl)) return true;
-      try {
-        const tabHostname = new URL(tabUrl).hostname;
-        return tabHostname && targetHostnames.includes(tabHostname);
-      } catch { return false; }
-    })
-    .map(tab => tab.id);
-  // Keep at least one tab per window so closing tabs never closes the
-  // window (or, for the last window, the browser).
-  const toClose = ensureWindowsKeepLastTab(allTabs, matched);
-
-  if (toClose.length > 0) await chrome.tabs.remove(toClose);
-  await fetchOpenTabs();
-  await loadSessionGroups(getOpenTabIdsForSessionPruning());
+  const result = await closeTabsByUrlsSafely(urls, { exact: false, playSound: false });
+  await refreshTabData();
+  return result;
 }
 
 /**
@@ -3005,16 +3110,9 @@ async function closeTabsByUrls(urls) {
  * so closing "Gmail inbox" doesn't also close individual email threads.
  */
 async function closeTabsExact(urls) {
-  if (!urls || urls.length === 0) return;
-  const urlSet = new Set(urls.map(url => runtimeGetCanonicalTabUrl ? runtimeGetCanonicalTabUrl(url) : url));
-  const allTabs = await queryTabsForDashboardWindow();
-  const matched = allTabs.filter(t => urlSet.has(getTabCanonicalUrl(t))).map(t => t.id);
-  // Keep at least one tab per window so closing tabs never closes the
-  // window (or, for the last window, the browser).
-  const toClose = ensureWindowsKeepLastTab(allTabs, matched);
-  if (toClose.length > 0) await chrome.tabs.remove(toClose);
-  await fetchOpenTabs();
-  await loadSessionGroups(getOpenTabIdsForSessionPruning());
+  const result = await closeTabsByUrlsSafely(urls, { exact: true, playSound: false });
+  await refreshTabData();
+  return result;
 }
 
 /**
@@ -3147,30 +3245,9 @@ async function runDefaultSearch(query) {
  * keepOne=false → close all copies.
  */
 async function closeDuplicateTabs(urls, keepOne = true) {
-  const allTabs = await queryTabsForDashboardWindow();
-  const toClose = [];
-
-  for (const url of urls) {
-    const targetUrl = runtimeGetCanonicalTabUrl ? runtimeGetCanonicalTabUrl(url) : url;
-    const matching = allTabs.filter(t => getTabCanonicalUrl(t) === targetUrl);
-    if (keepOne) {
-      const keep = matching.find(t => t.active) || matching[0];
-      for (const tab of matching) {
-        if (tab.id !== keep.id) toClose.push(tab.id);
-      }
-    } else {
-      for (const tab of matching) toClose.push(tab.id);
-    }
-  }
-
-  if (toClose.length > 0) {
-    // Same last-tab protection as every other close path: never remove a
-    // window's final tab (that would close the window / exit the browser).
-    const safeToClose = ensureWindowsKeepLastTab(allTabs, toClose);
-    if (safeToClose.length > 0) await chrome.tabs.remove(safeToClose);
-  }
-  await fetchOpenTabs();
-  await loadSessionGroups(getOpenTabIdsForSessionPruning());
+  const result = await closeDuplicatesByUrls(urls, { keepOne, playSound: false });
+  await refreshTabData();
+  return result;
 }
 
 /**
@@ -4627,15 +4704,13 @@ document.addEventListener('click', async (e) => {
     const tabId = actionEl.dataset.tabId || '';
     if (!tabUrl && !tabId) return;
 
-    // Suppress auto-refresh to prevent animation spam
-    window.__suppressAutoRefreshUntil = Date.now() + 2000;
-
     // Close the tab in Chrome directly. Prefer id so suspended/canonical URLs
     // and duplicate pages cannot close the wrong tab.
-    await removeOpenTabByIdOrUrl(tabId, tabUrl);
-    await fetchOpenTabs();
-    await loadSessionGroups(getOpenTabIdsForSessionPruning());
-    window.__suppressAutoRefreshUntil = 0;
+    await runWithSuppressedRefresh(async () => {
+      await removeOpenTabByIdOrUrl(tabId, tabUrl);
+      await fetchOpenTabs();
+      await loadSessionGroups(getOpenTabIdsForSessionPruning());
+    });
 
     playCloseSound();
 
@@ -4702,9 +4777,8 @@ document.addEventListener('click', async (e) => {
     // manual-group assignment — making the card structure look wrong. Detect it
     // up front: re-render to drop the ghost row, and let the refresh prune any
     // dangling assignment.
-    let liveTab = null;
-    try { liveTab = await chrome.tabs.get(Number(tabId)); } catch { liveTab = null; }
-    if (!liveTab) {
+    const { discarded, failed, stale } = await sleepTabsByIds([tabId], { skipActive: false });
+    if (stale > 0) {
       await renderDashboard();
       updateBackToTopVisibility();
       window.__suppressAutoRefreshUntil = 0;
@@ -4712,8 +4786,7 @@ document.addEventListener('click', async (e) => {
       return;
     }
 
-    const discarded = await discardTab(Number(tabId));
-    if (!discarded) {
+    if (failed > 0 || discarded === 0) {
       window.__suppressAutoRefreshUntil = 0;
       showToast(runtimeT ? runtimeT('toastTabDiscardFailed') || 'Failed to sleep tab' : 'Failed to sleep tab');
       return;
@@ -4762,26 +4835,14 @@ document.addEventListener('click', async (e) => {
     // preserves selection across all cards even when a chip sort id is not a
     // plain tab id (e.g. URL-based tokens or placeholder rows).
     const chipTabIds = getPageChipTabIdMap();
-    let discarded = 0;
-    let failed = 0;
-    let skippedActive = 0;
-    let stale = 0;
-    const keptChipIds = [];
-    for (const chipId of [...selectedPageChipIds]) {
+    const tabIds = [...selectedPageChipIds]
+      .map(chipId => chipTabIds.get(String(chipId)))
+      .filter(tabId => tabId != null);
+    const { discarded, failed, skippedActive, stale, resultsByTabId } = await sleepTabsByIds(tabIds, { skipActive: true });
+    const keptChipIds = [...selectedPageChipIds].filter(chipId => {
       const tabId = chipTabIds.get(String(chipId));
-      if (tabId == null) { stale += 1; continue; }
-      // Same live pre-check as the per-chip sleep: a ghost chip's id is still
-      // in the in-memory openTabs snapshot, so only a real chrome.tabs.get can
-      // tell a dead id apart from a live one. Dead ids count as stale and are
-      // skipped (the re-render below drops the row and prunes the assignment).
-      let liveTab = null;
-      try { liveTab = await chrome.tabs.get(tabId); } catch { liveTab = null; }
-      if (!liveTab) { stale += 1; continue; }
-      keptChipIds.push(String(chipId));
-      if (liveTab?.active) { skippedActive += 1; continue; }
-      if (await discardTab(tabId)) discarded += 1;
-      else failed += 1;
-    }
+      return tabId != null && resultsByTabId.has(tabId);
+    });
     await finishBatchAction({ keptChipIds });
     if (discarded > 0) {
       showToast(runtimeT ? runtimeT('toastTabsDiscarded', { count: discarded }) : `${discarded} tabs sleeping`);
@@ -4801,23 +4862,7 @@ document.addEventListener('click', async (e) => {
     beginBatchAction();
     const chipTabIds = getPageChipTabIdMap();
     const tabIds = getSelectedBatchTabIds();
-    const selectedTabs = getTabsByIds(tabIds);
-    const byUrl = new Map();
-    for (const tab of selectedTabs) {
-      const url = getTabCanonicalUrl(tab);
-      if (!url) continue;
-      if (!byUrl.has(url)) byUrl.set(url, []);
-      byUrl.get(url).push(tab);
-    }
-    const toClose = [];
-    for (const tabs of byUrl.values()) {
-      if (tabs.length < 2) continue;
-      const keep = tabs.find(t => t.active) || tabs[0];
-      for (const tab of tabs) {
-        if (tab.id !== keep.id) toClose.push(tab.id);
-      }
-    }
-    const { closedCount, closedTabIds } = await closeTabsSafely(toClose);
+    const { closedCount, closedTabIds } = await closeDuplicatesInSelection(tabIds);
     // Keep the ORIGINAL chip sort ids that survive dedup, so selection is
     // preserved on every card even when a chip id is not a plain tab id.
     // refreshPageChipSelectionClasses prunes any id that no longer has a row.
@@ -4865,15 +4910,12 @@ document.addEventListener('click', async (e) => {
     if (!tabIds.length) return;
     beginBatchAction();
 
-    // The write is muted so the dashboard's own group event cannot echo.
-    if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
     try {
-      const groupId = await groupTabsWithStaleRetry(tabIds);
       const title = buildBatchMergeGroupTitle(tabIds);
       const color = typeof runtimeAssignGroupColor === 'function'
         ? runtimeAssignGroupColor('all', chromeGroupMergeColorIndex++)
         : 'blue';
-      await chrome.tabGroups.update(groupId, { title, color });
+      await mergeTabsIntoChromeGroup(tabIds, { title, color });
     } catch (err) {
       window.__suppressAutoRefreshUntil = 0;
       showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not create Chrome tab group');
@@ -4929,11 +4971,7 @@ document.addEventListener('click', async (e) => {
     // Close the tabs in the background (the card is already exiting), then
     // rebuild so the nav and remaining cards reflect the closed group.
     try {
-      if (useExact) {
-        await closeTabsExact(urls);
-      } else {
-        await closeTabsByUrls(urls);
-      }
+      await closeTabsByUrlsSafely(urls, { exact: useExact, playSound: false });
     } catch { /* swallow: tabs may already be gone */ }
     await renderDashboard();
     window.__suppressAutoRefreshUntil = 0;
@@ -4979,14 +5017,13 @@ document.addEventListener('click', async (e) => {
     const group = domainGroups.find(g => getStableGroupId(g.domain) === domainId);
     if (!group) return;
 
-    const tabs = getOrderedUniqueTabsForGroup(group).filter(t => !t.active);
-    if (!tabs.length) return;
+    const tabIds = getOrderedUniqueTabsForGroup(group).filter(t => !t.active).map(t => t.id);
+    if (!tabIds.length) return;
 
     window.__suppressAutoRefreshUntil = Date.now() + 2000;
 
-    const results = await Promise.all(tabs.map(t => discardTab(t.id)));
-    const succeeded = results.filter(Boolean).length;
-    if (!succeeded) {
+    const { discarded } = await sleepTabsByIds(tabIds, { skipActive: true });
+    if (discarded === 0) {
       window.__suppressAutoRefreshUntil = 0;
       showToast(runtimeT ? runtimeT('toastTabDiscardFailed') || 'Failed to sleep tabs' : 'Failed to sleep tabs');
       return;
@@ -4998,21 +5035,20 @@ document.addEventListener('click', async (e) => {
     window.__suppressAutoRefreshUntil = 0;
 
     showToast(runtimeT
-      ? runtimeT('toastTabsDiscarded', { count: succeeded })
-      : `${succeeded} tabs sleeping`);
+      ? runtimeT('toastTabsDiscarded', { count: discarded })
+      : `${discarded} tabs sleeping`);
     return;
   }
 
   // ---- Sleep all open tabs ----
   if (action === 'sleep-all-open-tabs') {
-    const allTabs = getRealTabs().filter(t => !t.active);
-    if (!allTabs.length) return;
+    const tabIds = getRealTabs().filter(t => !t.active).map(t => t.id);
+    if (!tabIds.length) return;
 
     window.__suppressAutoRefreshUntil = Date.now() + 2000;
 
-    const results = await Promise.all(allTabs.map(t => discardTab(t.id)));
-    const succeeded = results.filter(Boolean).length;
-    if (!succeeded) {
+    const { discarded } = await sleepTabsByIds(tabIds, { skipActive: true });
+    if (discarded === 0) {
       window.__suppressAutoRefreshUntil = 0;
       showToast(runtimeT ? runtimeT('toastTabDiscardFailed') || 'Failed to sleep tabs' : 'Failed to sleep tabs');
       return;
@@ -5024,8 +5060,8 @@ document.addEventListener('click', async (e) => {
     window.__suppressAutoRefreshUntil = 0;
 
     showToast(runtimeT
-      ? runtimeT('toastTabsDiscarded', { count: succeeded })
-      : `${succeeded} tabs sleeping`);
+      ? runtimeT('toastTabsDiscarded', { count: discarded })
+      : `${discarded} tabs sleeping`);
     return;
   }
 
@@ -5066,7 +5102,6 @@ document.addEventListener('click', async (e) => {
     window.__suppressAutoRefreshUntil = Date.now() + 2000;
 
     try {
-      const groupId = await groupTabsWithStaleRetry(tabIds);
       const label = scope === 'all'
         ? (runtimeT ? runtimeT('mergeAllGroupTitle', { count: tabIds.length }) : `Open tabs (${tabIds.length})`)
         : getGroupDisplayLabel(group);
@@ -5076,7 +5111,7 @@ document.addEventListener('click', async (e) => {
       const color = typeof runtimeAssignGroupColor === 'function'
         ? runtimeAssignGroupColor(scope === 'all' ? 'all' : group.domain, chromeGroupMergeColorIndex++)
         : 'blue';
-      await chrome.tabGroups.update(groupId, { title: label, color });
+      await mergeTabsIntoChromeGroup(tabIds, { title: label, color });
     } catch (err) {
       window.__suppressAutoRefreshUntil = 0;
       showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not create Chrome tab group');
@@ -5099,7 +5134,7 @@ document.addEventListener('click', async (e) => {
     // Suppress auto-refresh to prevent animation spam
     window.__suppressAutoRefreshUntil = Date.now() + 2000;
 
-    await closeDuplicateTabs(urls, true);
+    await closeDuplicatesByUrls(urls, { keepOne: true, playSound: false });
     playCloseSound();
 
     // Rebuild the open-tabs area right away so the kept copy shows
@@ -5121,7 +5156,8 @@ document.addEventListener('click', async (e) => {
     const allUrls = openTabs
       .filter(t => t.url && !t.url.startsWith('chrome') && !t.url.startsWith('about:'))
       .map(t => t.url);
-    await closeTabsByUrls(allUrls);
+    await closeTabsByUrlsSafely(allUrls, { playSound: false });
+    await refreshTabData();
     playCloseSound();
 
     document.querySelectorAll('#openTabsMissions .mission-card').forEach(c => {
