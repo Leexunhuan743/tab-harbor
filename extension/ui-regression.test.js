@@ -104,7 +104,11 @@ test('home and saved section headers share a fixed title column and top nav stay
   const css = fs.readFileSync(path.join(__dirname, 'style.css'), 'utf8');
 
   assert.match(css, /#openTabsSection \.section-header h2,\s*\.saved-sessions-section \.section-header h2 \{[\s\S]*width:\s*13ch;/);
-  assert.match(css, /#openTabsSection \.section-count,\s*\.saved-sessions-section \.section-count \{[\s\S]*width:\s*96px;/);
+  // The open-tabs count hosts up to five icon buttons: it sizes to content and
+  // keeps a comfortable gap; only the saved-sessions count stays a fixed column.
+  assert.match(css, /#openTabsSection \.section-count \{[\s\S]*width:\s*auto;[\s\S]*flex:\s*0 0 auto;[\s\S]*gap:\s*8px;/);
+  assert.match(css, /\.saved-sessions-section \.section-count \{[\s\S]*width:\s*96px;/);
+  assert.match(css, /\.section-icon-action \{[\s\S]*width:\s*30px;[\s\S]*height:\s*30px;[\s\S]*flex-shrink:\s*0;/);
   assert.match(css, /\.group-nav-wide \{[\s\S]*min-height:\s*40px;[\s\S]*flex-wrap:\s*nowrap;[\s\S]*align-items:\s*center;/);
   assert.match(css, /\.group-nav-list \{[\s\S]*flex-wrap:\s*nowrap;/);
   assert.match(css, /\.group-nav-list \{[\s\S]*min-height:\s*40px;/);
@@ -774,7 +778,10 @@ test('todo list and tab chips expose drag handles with drag-state styling', () =
   assert.match(appJs, /data-chip-drag-handle="tab"/);
   assert.match(appJs, /const chipItem = e\.target\.closest\('\[data-chip-sort-id\]'\);/);
   assert.match(appJs, /const chipAction = e\.target\.closest\('\.chip-actions'\);/);
-  assert.match(appJs, /if \(chipHandle && chipItem && !chipAction && e\.button === 0\)/);
+  // The whole row is the drag surface: the handle is the visible grip, but a
+  // press on the row body arms the same drag.
+  assert.match(appJs, /if \(chipItem && !chipAction && e\.button === 0\)/);
+  assert.match(appJs, /originatedFromHandle: Boolean\(chipHandle\),/);
   // Handle-click toggles a row into the highlight-only selection; dragging a
   // selected row reorders the whole selection together within its group.
   assert.match(appJs, /function togglePageChipSelection\(chipId\) \{[\s\S]*selectedPageChipIds\.add\(key\);/);
@@ -801,7 +808,7 @@ test('todo list and tab chips expose drag handles with drag-state styling', () =
   assert.match(css, /\.page-chip-drag-badge \{[\s\S]*position: fixed;[\s\S]*pointer-events: none;/);
   assert.match(css, /\.chip-reorder-handle \{\s*touch-action: none;/);
   assert.match(appJs, /function updatePageChipDragBadge\(count\) \{[\s\S]*badge\.textContent = count > 1 \? `×\$\{count\}` : '';/);
-  assert.match(appJs, /if \(chipItem && !chipAction && e\.button === 0\) \{\s*e\.preventDefault\(\);/);
+  assert.match(appJs, /if \(chipItem && !chipAction && e\.button === 0\) \{\s*\/\/ Re-entrancy guard[\s\S]{0,600}e\.preventDefault\(\);/);
   assert.match(appJs, /if \(e\.key !== 'Escape'\) return;[\s\S]{0,300}if \(draggedPageChipId && pageChipDragState\) \{\s*clearPageChipDragState\(\{ removeNode: false \}\);/);
   assert.match(appJs, /movingChipIds: getMovingPageChipIds\(\),/);
   assert.match(appJs, /e\.stopPropagation\(\);/);
@@ -1250,9 +1257,10 @@ test('popup scrolls inside panels only, never the document', () => {
   // Deduplicating tabs re-renders the open-tabs area immediately instead of
   // leaving stale duplicate chips until the next event-driven refresh.
   assert.match(runtimeJs, /if \(action === 'dedup-keep-one'\) \{[\s\S]*await closeDuplicateTabs\(urls, true\);\s*playCloseSound\(\);[\s\S]*await renderDashboard\(\);/);
-  // Cards can merge all their tabs into one native Chrome tab group.
+  // Cards can merge all their tabs into one native Chrome tab group; the
+  // section header reuses the action with scope="all" to group every card.
   assert.match(runtimeJs, /data-action="group-card-tabs" data-domain-id="\$\{stableId\}"/);
-  assert.match(runtimeJs, /if \(action === 'group-card-tabs'\) \{[\s\S]*await chrome\.tabs\.group\(\{ tabIds \}\);\s*const label = getGroupDisplayLabel\(group\);[\s\S]*await chrome\.tabGroups\.update\(groupId, \{ title: label, color \}\)/);
+  assert.match(runtimeJs, /if \(action === 'group-card-tabs'\) \{[\s\S]*const scope = actionEl\.dataset\.scope \|\| '';[\s\S]*await groupTabsWithStaleRetry\(tabIds\);\s*const label = scope === 'all'[\s\S]*getGroupDisplayLabel\(group\);[\s\S]*await chrome\.tabGroups\.update\(groupId, \{ title: label, color \}\)/);
   assert.match(i18nJs, /groupCardTabsLabel: 'Merge into Chrome group'/);
   assert.match(i18nJs, /groupCardTabsLabel: '合并为 Chrome 标签组'/);
   assert.match(i18nJs, /toastGroupCreated: 'Created Chrome tab group'/);

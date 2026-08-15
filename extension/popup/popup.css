@@ -296,7 +296,14 @@ body.popup-shell {
   overflow-x: auto;
   overflow-y: hidden;
   gap: 6px;
-  padding-bottom: 6px;
+  /* This element also carries the shared .group-nav class (style.css), which
+     would add margin-bottom: 14px below the icon row — override it so the
+     row's spacing is controlled here, not by the dashboard nav rules. */
+  margin: 0;
+  /* Top headroom so the shared style.css hover lift (translateY(-1px)) never
+     clips the button's top edge against overflow-y: hidden. */
+  padding-top: 2px;
+  padding-bottom: 2px;
   /* Keep horizontal scrolling, but never show the nav scrollbar. */
   scrollbar-width: none;
   -ms-overflow-style: none;
@@ -450,12 +457,12 @@ body.popup-shell {
 }
 
 .popup-tab-close-btn {
-  width: 22px;
-  height: 22px;
+  width: 34px;
+  height: 34px;
   border: none;
   background: transparent;
   color: var(--muted);
-  border-radius: 4px;
+  border-radius: 6px;
   padding: 0;
   display: inline-flex;
   align-items: center;
@@ -467,8 +474,8 @@ body.popup-shell {
 }
 
 .popup-tab-close-btn svg {
-  width: 13px;
-  height: 13px;
+  width: 19px;
+  height: 19px;
 }
 
 .popup-tab-close-btn:hover {
@@ -542,7 +549,8 @@ body.popup-shell {
 @keyframes tab-rise {
   from {
     opacity: 0;
-    transform: translateY(5px);
+    /* Below the 4px row gap so a rising row never covers the row beneath it. */
+    transform: translateY(3px);
   }
   to {
     opacity: 1;

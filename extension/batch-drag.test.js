@@ -193,6 +193,106 @@ test('handle press that never moved toggles; completed drags are never clicks', 
   assert.match(runtimeJs, /if \(!pageChipDragState\.moved && finalDistance < 4\) \{/);
 });
 
+test('whole-row drag: the row body arms the same drag as the handle', () => {
+  // The handle is the visible grip, but a press anywhere on the row body
+  // arms the drag too — no need to aim for the 30px grip.
+  assert.match(runtimeJs, /if \(chipItem && !chipAction && e\.button === 0\) \{/);
+  assert.match(runtimeJs, /const dragHandleEl = chipHandle \|\| item;/);
+  assert.match(runtimeJs, /originatedFromHandle: Boolean\(chipHandle\),/);
+});
+
+test('a completed drag suppresses the click that follows it', () => {
+  // The click dispatched right after pointerup must not activate the tab; the
+  // suppression is set synchronously in pointerup, before the async commit.
+  assert.match(runtimeJs, /suppressPageChipClickUntil = Date\.now\(\) \+ 250;\s*updateDraggedPageChipPosition\(e\.clientX, e\.clientY\);/);
+});
+
+test('multi-select mode: clicking a row toggles it instead of activating the tab', () => {
+  // While a selection exists, focus-tab becomes a toggle: the row body never
+  // jumps to the tab in batch mode.
+  assert.match(runtimeJs, /if \(action === 'focus-tab'\) \{/);
+  assert.match(runtimeJs, /if \(selectedPageChipIds\.size > 0\) \{\s*if \(key\) \{[\s\S]{0,300}if \(e\.shiftKey && pageChipSelectionAnchorId\) \{\s*selectPageChipRange\(key, pageChipSelectionAnchorId\);\s*\} else \{\s*togglePageChipSelection\(key\);/);
+  // A plain body click (no selection yet) stays a click and activates the tab.
+  assert.match(runtimeJs, /const tabUrl = actionEl\.dataset\.tabUrl;\s*const tabId = actionEl\.dataset\.tabId \|\| '';\s*if \(tabUrl \|\| tabId\) await focusTab\(tabUrl, tabId\);/);
+  // Body presses only toggle on click while a selection is active.
+  assert.match(runtimeJs, /const toggleAsClick = pageChipDragState\.originatedFromHandle\s*\|\| selectedPageChipIds\.size > 0\s*\|\| e\.shiftKey;/);
+  // Deselecting the last row must not make the follow-up click jump to it;
+  // the guard checks key + window only (no keydown bypass — row bodies are
+  // not keyboard-focusable, so a recent keydown must not re-toggle the row).
+  assert.match(runtimeJs, /const toggleGuardHit = Boolean\(key\)\s*&& pageChipPointerToggleGuard\.key === key\s*&& Date\.now\(\) < pageChipPointerToggleGuard\.until;\s*if \(toggleGuardHit\) return;/);
+  assert.doesNotMatch(runtimeJs, /const toggleGuardHit = Boolean\(key\)[\s\S]{0,60}Date\.now\(\) - pageChipLastKeydownAt > 120/);
+});
+
+test('section header above all cards adds global close-duplicates and merge-all', () => {
+  // buildOpenTabsSectionActions drives both render paths of the open-tabs
+  // section header; close-duplicates appears only while some card-visible URL
+  // is duplicated anywhere in the window (getRealTabs scope — internal pages
+  // and the dashboard's own new-tab page never inflate the count).
+  assert.match(runtimeJs, /function buildOpenTabsSectionActions\(\) \{[\s\S]{0,500}const counts = \{\};\s*for \(const tab of getRealTabs\(\)\) \{[\s\S]{0,200}const dupeUrls = Object\.entries\(counts\)\s*\.filter\(\(\[, c\]\) => c > 1\)/);
+  assert.match(runtimeJs, /data-action="dedup-keep-one" data-dupe-urls="\$\{dupeUrlsEncoded\}"/);
+  assert.match(runtimeJs, /data-action="group-card-tabs" data-scope="all"/);
+  assert.match(runtimeJs, /openTabsSectionCount\.innerHTML = buildOpenTabsSectionActions\(\);/);
+  // The all-scope branch collects every card's ordered unique tabs.
+  assert.match(runtimeJs, /const scope = actionEl\.dataset\.scope \|\| '';/);
+  assert.match(runtimeJs, /if \(scope === 'all'\) \{[\s\S]{0,300}for \(const g of domainGroups\) \{[\s\S]{0,200}getOrderedUniqueTabsForGroup\(g\)/);
+});
+
+test('merge-all is titled with its real tab count and retries once on stale ids', () => {
+  // The group title reflects what was actually merged (scope="all" excludes
+  // pinned and non-restorable tabs), so the count is part of the label.
+  assert.match(runtimeJs, /const label = scope === 'all'\s*\?\s*\(runtimeT \? runtimeT\('mergeAllGroupTitle', \{ count: tabIds\.length \}\) : `Open tabs \(\$\{tabIds\.length\}\)`\)/);
+  // chrome.tabs.group fails atomically on any invalid id; drop ids that no
+  // longer exist and retry once with the survivors.
+  assert.match(runtimeJs, /async function groupTabsWithStaleRetry\(tabIds\) \{[\s\S]{0,200}return await chrome\.tabs\.group\(\{ tabIds \}\);\s*\} catch \(err\) \{[\s\S]{0,250}const liveIds = \[\];[\s\S]{0,200}try \{ await chrome\.tabs\.get\(id\); liveIds\.push\(id\); \} catch/);
+  assert.match(runtimeJs, /const groupId = await groupTabsWithStaleRetry\(tabIds\);/);
+  const i18nJs = fs.readFileSync(path.join(__dirname, 'i18n.js'), 'utf8');
+  assert.match(i18nJs, /mergeAllGroupTitle: 'Open tabs \(\{count\}\)'/);
+  assert.match(i18nJs, /mergeAllGroupTitle: '打开的标签页 \(\{count\}\)'/);
+});
+
+test('every re-render re-syncs the batch bar so the header title stays consistent', () => {
+  // renderOpenTabsArea ends by re-applying the selection classes, which also
+  // re-runs syncPageChipBatchBar — a full refresh while rows are selected
+  // restores the "N selected" title instead of leaving it on "Open tabs".
+  assert.match(runtimeJs, /\/\/ Re-apply the selection highlight and prune ids whose rows are gone; this[\s\S]{0,400}refreshPageChipSelectionClasses\(\);/);
+});
+
+test('merge-all skips pinned tabs; the tab snapshot carries the pinned flag', () => {
+  // The section-header merge folds every card's tabs into one Chrome group
+  // but leaves pinned tabs outside it.
+  assert.match(runtimeJs, /if \(tab\?\.pinned\) continue;/);
+  assert.match(runtimeJs, /pinned:\s*Boolean\(t\.pinned\),/);
+});
+
+test('close-single-tab tolerates a tab that vanished before the click', () => {
+  // removeOpenTabByIdOrUrl wraps chrome.tabs.remove in try/catch so a stale id
+  // cannot produce an unhandled rejection that skips the toast/animation.
+  assert.match(runtimeJs, /async function removeOpenTabByIdOrUrl\(tabId, tabUrl\) \{[\s\S]{0,200}try \{[\s\S]{0,120}await chrome\.tabs\.remove\(numericTabId\);[\s\S]{0,80}\} catch \{\s*\/\* tab already gone[\s\S]{0,80}return null;/);
+});
+
+test('close-duplicates keeps every window\'s last tab like the other close paths', () => {
+  // closeDuplicateTabs routes its removals through ensureWindowsKeepLastTab so
+  // deduplication can never close a window (or, for the last window, Chrome).
+  assert.match(runtimeJs, /const safeToClose = ensureWindowsKeepLastTab\(allTabs, toClose\);\s*if \(safeToClose\.length > 0\) await chrome\.tabs\.remove\(safeToClose\);/);
+});
+
+test('the card-header actions wrapper left no orphaned .actions CSS rule', () => {
+  const css = fs.readFileSync(path.join(__dirname, 'style.css'), 'utf8');
+  assert.doesNotMatch(css, /\.actions\s*\{/);
+});
+
+test('an invalidated extension context recovers by reloading the page once', () => {
+  // Extension reload/update while the dashboard is open makes every chrome.*
+  // call throw "Extension context invalidated". The refresh catch detects it
+  // and reloads the page once so it rebinds to the live context.
+  assert.match(runtimeJs, /function isExtensionContextInvalidated\(err\) \{[\s\S]{0,200}\/Extension context invalidated\/i/);
+  assert.match(runtimeJs, /let extensionContextInvalidatedHandled = false;[\s\S]{0,200}if \(extensionContextInvalidatedHandled\) return;[\s\S]{0,250}location\.reload\(\);/);
+  assert.match(runtimeJs, /console\.warn\('\[tab-harbor\] Failed to refresh dashboard:', err\);\s*if \(isExtensionContextInvalidated\(err\)\) recoverFromInvalidatedExtensionContext\(\);/);
+  // User-triggered chrome calls after invalidation reject too — the global
+  // unhandled-rejection net routes them to the same single recovery.
+  assert.match(runtimeJs, /window\.addEventListener\('unhandledrejection', \(event\) => \{[\s\S]{0,200}isExtensionContextInvalidated\(event\?\.reason\)\) recoverFromInvalidatedExtensionContext\(\);/);
+});
+
 test('pointerup parks the placeholder at the release point (fast-flick fix)', () => {
   assert.match(runtimeJs, /if \(!stickyIsNonSource\) \{\s*(?:\/\/[^\n]*\n\s*)*previewPageChipOrder\(e\.clientX, e\.clientY\);/);
 });
@@ -249,9 +349,39 @@ test('sleeping a stale (ghost) chip re-renders instead of silently corrupting gr
   // Per-chip sleep detects a tab id that no longer exists in Chrome and
   // re-renders (dropping the ghost row and pruning its dangling assignment).
   assert.match(runtimeJs, /let liveTab = null;\s*try \{ liveTab = await chrome\.tabs\.get\(Number\(tabId\)\); \} catch \{ liveTab = null; \}[\s\S]{0,300}if \(!liveTab\) \{\s*await renderDashboard\(\);\s*updateBackToTopVisibility\(\);\s*window\.__suppressAutoRefreshUntil = 0;\s*showToast\(runtimeT \? runtimeT\('toastTabAlreadyClosed'\)/);
-  // Batch sleep skips ghost ids instead of counting them as discarded.
-  assert.match(runtimeJs, /if \(!tab\) \{ stale \+= 1; continue; \}/);
+  // Batch sleep uses the SAME live pre-check (the in-memory openTabs snapshot
+  // still holds the ghost id, so a snapshot lookup can never classify it) and
+  // counts dead ids as stale instead of discarded.
+  assert.match(runtimeJs, /let stale = 0;[\s\S]{0,400}let liveTab = null;\s*try \{ liveTab = await chrome\.tabs\.get\(Number\(tabId\)\); \} catch \{ liveTab = null; \}[\s\S]{0,120}if \(!liveTab\) \{ stale \+= 1; continue; \}/);
   assert.match(runtimeJs, /} else if \(stale > 0\) \{\s*showToast\(runtimeT \? runtimeT\('toastTabAlreadyClosed'\) : 'Tab already closed'\);/);
+});
+
+test('close-duplicates and merge-group are header icon actions left of the sleep action', () => {
+  assert.match(runtimeJs, /const dedupButton = hasDupes \? `\s*<button class="group-action-icon" type="button" data-action="dedup-keep-one" data-dupe-urls="\$\{dupeUrlsEncoded\}" aria-label="\$\{dedupLabel\}" data-tooltip="\$\{dedupLabel\}">/);
+  assert.match(runtimeJs, /const mergeGroupButton = `\s*<button class="group-action-icon" type="button" data-action="group-card-tabs" data-domain-id="\$\{stableId\}" aria-label="\$\{runtimeT \? runtimeT\('groupCardTabsLabel'\)/);
+  // Close-duplicates sits leftmost, then merge, then the sleep icon.
+  assert.match(runtimeJs, /<div class="mission-actions">\s*\$\{dedupButton\}\s*\$\{mergeGroupButton\}\s*\$\{sleepControlEnabled \? `/);
+});
+
+test('merge/duplicate actions reuse the icon-button style of sleep/save/close', () => {
+  const helperJs = fs.readFileSync(path.join(__dirname, 'ui-helpers.js'), 'utf8');
+  assert.match(helperJs, /mergeGroup: `<svg[\s\S]*<\/svg>`/);
+  assert.match(helperJs, /closeDuplicates: `<svg[\s\S]*<\/svg>`/);
+  assert.doesNotMatch(runtimeJs, /data-action="group-card-tabs"[\s\S]{0,120}class="action-btn"/);
+});
+
+test('per-chip duplicate count badges are not rendered', () => {
+  // The "(Nx)" text badge on duplicated rows is gone; the duplicate detection
+  // (card badge, dedup action, border highlight) stays.
+  assert.doesNotMatch(runtimeJs, /chip-dupe-badge/);
+  assert.doesNotMatch(runtimeJs, /dupeTag/);
+  assert.match(runtimeJs, /\$\{count > 1 \? ' chip-has-dupes' : ''\}/);
+});
+
+test('the bottom of the tab list keeps the same hairline as the middle rows', () => {
+  const css = fs.readFileSync(path.join(__dirname, 'style.css'), 'utf8');
+  assert.match(css, /\.page-chip \{\s*[\s\S]{0,200}border-bottom: 1px solid rgba\(154, 145, 138, 0\.12\);/);
+  assert.doesNotMatch(css, /\.page-chip:last-child,[\s\S]*\.page-chip-overflow \{\s*border-bottom: none;/);
 });
 
 test('touch/pen synthesized clicks do not double-toggle the row', () => {

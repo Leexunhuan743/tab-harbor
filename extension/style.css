@@ -1492,7 +1492,16 @@ body.theme-tone-dark .deferred-shell {
     flex: 0 0 13ch;
 }
 
-#openTabsSection .section-count,
+/* The open-tabs count now hosts up to five 30px icon buttons; it must size to
+   its content instead of the old 96px text-count column, or the buttons get
+   compressed. The saved-sessions count keeps its fixed column. */
+#openTabsSection .section-count {
+    width: auto;
+    flex: 0 0 auto;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
 .saved-sessions-section .section-count {
     width: 96px;
     flex: 0 0 96px;
@@ -1542,7 +1551,10 @@ body.theme-tone-dark .deferred-shell {
     flex-wrap: nowrap;
     flex: 1;
     min-width: 0;
-    min-height: 40px;
+    /* Top headroom so the hover lift (translateY(-1px)) never clips the
+       button's top edge against overflow-y: hidden. */
+    min-height: 42px;
+    padding-top: 2px;
     overflow-x: auto;
     overflow-y: hidden;
     scrollbar-width: none;
@@ -1702,7 +1714,7 @@ body.group-dragging .group-nav-button {
             var(--workspace-accent-border) 26%
         );
     border-radius: 16px;
-    padding: 14px 16px;
+    padding: 16px 16px 15px;
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -2047,11 +2059,6 @@ body.page-chip-list-dragging .page-chip.is-selected:not(.is-dragging) {
     height: 36px;
 }
 
-.page-chip:last-child,
-.page-chip-overflow {
-    border-bottom: none;
-}
-
 /* Overflow rows ("+N more" expansion) stay out of the list until expanded.
    They are direct list children so drag/selection still see them. */
 .page-chip--collapsed {
@@ -2105,12 +2112,6 @@ body.page-chip-list-dragging .page-chip.is-selected:not(.is-dragging) {
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
-}
-
-/* Duplicate badge */
-.chip-dupe-badge {
-    color: var(--accent-amber);
-    font-weight: 600;
 }
 
 /* Duplicate border highlight */
@@ -2281,19 +2282,13 @@ body.page-chip-list-dragging .page-chip.is-selected:not(.is-dragging) {
 }
 
 /* ---- Actions row ---- */
-.actions {
-    display: flex;
-    gap: 8px;
-    margin-top: 8px;
-    flex-wrap: wrap;
-}
-
 .section-icon-action {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     width: 30px;
     height: 30px;
+    flex-shrink: 0;
     padding: 0;
     border: none;
     background: transparent;
@@ -3735,7 +3730,10 @@ footer {
 @keyframes fadeUp {
     from {
         opacity: 0;
-        transform: translateY(12px);
+        /* Rise offset stays below the 12px card/deferred-item rhythm so a
+           rising element never overlaps the one below it (no "blocked by the
+           card above" flash during entrance). */
+        transform: translateY(8px);
     }
     to {
         opacity: 1;

@@ -880,6 +880,7 @@ async function fetchOpenTabs() {
         title:    suspended.title || t.title,
         windowId: t.windowId,
         active:   t.active,
+        pinned:   Boolean(t.pinned),
         favIconUrl: t.favIconUrl || '',
         isSuspended: Boolean(suspended.isSuspended),
         discarded: t.discarded || false,
@@ -1790,8 +1791,11 @@ async function restoreSavedTabSession(sessionId) {
 async function removeOpenTabByIdOrUrl(tabId, tabUrl) {
   const numericTabId = getTabIdValue(tabId);
   if (numericTabId != null) {
-    await chrome.tabs.remove(numericTabId);
-    return numericTabId;
+    try {
+      await chrome.tabs.remove(numericTabId);
+      return numericTabId;
+    } catch { /* tab already gone — treat as removed */ }
+    return null;
   }
 
   const allTabs = await queryTabsForDashboardWindow();
@@ -1801,8 +1805,10 @@ async function removeOpenTabByIdOrUrl(tabId, tabUrl) {
     return tab.url === tabUrl || canonicalUrl === targetUrl;
   });
   if (match?.id != null) {
-    await chrome.tabs.remove(match.id);
-    return match.id;
+    try {
+      await chrome.tabs.remove(match.id);
+      return match.id;
+    } catch { /* tab already gone — treat as removed */ }
   }
   return null;
 }
@@ -2886,9 +2892,35 @@ async function closeDuplicateTabs(urls, keepOne = true) {
     }
   }
 
-  if (toClose.length > 0) await chrome.tabs.remove(toClose);
+  if (toClose.length > 0) {
+    // Same last-tab protection as every other close path: never remove a
+    // window's final tab (that would close the window / exit the browser).
+    const safeToClose = ensureWindowsKeepLastTab(allTabs, toClose);
+    if (safeToClose.length > 0) await chrome.tabs.remove(safeToClose);
+  }
   await fetchOpenTabs();
   await loadSessionGroups(getOpenTabIdsForSessionPruning());
+}
+
+/**
+ * groupTabsWithStaleRetry(tabIds)
+ *
+ * chrome.tabs.group fails atomically when any id is invalid (a tab closed or
+ * was replaced between render and click). Drop ids that no longer exist —
+ * verified with chrome.tabs.get — and retry once with the survivors; if that
+ * still fails (or nothing was stale), rethrow so the caller can toast.
+ */
+async function groupTabsWithStaleRetry(tabIds) {
+  try {
+    return await chrome.tabs.group({ tabIds });
+  } catch (err) {
+    const liveIds = [];
+    for (const id of tabIds) {
+      try { await chrome.tabs.get(id); liveIds.push(id); } catch { /* stale */ }
+    }
+    if (liveIds.length === 0 || liveIds.length === tabIds.length) throw err;
+    return chrome.tabs.group({ tabIds: liveIds });
+  }
 }
 
 /**
@@ -3008,7 +3040,6 @@ function buildPageChipHtml(tab, group, urlCounts = {}, collapsed = false) {
     if (parsed.hostname === 'localhost' && parsed.port) label = `${parsed.port} ${label}`;
   } catch {}
   const count    = urlCounts[tab.url] || 1;
-  const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
   const sortId = getPrimaryTabOrderToken(tab);
   const isSelected = selectedPageChipIds.has(String(sortId || ''));
   const chipClass = `${count > 1 ? ' chip-has-dupes' : ''}${tab.discarded ? ' page-chip--discarded' : ''}${isSelected ? ' is-selected' : ''}${collapsed ? ' page-chip--collapsed' : ''}`;
@@ -3028,7 +3059,7 @@ function buildPageChipHtml(tab, group, urlCounts = {}, collapsed = false) {
       </button>
       ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" data-fallback-src="${safeFallbackUrl}" data-fallback-srcset="${runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(JSON.stringify(iconData.sources.slice(2))) : JSON.stringify(iconData.sources.slice(2)).replace(/"/g, '&quot;')}">` : ''}
       <span class="chip-favicon chip-favicon-fallback"${faviconUrl ? ' style="display:none"' : ''}>${fallbackLabel}</span>
-      <span class="chip-text">${safeLabel}</span>${dupeTag}
+      <span class="chip-text">${safeLabel}</span>
       <div class="chip-actions">
         ${sleepControlEnabled && !tab.active ? `<button class="chip-action chip-discard" data-action="discard-tab" data-tab-id="${tab.id}" aria-label="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}" data-tooltip="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}">
           ${ICONS.moon}
@@ -3109,23 +3140,21 @@ function renderDomainCard(group) {
         ${ICONS.close}
       </button>`;
 
-  let actionsHtml = '';
-  // Merge every tab of this card into one native Chrome tab group.
-  actionsHtml += `
-    <button class="action-btn" type="button" data-action="group-card-tabs" data-domain-id="${stableId}">
-      ${runtimeT
-        ? runtimeT('groupCardTabsLabel')
-        : 'Merge into Chrome group'}
+  const dupeUrlsEncoded = hasDupes ? dupeUrls.map(([url]) => encodeURIComponent(url)).join(',') : '';
+  // Header actions, left to right: close duplicates, merge into a Chrome
+  // group, sleep all in group, save session, close group. All are icon
+  // buttons in the same quiet header style (30×30, muted → ink on hover).
+  const mergeGroupButton = `
+    <button class="group-action-icon" type="button" data-action="group-card-tabs" data-domain-id="${stableId}" aria-label="${runtimeT ? runtimeT('groupCardTabsLabel') : 'Merge into Chrome group'}" data-tooltip="${runtimeT ? runtimeT('groupCardTabsLabel') : 'Merge into Chrome group'}">
+      ${ICONS.mergeGroup}
     </button>`;
-  if (hasDupes) {
-    const dupeUrlsEncoded = dupeUrls.map(([url]) => encodeURIComponent(url)).join(',');
-    actionsHtml += `
-      <button class="action-btn" type="button" data-action="dedup-keep-one" data-dupe-urls="${dupeUrlsEncoded}">
-        ${runtimeT
-          ? runtimeT('closedDuplicatesCount', { count: totalExtras, suffix: totalExtras !== 1 ? 's' : '' })
-          : `Close ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}`}
-      </button>`;
-  }
+  const dedupLabel = runtimeT
+    ? runtimeT('closedDuplicatesCount', { count: totalExtras, suffix: totalExtras !== 1 ? 's' : '' })
+    : `Close ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}`;
+  const dedupButton = hasDupes ? `
+    <button class="group-action-icon" type="button" data-action="dedup-keep-one" data-dupe-urls="${dupeUrlsEncoded}" aria-label="${dedupLabel}" data-tooltip="${dedupLabel}">
+      ${ICONS.closeDuplicates}
+    </button>` : '';
 
   return `
     <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}" data-domain-id="${stableId}" data-group-id="${group.domain}">
@@ -3147,6 +3176,8 @@ function renderDomainCard(group) {
             ${dupeBadge}
           </div>
           <div class="mission-actions">
+            ${dedupButton}
+            ${mergeGroupButton}
             ${sleepControlEnabled ? `
             <button class="group-action-icon" type="button" data-action="sleep-domain-tabs" data-domain-id="${stableId}" aria-label="${runtimeT ? runtimeT('sleepAllTabsButton') : 'Sleep all tabs in group'}" data-tooltip="${runtimeT ? runtimeT('sleepAllTabsButton') : 'Sleep all tabs in group'}">
               ${ICONS.moon}
@@ -3156,7 +3187,6 @@ function renderDomainCard(group) {
           </div>
         </div>
         <div class="mission-pages">${pageChips}</div>
-        ${actionsHtml ? `<div class="actions">${actionsHtml}</div>` : ''}
       </div>
       <div class="mission-meta">
         <div class="mission-page-count">${tabCount}</div>
@@ -3455,6 +3485,39 @@ function syncWorkspaceTopNavMarkup(markup = '', visible = true) {
   if (typeof renderThemeMenu === 'function') renderThemeMenu();
 }
 
+function buildOpenTabsSectionActions() {
+  // Section header above ALL cards, left to right: close duplicates (only
+  // while some card-visible URL is duplicated anywhere in the window), merge
+  // every open tab into one Chrome tab group, sleep all, save session, close
+  // all. Duplicates are counted over getRealTabs() — the same restorable-tab
+  // scope the cards show — so internal pages (chrome://, the dashboard's own
+  // new-tab page) never inflate the count.
+  const counts = {};
+  for (const tab of getRealTabs()) {
+    if (!tab?.url) continue;
+    counts[tab.url] = (counts[tab.url] || 0) + 1;
+  }
+  const dupeUrls = Object.entries(counts)
+    .filter(([, c]) => c > 1)
+    .map(([url]) => url);
+  const totalExtras = dupeUrls.reduce((sum, url) => sum + counts[url] - 1, 0);
+  const dedupLabel = runtimeT
+    ? runtimeT('closedDuplicatesCount', { count: totalExtras, suffix: totalExtras !== 1 ? 's' : '' })
+    : `Close ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}`;
+  const dupeUrlsEncoded = dupeUrls.map(url => encodeURIComponent(url)).join(',');
+
+  return `
+    ${dupeUrls.length > 0 ? `<button class="section-icon-action" type="button" data-action="dedup-keep-one" data-dupe-urls="${dupeUrlsEncoded}" aria-label="${dedupLabel}" data-tooltip="${dedupLabel}">
+      ${ICONS.closeDuplicates}
+    </button>` : ''}
+    <button class="section-icon-action" type="button" data-action="group-card-tabs" data-scope="all" aria-label="${runtimeT ? runtimeT('groupCardTabsLabel') : 'Merge into Chrome group'}" data-tooltip="${runtimeT ? runtimeT('groupCardTabsLabel') : 'Merge into Chrome group'}">
+      ${ICONS.mergeGroup}
+    </button>
+    ${sleepControlEnabled ? `<button class="section-icon-action" type="button" data-action="sleep-all-open-tabs" aria-label="${runtimeT ? runtimeT('sleepAllTabsButton') : 'Sleep all tabs'}" data-tooltip="${runtimeT ? runtimeT('sleepAllTabsButton') : 'Sleep all tabs'}">${ICONS.moon}</button>` : ''}
+    <button class="section-icon-action" type="button" data-action="save-current-window-session" aria-label="${runtimeT ? runtimeT('saveSessionButton') : 'Save session'}" data-tooltip="${runtimeT ? runtimeT('saveSessionButton') : 'Save session'}">${ICONS.archive}</button>
+    <button class="section-icon-action section-icon-action-close" type="button" data-action="close-all-open-tabs" aria-label="${runtimeT ? runtimeT('closeAllTabsButton') : 'Close all tabs'}" data-tooltip="${runtimeT ? runtimeT('closeAllTabsButton') : 'Close all tabs'}">${ICONS.close}</button>`;
+}
+
 function renderOpenTabsSummary(realTabs = getRealTabs()) {
   const openTabsSection      = document.getElementById('openTabsSection');
   const openTabsSectionCount = document.getElementById('openTabsSectionCount');
@@ -3466,10 +3529,7 @@ function renderOpenTabsSummary(realTabs = getRealTabs()) {
   if (domainGroups.length > 0) {
     if (openTabsSectionTitle) openTabsSectionTitle.textContent = runtimeT ? runtimeT('openTabsSectionTitle') : 'Open tabs';
     if (openTabsSectionCount) {
-      openTabsSectionCount.innerHTML = `
-        ${sleepControlEnabled ? `<button class="section-icon-action" type="button" data-action="sleep-all-open-tabs" aria-label="${runtimeT ? runtimeT('sleepAllTabsButton') : 'Sleep all tabs'}" data-tooltip="${runtimeT ? runtimeT('sleepAllTabsButton') : 'Sleep all tabs'}">${ICONS.moon}</button>` : ''}
-        <button class="section-icon-action" type="button" data-action="save-current-window-session" aria-label="${runtimeT ? runtimeT('saveSessionButton') : 'Save session'}" data-tooltip="${runtimeT ? runtimeT('saveSessionButton') : 'Save session'}">${ICONS.archive}</button>
-        <button class="section-icon-action section-icon-action-close" type="button" data-action="close-all-open-tabs" aria-label="${runtimeT ? runtimeT('closeAllTabsButton') : 'Close all tabs'}" data-tooltip="${runtimeT ? runtimeT('closeAllTabsButton') : 'Close all tabs'}">${ICONS.close}</button>`;
+      openTabsSectionCount.innerHTML = buildOpenTabsSectionActions();
     }
     syncWorkspaceTopNavMarkup(renderGroupNavArea(domainGroups), true);
     if (openTabsMissionsEl) {
@@ -3699,10 +3759,7 @@ function renderOpenTabsArea(realTabs = getRealTabs()) {
   if (domainGroups.length > 0 && openTabsSection) {
     if (openTabsSectionTitle) openTabsSectionTitle.textContent = runtimeT ? runtimeT('openTabsSectionTitle') : 'Open tabs';
     if (openTabsSectionCount) {
-      openTabsSectionCount.innerHTML = `
-        ${sleepControlEnabled ? `<button class="section-icon-action" type="button" data-action="sleep-all-open-tabs" aria-label="${runtimeT ? runtimeT('sleepAllTabsButton') : 'Sleep all tabs'}" data-tooltip="${runtimeT ? runtimeT('sleepAllTabsButton') : 'Sleep all tabs'}">${ICONS.moon}</button>` : ''}
-        <button class="section-icon-action" type="button" data-action="save-current-window-session" aria-label="${runtimeT ? runtimeT('saveSessionButton') : 'Save session'}" data-tooltip="${runtimeT ? runtimeT('saveSessionButton') : 'Save session'}">${ICONS.archive}</button>
-        <button class="section-icon-action section-icon-action-close" type="button" data-action="close-all-open-tabs" aria-label="${runtimeT ? runtimeT('closeAllTabsButton') : 'Close all tabs'}" data-tooltip="${runtimeT ? runtimeT('closeAllTabsButton') : 'Close all tabs'}">${ICONS.close}</button>`;
+      openTabsSectionCount.innerHTML = buildOpenTabsSectionActions();
     }
     if (openTabsMissionsEl) openTabsMissionsEl.innerHTML = `${renderTabSessionPicker()}${domainGroups.map(g => renderDomainCard(g)).join('')}`;
     syncWorkspaceTopNavMarkup(renderGroupNavArea(domainGroups), true);
@@ -4190,12 +4247,30 @@ document.addEventListener('click', async (e) => {
   // ---- Focus a specific tab ----
   if (action === 'focus-tab') {
     if (Date.now() < suppressPageChipClickUntil) return;
+    const chip = actionEl.closest('[data-chip-sort-id]');
+    const key = chip ? String(chip.dataset.chipSortId || '') : '';
+    // The pointerup path already handled this gesture as a click (a toggle);
+    // the click that follows must not toggle the row again — or jump to the
+    // tab the user just deselected. Row bodies are not keyboard-focusable, so
+    // no keydown bypass is needed here (unlike the handle branch above).
+    const toggleGuardHit = Boolean(key)
+      && pageChipPointerToggleGuard.key === key
+      && Date.now() < pageChipPointerToggleGuard.until;
+    if (toggleGuardHit) return;
+    // While a multi-selection exists, clicking a row toggles it in the
+    // selection instead of activating the tab — batch mode never jumps.
+    if (selectedPageChipIds.size > 0) {
+      if (key) {
+        if (e.shiftKey && pageChipSelectionAnchorId) {
+          selectPageChipRange(key, pageChipSelectionAnchorId);
+        } else {
+          togglePageChipSelection(key);
+        }
+      }
+      return;
+    }
     const tabUrl = actionEl.dataset.tabUrl;
     const tabId = actionEl.dataset.tabId || '';
-    // A plain row click activates the tab and clears the selection.
-    if (selectedPageChipIds.size > 0) {
-      clearPageChipSelection();
-    }
     if (tabUrl || tabId) await focusTab(tabUrl, tabId);
     return;
   }
@@ -4371,12 +4446,14 @@ document.addEventListener('click', async (e) => {
     let skippedActive = 0;
     let stale = 0;
     for (const tabId of tabIds) {
-      const tab = openTabs.find(t => Number(t?.id) === tabId);
-      // Ghost chip: the tab is already gone (replaced/closed without a
-      // refresh). The re-render below drops the row and prunes any dangling
-      // manual-group assignment — do not count it as discarded.
-      if (!tab) { stale += 1; continue; }
-      if (tab?.active) { skippedActive += 1; continue; }
+      // Same live pre-check as the per-chip sleep: a ghost chip's id is still
+      // in the in-memory openTabs snapshot, so only a real chrome.tabs.get can
+      // tell a dead id apart from a live one. Dead ids count as stale and are
+      // skipped (the re-render below drops the row and prunes the assignment).
+      let liveTab = null;
+      try { liveTab = await chrome.tabs.get(Number(tabId)); } catch { liveTab = null; }
+      if (!liveTab) { stale += 1; continue; }
+      if (liveTab?.active) { skippedActive += 1; continue; }
       if (await discardTab(tabId)) discarded += 1;
       else failed += 1;
     }
@@ -4540,25 +4617,43 @@ document.addEventListener('click', async (e) => {
     return;
   }
 
-  // ---- Merge all card tabs into one Chrome tab group ----
+  // ---- Merge tabs into one Chrome tab group ----
   if (action === 'group-card-tabs') {
+    const scope = actionEl.dataset.scope || '';
     const domainId = actionEl.dataset.domainId || '';
-    const group = domainGroups.find(g => getStableGroupId(g.domain) === domainId);
-    if (!group) return;
+    const group = scope === 'all' ? null : domainGroups.find(g => getStableGroupId(g.domain) === domainId);
+    if (scope !== 'all' && !group) return;
 
-    const tabIds = getOrderedUniqueTabsForGroup(group)
-      .map(tab => Number(tab?.id))
-      .filter(id => Number.isInteger(id) && id > 0);
+    const tabIds = [];
+    if (scope === 'all') {
+      // Section-header variant: merge every open tab (all cards) into one
+      // Chrome tab group. Pinned tabs stay outside the merged group.
+      for (const g of domainGroups) {
+        for (const tab of getOrderedUniqueTabsForGroup(g)) {
+          const id = Number(tab?.id);
+          if (!Number.isInteger(id) || id <= 0) continue;
+          if (tab?.pinned) continue;
+          tabIds.push(id);
+        }
+      }
+    } else if (group) {
+      for (const tab of getOrderedUniqueTabsForGroup(group)) {
+        const id = Number(tab?.id);
+        if (Number.isInteger(id) && id > 0) tabIds.push(id);
+      }
+    }
     if (!tabIds.length) return;
 
     // Suppress auto-refresh to prevent animation spam
     window.__suppressAutoRefreshUntil = Date.now() + 2000;
 
     try {
-      const groupId = await chrome.tabs.group({ tabIds });
-      const label = getGroupDisplayLabel(group);
+      const groupId = await groupTabsWithStaleRetry(tabIds);
+      const label = scope === 'all'
+        ? (runtimeT ? runtimeT('mergeAllGroupTitle', { count: tabIds.length }) : `Open tabs (${tabIds.length})`)
+        : getGroupDisplayLabel(group);
       const color = typeof runtimeAssignGroupColor === 'function'
-        ? runtimeAssignGroupColor(group.domain, 0)
+        ? runtimeAssignGroupColor(scope === 'all' ? 'all' : group.domain, 0)
         : 'blue';
       await chrome.tabGroups.update(groupId, { title: label, color });
     } catch (err) {
@@ -4984,10 +5079,13 @@ document.addEventListener('pointerdown', (e) => {
   const chipHandle = e.target.closest('[data-chip-drag-handle="tab"]');
   const chipItem = e.target.closest('[data-chip-sort-id]');
   const chipAction = e.target.closest('.chip-actions');
-  // Drag only starts from the reorder handle. Pressing the row body keeps
-  // its plain click behavior (activate the tab) — arming a drag from the
-  // body would jump to the link on release after a drag gesture.
-  if (chipHandle && chipItem && !chipAction && e.button === 0) {
+  // The whole row is the drag surface — the handle is just the visible grip.
+  // A press that never moves is a click: the handle toggles the row in the
+  // selection, and the row body activates the tab (unless a multi-selection
+  // is active, in which case it toggles the row too). A press that moves
+  // drags the row (or the whole selection) no matter where it started; the
+  // click that follows a completed drag is suppressed in the pointerup path.
+  if (chipItem && !chipAction && e.button === 0) {
     // Re-entrancy guard: a second pointer must not clobber an in-flight drag
     // (first drag would be silently lost and its capture never released).
     if (pageChipDragState || draggedPageChipId) return;
@@ -5013,6 +5111,9 @@ document.addEventListener('pointerdown', (e) => {
       createNewGroup: false,
       newGroupPlacement: '',
       handleEl: dragHandleEl,
+      // Handle presses toggle on click; body presses only toggle while a
+      // multi-selection is already active (otherwise the click jumps).
+      originatedFromHandle: Boolean(chipHandle),
       pointerId: e.pointerId,
       x: e.clientX,
       y: e.clientY,
@@ -5036,13 +5137,6 @@ document.addEventListener('pointerdown', (e) => {
       } catch {}
     }
     return;
-  }
-
-  // Pressing the row body (not the handle) must not arm a drag, but it
-  // should also not start a text selection while the user is about to click
-  // the row to activate the tab.
-  if (chipItem && !chipAction && e.button === 0) {
-    e.preventDefault();
   }
 
   const drawerHandle = e.target.closest('.drawer-reorder-handle');
@@ -5109,18 +5203,29 @@ document.addEventListener('pointerup', async (e) => {
       pointerId: e.pointerId,
       moved: pageChipDragState.moved,
     });
-    // A handle press that never moved is a click: toggle the row in the
-    // highlight-only selection (Shift extends the range from the anchor).
-    // A drag that ended near its start point is a completed drag, not a click.
+    // A press that never moved is a click, not a drag. The handle always
+    // toggles the row in the highlight-only selection (Shift extends the
+    // range from the anchor); the row body only toggles while a selection is
+    // already active — a plain body click stays a click so the synthesized
+    // click event can activate the tab.
     const finalDistance = Math.hypot(e.clientX - pageChipDragState.x, e.clientY - pageChipDragState.y);
     if (!pageChipDragState.moved && finalDistance < 4) {
-      // Guard the synthesized click that follows on touch/pen devices so the
-      // row is not toggled twice.
-      pageChipPointerToggleGuard = { key: String(draggedPageChipId || ''), until: Date.now() + 400 };
-      if (e.shiftKey && pageChipSelectionAnchorId) {
-        selectPageChipRange(draggedPageChipId, pageChipSelectionAnchorId);
+      const toggleAsClick = pageChipDragState.originatedFromHandle
+        || selectedPageChipIds.size > 0
+        || e.shiftKey;
+      if (toggleAsClick) {
+        // Guard the synthesized click that follows on touch/pen devices so the
+        // row is not toggled twice.
+        pageChipPointerToggleGuard = { key: String(draggedPageChipId || ''), until: Date.now() + 400 };
+        if (e.shiftKey && pageChipSelectionAnchorId) {
+          selectPageChipRange(draggedPageChipId, pageChipSelectionAnchorId);
+        } else {
+          togglePageChipSelection(draggedPageChipId);
+        }
       } else {
-        togglePageChipSelection(draggedPageChipId);
+        // No toggle happened, so there is no synthesized click to guard — a
+        // stale guard must not swallow the click that activates the tab.
+        pageChipPointerToggleGuard = { key: '', until: 0 };
       }
       clearPageChipDragState({ removeNode: false });
       return;
@@ -5131,6 +5236,11 @@ document.addEventListener('pointerup', async (e) => {
         startPageChipDragVisuals();
       }
     }
+    // A completed drag must not let the click that follows it activate the
+    // tab (the click lands on the row under the pointer). Suppress it here,
+    // synchronously, because the click is dispatched before the async commit
+    // inside finishPageChipDrag finishes.
+    suppressPageChipClickUntil = Date.now() + 250;
     updateDraggedPageChipPosition(e.clientX, e.clientY);
     const stickyTarget = pageChipDragState.lastResolvedDropTarget;
     const stickyIsNonSource = stickyTarget && (
@@ -5559,6 +5669,27 @@ async function initializeDashboardRuntime() {
 }
 
 /**
+ * isExtensionContextInvalidated(err)
+ *
+ * True when the extension was reloaded/updated/disabled while this page was
+ * still open: every chrome.* call then throws "Extension context invalidated".
+ * The page cannot do anything useful until it rebinds to a live context.
+ */
+function isExtensionContextInvalidated(err) {
+  return Boolean(err && /Extension context invalidated/i.test(String(err?.message || err)));
+}
+
+// Reload only once per invalidation — if the extension is disabled, the next
+// new-tab load falls back to the default page, so a single attempt cannot loop.
+let extensionContextInvalidatedHandled = false;
+function recoverFromInvalidatedExtensionContext() {
+  if (extensionContextInvalidatedHandled) return;
+  extensionContextInvalidatedHandled = true;
+  console.warn('[tab-harbor] Extension context invalidated — reloading dashboard to rebind.');
+  try { location.reload(); } catch { /* page may already be tearing down */ }
+}
+
+/**
  * setupTabChangeListener()
  * 
  * Listens for messages from background.js when tabs change,
@@ -5597,6 +5728,7 @@ function setupTabChangeListener() {
           if (DEBUG) console.log('[tab-harbor] Dashboard refreshed successfully');
         } catch (err) {
           console.warn('[tab-harbor] Failed to refresh dashboard:', err);
+          if (isExtensionContextInvalidated(err)) recoverFromInvalidatedExtensionContext();
         }
       }, 300); // Wait 300ms after last tab change
     }
@@ -5607,6 +5739,11 @@ function mountDashboardRuntime() {
   if (!window.__tabHarborRuntimeMounted) {
     document.addEventListener('pointerdown', disableEntryAnimations, { capture: true, passive: true });
     window.addEventListener('scroll', updateBackToTopVisibility, { passive: true });
+    // Any chrome.* call after the extension reloaded throws; a rejected promise
+    // from a user action would otherwise leave the page as a silent zombie.
+    window.addEventListener('unhandledrejection', (event) => {
+      if (isExtensionContextInvalidated(event?.reason)) recoverFromInvalidatedExtensionContext();
+    });
     window.addEventListener('focus', () => {
       void collapseChromeGroupsForCurrentTabHarborTab();
     });
