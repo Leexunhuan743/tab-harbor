@@ -1752,6 +1752,32 @@ body.group-dragging .group-nav-button {
     background: var(--warm-gray);
 }
 
+/* User-created Chrome group cards wear their native group color on the card
+   name and the tab rows' drag handles — a quiet accent that follows the
+   group's real Chrome color without adding a separate bar. The NAME mixes the
+   group color toward --ink so text stays readable (AA ≥ 4.5:1); the drag
+   handles are graphical icons and keep the pure group color. */
+.mission-card.chrome-group-card .mission-name {
+    color: color-mix(in srgb, var(--chrome-group-color, var(--ink)) 35%, var(--ink));
+}
+
+.mission-card.chrome-group-card .mission-rename-trigger:hover .mission-name,
+.mission-card.chrome-group-card .mission-rename-trigger:focus-visible .mission-name {
+    color: color-mix(in srgb, var(--chrome-group-color, var(--ink)) 35%, var(--ink));
+}
+
+.mission-card.chrome-group-card .chip-reorder-handle {
+    color: var(--chrome-group-color, color-mix(in srgb, var(--ink) 84%, var(--muted) 16%));
+}
+
+.mission-card.chrome-group-card .chip-reorder-handle:hover,
+.mission-card.chrome-group-card .chip-reorder-handle:focus-visible {
+    /* Hover/focus must be visibly different from the resting pure group
+       color; mix toward the ink so the feedback stays readable in light
+       themes too (C29). */
+    color: color-mix(in srgb, var(--chrome-group-color, var(--ink)) 55%, var(--ink));
+}
+
 .mission-card:hover {
     box-shadow: 0 16px 30px
         color-mix(in srgb, var(--workspace-accent) 12%, transparent);
@@ -2010,20 +2036,24 @@ body.page-chip-list-dragging .page-chip.is-selected:not(.is-dragging) {
 .page-chip-batch-action {
     display: inline-flex;
     align-items: center;
+    justify-content: center;
+    width: 30px;
     height: 30px;
-    padding: 0 8px;
+    flex-shrink: 0;
+    padding: 0;
     border: none;
     background: transparent;
     color: color-mix(in srgb, var(--muted) 82%, var(--ink) 18%);
-    font-family: "Public Sans", sans-serif;
-    font-size: 11px;
-    font-size: var(--ui-font-11);
-    font-weight: 600;
-    letter-spacing: 0.04em;
     cursor: pointer;
     transition:
         color 0.15s ease,
         opacity 0.15s ease;
+    position: relative;
+}
+
+.page-chip-batch-action svg {
+    width: 14px;
+    height: 14px;
 }
 
 .page-chip-batch-action:hover {
@@ -2316,6 +2346,7 @@ body.page-chip-list-dragging .page-chip.is-selected:not(.is-dragging) {
 .chip-action[data-tooltip]::after,
 .group-action-icon[data-tooltip]::after,
 .section-icon-action[data-tooltip]::after,
+.page-chip-batch-action[data-tooltip]::after,
 .todo-action-btn[data-tooltip]::after {
     content: attr(data-tooltip);
     position: absolute;
@@ -2347,6 +2378,8 @@ body.page-chip-list-dragging .page-chip.is-selected:not(.is-dragging) {
 .group-action-icon[data-tooltip]:focus-visible::after,
 .section-icon-action[data-tooltip]:hover::after,
 .section-icon-action[data-tooltip]:focus-visible::after,
+.page-chip-batch-action[data-tooltip]:hover::after,
+.page-chip-batch-action[data-tooltip]:focus-visible::after,
 .todo-action-btn[data-tooltip]:hover::after,
 .todo-action-btn[data-tooltip]:focus-visible::after {
     opacity: 1;

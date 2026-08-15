@@ -10,6 +10,7 @@
   let importMode = false;
   let chromeEventMuteUntil = 0;
   let chromeListenersAttached = false;
+  let chromeGroupsLastError = '';
   const chromeGroupSubscribers = new Set();
 
   const GROUP_COLORS = ['grey', 'red', 'green', 'pink', 'purple', 'cyan', 'orange'];
@@ -19,7 +20,10 @@
   }
 
   function shouldIgnoreChromeEvent() {
-    return !cachedEnabled || Date.now() < chromeEventMuteUntil;
+    // Only the short echo-mute window suppresses notifications. Whether the
+    // sync PUSH is enabled is a separate concern — live card recognition
+    // listens to Chrome group events even when the push toggle is off.
+    return Date.now() < chromeEventMuteUntil;
   }
 
   function notifyChromeGroupSubscribers(event) {
@@ -31,22 +35,17 @@
     }
   }
 
-  function shouldNotifyChromeGroupUpdate(changeInfo) {
-    if (!changeInfo || typeof changeInfo !== 'object') return false;
-    const changedKeys = Object.keys(changeInfo);
-    if (changedKeys.length === 0) return false;
-    return changedKeys.some(key => key !== 'collapsed');
-  }
-
   function attachChromeListeners() {
     if (chromeListenersAttached || typeof chrome === 'undefined') return;
 
     const eventBindings = [
       [chrome.tabGroups?.onCreated, group => notifyChromeGroupSubscribers({ source: 'tabGroups.onCreated', group })],
-      [chrome.tabGroups?.onUpdated, (groupId, changeInfo) => {
-        // Collapsing or expanding a group should not trigger a full import cycle.
-        if (!shouldNotifyChromeGroupUpdate(changeInfo)) return;
-        notifyChromeGroupSubscribers({ source: 'tabGroups.onUpdated', groupId, changeInfo });
+      [chrome.tabGroups?.onUpdated, (group) => {
+        // Chrome passes the full updated TabGroup object (there is no separate
+        // changeInfo parameter). Collapse-only updates also arrive here; the
+        // dashboard side debounces the re-render, and the import pipeline is
+        // retired, so a full notify is safe.
+        notifyChromeGroupSubscribers({ source: 'tabGroups.onUpdated', group });
       }],
       [chrome.tabGroups?.onRemoved, group => notifyChromeGroupSubscribers({ source: 'tabGroups.onRemoved', group })],
       [chrome.tabs?.onAttached, (tabId, attachInfo) => notifyChromeGroupSubscribers({ source: 'tabs.onAttached', tabId, attachInfo })],
@@ -111,15 +110,19 @@
 
   async function persistChromeGroupMap() {
     try {
-      // Save group metadata (title, color) instead of raw groupIds,
-      // since Chrome tab group IDs are only stable within a session.
+      // Save group metadata (title, color) per window instead of raw groupIds,
+      // since Chrome tab group IDs are only stable within a session. Keeping
+      // the window id in the key lets reload match within the SAME window, so a
+      // user-created group that happens to share title+color in another window
+      // is never misclassified as a dashboard mirror.
       const meta = {};
       for (const [groupKey, windowMap] of Object.entries(chromeGroupMap)) {
-        for (const chromeGroupId of Object.values(windowMap)) {
+        for (const [windowIdStr, chromeGroupId] of Object.entries(windowMap)) {
           try {
             const group = await chrome.tabGroups.get(chromeGroupId);
-            if (group && !meta[groupKey]) {
-              meta[groupKey] = { title: group.title, color: group.color };
+            if (group) {
+              if (!meta[groupKey]) meta[groupKey] = {};
+              meta[groupKey][windowIdStr] = { title: group.title, color: group.color };
             }
           } catch {}
         }
@@ -137,15 +140,34 @@
       const currentGroups = await chrome.tabGroups.query({});
       const reconciled = {};
 
-      for (const [groupKey, info] of Object.entries(meta)) {
-        // Match by title + color — the values we control. After restart,
-        // Chrome assigns new groupIds, but our groups retain their title/color.
-        const match = currentGroups.find(g =>
-          g.title === info.title && g.color === info.color
-        );
-        if (match) {
-          if (!reconciled[groupKey]) reconciled[groupKey] = {};
-          reconciled[groupKey][match.windowId] = match.id;
+      for (const [groupKey, stored] of Object.entries(meta)) {
+        // Stored shape is { windowId: { title, color } }. Older snapshots may
+        // be flat { title, color } — fall back to matching any window for them.
+        const perWindow = stored && typeof stored === 'object' && !('title' in stored) && !('color' in stored)
+          ? stored
+          : { any: stored };
+        for (const [windowIdKey, info] of Object.entries(perWindow)) {
+          if (!info || typeof info !== 'object') continue;
+          // Match by window + title + color — the values we control. After
+          // restart Chrome assigns new groupIds, but our groups retain their
+          // title/color within the same window.
+          const matches = currentGroups.filter(g =>
+            (windowIdKey === 'any' || Number(g.windowId) === Number(windowIdKey)) &&
+            g.title === info.title && g.color === info.color
+          );
+          // Legacy flat snapshots carry no window id. If more than one window
+          // has a same-title+color group, auto-binding would be a coin toss
+          // that can mark a user group as a mirror — skip and let the next
+          // persist (or a toggle off/on) rebuild a correct per-window mapping.
+          if (windowIdKey === 'any' && matches.length > 1) {
+            console.warn(`[tab-harbor] ambiguous legacy chromeTabGroupsMeta for ${groupKey}; skipping auto-bind`);
+            continue;
+          }
+          const match = matches[0];
+          if (match) {
+            if (!reconciled[groupKey]) reconciled[groupKey] = {};
+            reconciled[groupKey][match.windowId] = match.id;
+          }
         }
       }
 
@@ -154,9 +176,15 @@
   }
 
   function isChromeApiAvailable() {
-    return typeof chrome !== 'undefined' &&
+    const available = typeof chrome !== 'undefined' &&
       chrome.tabs && typeof chrome.tabs.group === 'function' &&
       chrome.tabGroups && typeof chrome.tabGroups.update === 'function';
+    if (!available) chromeGroupsLastError = 'chrome.tabGroups API unavailable';
+    return available;
+  }
+
+  function getChromeGroupsLastError() {
+    return chromeGroupsLastError;
   }
 
   async function ungroupTabs(tabIds) {
@@ -169,7 +197,16 @@
   }
 
   async function reorderGroupedTabs(chromeGroupId, desiredTabIds, windowId) {
-    if (!chromeGroupId || !Array.isArray(desiredTabIds) || desiredTabIds.length <= 1) return;
+    if (!chromeGroupId || !Array.isArray(desiredTabIds) || desiredTabIds.length === 0) return;
+
+    // Callers may pass chip tokens (string ids) or raw tab ids — normalize to
+    // numbers so the strict comparisons and chrome.tabs.move receive numbers.
+    const desiredIds = desiredTabIds
+      .map(id => Number(id))
+      .filter(Number.isFinite);
+    if (desiredIds.length === 0) return;
+
+    const desiredSet = new Set(desiredIds.map(String));
 
     let groupedTabs = [];
     try {
@@ -181,50 +218,34 @@
     if (!groupedTabs.length) return;
 
     const currentTabs = groupedTabs
-      .filter(tab => desiredTabIds.includes(tab.id))
+      .filter(tab => desiredSet.has(String(tab.id)))
       .sort((a, b) => a.index - b.index);
     if (!currentTabs.length) return;
 
     const currentOrder = currentTabs.map(tab => tab.id);
-    if (currentOrder.length === desiredTabIds.length &&
-        currentOrder.every((tabId, index) => tabId === desiredTabIds[index])) {
+    if (currentOrder.length === desiredIds.length &&
+        currentOrder.every((tabId, index) => tabId === desiredIds[index])) {
       return;
     }
 
     const baseIndex = Math.min(...currentTabs.map(tab => tab.index));
-    for (const [offset, tabId] of desiredTabIds.entries()) {
-      try {
-        await chrome.tabs.move(tabId, { windowId, index: baseIndex + offset });
-      } catch {}
-    }
-  }
-
-  async function reorderWindowTabsByDesiredOrder(windowId, desiredTabIds) {
-    if (!Number.isFinite(windowId) || !Array.isArray(desiredTabIds) || desiredTabIds.length <= 1) return;
-
-    let windowTabs = [];
-    try {
-      windowTabs = await chrome.tabs.query({ windowId });
-    } catch {
+    // Prefer the group's own window from the live query: callers pass a
+    // windowId that may come from a stale snapshot or a placeholder row. The
+    // live query result is authoritative for the group's real window.
+    const liveWindowId = currentTabs[0]?.windowId != null ? Number(currentTabs[0].windowId) : NaN;
+    const effectiveWindowId = Number.isFinite(liveWindowId) ? liveWindowId : Number(windowId);
+    if (!Number.isFinite(effectiveWindowId)) {
+      console.warn('[tab-harbor] reorderGroupedTabs: no usable windowId, skipping reorder');
       return;
     }
-
-    const relevantTabs = windowTabs
-      .filter(tab => desiredTabIds.includes(tab.id))
-      .sort((a, b) => a.index - b.index);
-    if (relevantTabs.length <= 1) return;
-
-    const currentOrder = relevantTabs.map(tab => tab.id);
-    if (currentOrder.length === desiredTabIds.length &&
-        currentOrder.every((tabId, index) => tabId === desiredTabIds[index])) {
-      return;
-    }
-
-    const baseIndex = Math.min(...relevantTabs.map(tab => tab.index));
-    for (const [offset, tabId] of desiredTabIds.entries()) {
+    for (const [offset, tabId] of desiredIds.entries()) {
       try {
-        await chrome.tabs.move(tabId, { windowId, index: baseIndex + offset });
-      } catch {}
+        await chrome.tabs.move(tabId, { windowId: effectiveWindowId, index: baseIndex + offset });
+      } catch (err) {
+        // Do not swallow silently: a failed move means the panel order and the
+        // native group order diverge and the user cannot see why.
+        console.warn(`[tab-harbor] reorderGroupedTabs: move tab ${tabId} failed:`, err);
+      }
     }
   }
 
@@ -251,6 +272,58 @@
     await persistChromeGroupMap();
   }
 
+  function getManagedChromeGroupIds() {
+    const ids = new Set();
+    for (const windowMap of Object.values(chromeGroupMap)) {
+      for (const chromeGroupId of Object.values(windowMap)) {
+        if (chromeGroupId != null) ids.add(chromeGroupId);
+      }
+    }
+    return ids;
+  }
+
+  /**
+   * queryUserChromeGroups(windowId)
+   *
+   * Returns the native Chrome tab groups of the given window that the DASHBOARD
+   * does not manage (i.e. groups the user created in the browser, not the
+   * mirror groups this extension pushed). Each entry carries the group's live
+   * title/color, its tab ids and its strip position (min tab index) so the
+   * dashboard can render one card per group, ordered like the tab strip.
+   */
+  async function queryUserChromeGroups(windowId) {
+    if (!isChromeApiAvailable()) return [];
+    try {
+      const groups = await chrome.tabGroups.query({});
+      const managed = getManagedChromeGroupIds();
+      const inWindow = groups.filter(g => Number(g.windowId) === Number(windowId));
+      const result = [];
+      for (const group of inWindow) {
+        if (managed.has(group.id)) continue;
+        const tabs = await chrome.tabs.query({ groupId: group.id }).catch(() => []);
+        if (!tabs.length) continue;
+        const positions = tabs.map(t => t.index).filter(Number.isFinite);
+        result.push({
+          id: group.id,
+          windowId: Number(group.windowId),
+          title: group.title || '',
+          color: group.color || 'grey',
+          collapsed: Boolean(group.collapsed),
+          minIndex: positions.length ? Math.min(...positions) : Number.MAX_SAFE_INTEGER,
+          tabIds: tabs.map(t => t.id).filter(id => id != null),
+        });
+      }
+      chromeGroupsLastError = '';
+      return result.sort((a, b) => a.minIndex - b.minIndex);
+    } catch (err) {
+      // Never silently pretend there are no user groups: keep a diagnostic and
+      // let the dashboard surface a visible failure state.
+      chromeGroupsLastError = err?.message || String(err || 'queryUserChromeGroups failed');
+      console.warn('[tab-harbor] queryUserChromeGroups failed:', err);
+      return [];
+    }
+  }
+
   async function syncChromeTabGroups(domainGroups) {
     muteChromeGroupEvents();
     await loadPersistedChromeGroupMap();
@@ -264,17 +337,18 @@
 
     // Build desired state: { groupKey: { windowId: [tabIds] } }
     const desired = {};
-    const desiredWindowOrders = {};
     for (const group of domainGroups) {
       const groupKey = group.domain;
+      // Manual groups stay dashboard-internal, and live Chrome-group cards are
+      // already native groups — neither is pushed to Chrome.
+      if (group.isManual || group.isChromeGroup) continue;
+      if (groupKey.startsWith('__session_group__:') || groupKey.startsWith('__chrome_group__:')) continue;
       for (const tab of (group.tabs || [])) {
         if (tab.id == null) continue;
         const windowId = tab.windowId != null ? tab.windowId : 0;
         if (!desired[groupKey]) desired[groupKey] = {};
         if (!desired[groupKey][windowId]) desired[groupKey][windowId] = [];
         desired[groupKey][windowId].push(tab.id);
-        if (!desiredWindowOrders[windowId]) desiredWindowOrders[windowId] = [];
-        desiredWindowOrders[windowId].push(tab.id);
       }
     }
 
@@ -288,12 +362,21 @@
 
     // Remove orphaned Chrome groups only for windows represented in this sync.
     // Other windows may be managed by their own Tab Harbor new-tab page.
+    // Include the windows of MANUAL/Chrome-group cards too: their groups are
+    // skipped from `desired`, but a stale mirror mapping for those windows must
+    // still be cleaned up — otherwise a manual group that once had a mirror
+    // would keep its Chrome group forever.
     const desiredWindowIds = new Set(
       Object.values(desired)
         .flatMap(windowMap => Object.keys(windowMap))
         .map(windowId => Number(windowId))
         .filter(Number.isFinite)
     );
+    for (const group of domainGroups) {
+      for (const tab of (group.tabs || [])) {
+        if (tab?.windowId != null) desiredWindowIds.add(Number(tab.windowId));
+      }
+    }
     for (const [groupKey, windowMap] of Object.entries(chromeGroupMap)) {
       for (const [windowIdStr, chromeGroupId] of Object.entries(windowMap)) {
         const windowId = Number(windowIdStr);
@@ -381,9 +464,9 @@
       }
     }
 
-    for (const [windowIdStr, orderedTabIds] of Object.entries(desiredWindowOrders)) {
-      await reorderWindowTabsByDesiredOrder(Number(windowIdStr), orderedTabIds);
-    }
+    // The dashboard no longer reorders the whole window tab strip: card order
+    // follows Chrome's group strip order (see queryUserChromeGroups), so the
+    // window layout is left to the user.
     await persistChromeGroupMap();
   }
 
@@ -434,7 +517,14 @@
       return;
     }
 
-    const groupsInWindow = groups.filter(group => Number(group?.windowId) === targetWindowId);
+    // Only dashboard-managed mirror groups are collapsed. User-created groups
+    // keep whatever collapsed state the user chose — this helper runs when the
+    // Tab Harbor new-tab page gains focus, and must not fight the user's own
+    // group layout.
+    const managed = getManagedChromeGroupIds();
+    const groupsInWindow = groups.filter(group =>
+      Number(group?.windowId) === targetWindowId && managed.has(group.id)
+    );
     muteChromeGroupEvents();
 
     for (const group of groupsInWindow) {
@@ -460,7 +550,14 @@
       return;
     }
 
-    const groupsInWindow = groups.filter(group => Number(group?.windowId) === targetWindowId);
+    // Expand/collapse applies to dashboard-managed mirror groups only; the
+    // user's own groups keep their state. If the focused group itself is a
+    // user group, leave every group untouched.
+    const managed = getManagedChromeGroupIds();
+    if (!managed.has(targetGroupId)) return;
+    const groupsInWindow = groups.filter(group =>
+      Number(group?.windowId) === targetWindowId && managed.has(group.id)
+    );
     muteChromeGroupEvents();
 
     for (const group of groupsInWindow) {
@@ -498,6 +595,11 @@
     resetChromeGroupState,
     isChromeTabGroupsEnabled,
     getChromeGroupCount,
+    getManagedChromeGroupIds,
+    queryUserChromeGroups,
+    getChromeGroupsLastError,
+    reorderGroupedTabs,
+    muteChromeGroupEvents,
     populateChromeGroupMap,
     queryExistingChromeGroups,
     collapseChromeTabGroupsInWindow,
@@ -505,6 +607,8 @@
     setImportMode,
     isImportMode,
     subscribeToChromeTabGroupChanges,
+    loadPersistedChromeGroupMap,
+    persistChromeGroupMap,
     STORAGE_KEY,
     assignGroupColor,
     getGroupTitle,

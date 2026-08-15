@@ -188,6 +188,7 @@ let pageChipDragState = null;
 let pageChipPlaceholderEl = null;
 let pageChipNewGroupSlotEl = null;
 let pageChipAutoScrollRaf = 0;
+let pageChipCommitInFlight = false;
 let tabSessionPickerState = {
   open: false,
   mode: 'new',
@@ -351,6 +352,11 @@ function reorderGroupTabsByStoredUrls(tabs, groupKey) {
 
 function getOrderedUniqueTabsForGroup(group) {
   const tabs = Array.isArray(group?.tabs) ? group.tabs : [];
+  // User-created Chrome group cards always follow the native strip order
+  // (tabs come from queryUserChromeGroups, already strip-ordered). Applying
+  // the dashboard's stored tab order would keep a stale snapshot after the
+  // user reorders the group in the browser (C22).
+  if (group?.isChromeGroup) return tabs.slice();
   return reorderGroupTabsByStoredUrls(tabs, group?.domain);
 }
 
@@ -1239,11 +1245,33 @@ async function applyChromeTabGroupsToggle(nextEnabled) {
 async function loadGroupOrder() {
   const stored = await chrome.storage.local.get(GROUP_ORDER_KEY);
   groupOrderState = normalizeGroupOrderState(stored[GROUP_ORDER_KEY]);
+  // Chrome-group card keys are session-local and must never live in the
+  // durable card order. Clean any residue written before the filter was
+  // centralized here (C23).
+  const chromeKey = /^__chrome_group__:/;
+  const cleanSessionOrder = (groupOrderState.sessionOrder || []).filter(key => !chromeKey.test(String(key)));
+  const cleanPinnedOrder = (groupOrderState.pinnedOrder || []).filter(key => !chromeKey.test(String(key)));
+  if (cleanSessionOrder.length !== (groupOrderState.sessionOrder || []).length ||
+      cleanPinnedOrder.length !== (groupOrderState.pinnedOrder || []).length) {
+    groupOrderState = normalizeGroupOrderState({
+      ...groupOrderState,
+      sessionOrder: cleanSessionOrder,
+      pinnedOrder: cleanPinnedOrder,
+    });
+    await chrome.storage.local.set({ [GROUP_ORDER_KEY]: groupOrderState });
+  }
   return groupOrderState;
 }
 
 async function saveGroupOrder(nextState) {
-  groupOrderState = normalizeGroupOrderState(nextState);
+  const chromeKey = /^__chrome_group__:/;
+  const cleanSessionOrder = (nextState?.sessionOrder || []).map(String).filter(key => key && !chromeKey.test(key));
+  const cleanPinnedOrder = (nextState?.pinnedOrder || []).map(String).filter(key => key && !chromeKey.test(key));
+  groupOrderState = normalizeGroupOrderState({
+    ...nextState,
+    sessionOrder: cleanSessionOrder,
+    pinnedOrder: cleanPinnedOrder,
+  });
   await chrome.storage.local.set({ [GROUP_ORDER_KEY]: groupOrderState });
   return groupOrderState;
 }
@@ -1508,8 +1536,17 @@ async function mergeTabsIntoChromeGroup(tabIds, { title, color }) {
   // The write is muted so the dashboard's own group event cannot echo.
   if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
   const groupId = await groupTabsWithStaleRetry(tabIds);
-  await chrome.tabGroups.update(groupId, { title, color });
-  return groupId;
+  // The group is already created at this point. A rename/color failure must
+  // not be reported as "could not create the group" — the caller needs to
+  // know the side effect happened so it can still clean up (C5).
+  let updated = true;
+  try {
+    await chrome.tabGroups.update(groupId, { title, color });
+  } catch (err) {
+    updated = false;
+    console.warn('[tab-harbor] mergeTabsIntoChromeGroup: group created but update failed:', err);
+  }
+  return { groupId, updated };
 }
 
 async function sleepTabsByIds(tabIds, { skipActive = true } = {}) {
@@ -2741,7 +2778,12 @@ async function moveDraggedPageChipToGroup(targetGroupKey, targetListEl = null) {
     }
     let nextState = clearTabsFromSessionGroups(sessionGroupsState, draggedTabIds);
     nextState = pruneSessionGroups(nextState, getOpenTabIdsForSessionPruning());
-    await saveSessionGroups(nextState);
+    try {
+      await saveSessionGroups(nextState);
+    } catch (err) {
+      console.warn('[tab-harbor] move-to-chrome-group: session cleanup failed:', err);
+      showToast(runtimeT ? runtimeT('toastBatchMergeCleanupFailed') : 'Merged tabs, but could not update saved groups');
+    }
     logPageChipDragDebug('move-group-join-chrome', {
       groupId: targetGroup.chromeGroupId,
       tabCount: draggedTabIds.length,
@@ -2775,7 +2817,12 @@ async function moveDraggedPageChipToGroup(targetGroupKey, targetListEl = null) {
     groupId: dropTarget.groupId,
     groupName: dropTarget.groupName,
   });
-  await saveSessionGroups(nextState);
+  try {
+    await saveSessionGroups(nextState);
+  } catch (err) {
+    console.warn('[tab-harbor] move-to-manual-group: session cleanup failed:', err);
+    showToast(runtimeT ? runtimeT('toastBatchMergeCleanupFailed') : 'Merged tabs, but could not update saved groups');
+  }
   logPageChipDragDebug('move-group-end', {
     groupId: dropTarget.groupId,
     groupName: dropTarget.groupName,
@@ -2839,6 +2886,10 @@ async function finishPageChipDrag() {
   // Stop edge auto-scroll before the async commit so a scheduled frame cannot
   // change the drop target mid-commit.
   stopPageChipAutoScroll();
+
+  // While a commit is in flight, Escape must not clear pageChipDragState —
+  // the commit reads that state after await points (C9).
+  pageChipCommitInFlight = true;
 
   const moved = pageChipDragState.moved;
   const sourceGroupKey = pageChipDragState.sourceGroupKey;
@@ -2970,6 +3021,8 @@ async function finishPageChipDrag() {
       message: error?.message || String(error),
     });
     throw error;
+  } finally {
+    pageChipCommitInFlight = false;
   }
 }
 
@@ -3404,16 +3457,24 @@ function checkTabOutDupes() {
  * (placeholder, drop index, order save) treats them like any other row.
  */
 function buildPageChipHtml(tab, group, urlCounts = {}, collapsed = false) {
-  let label = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), group?.domain || '');
+  // Placeholder rows represent a tab id the openTabs snapshot has not
+  // materialized yet. They must not look like a real row with destructive
+  // controls (sleep) or an empty accessible name (C16).
+  const isPlaceholder = !tab.url && !tab.title && tab.id != null;
+  let label = isPlaceholder
+    ? (runtimeT ? runtimeT('chromeGroupPlaceholder') : 'Loading…')
+    : cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), group?.domain || '');
   // For localhost tabs, prepend port number so you can tell projects apart
-  try {
-    const parsed = new URL(tab.url);
-    if (parsed.hostname === 'localhost' && parsed.port) label = `${parsed.port} ${label}`;
-  } catch {}
+  if (!isPlaceholder) {
+    try {
+      const parsed = new URL(tab.url);
+      if (parsed.hostname === 'localhost' && parsed.port) label = `${parsed.port} ${label}`;
+    } catch {}
+  }
   const count    = urlCounts[tab.url] || 1;
   const sortId = getPrimaryTabOrderToken(tab);
   const isSelected = selectedPageChipIds.has(String(sortId || ''));
-  const chipClass = `${count > 1 ? ' chip-has-dupes' : ''}${tab.discarded ? ' page-chip--discarded' : ''}${isSelected ? ' is-selected' : ''}${collapsed ? ' page-chip--collapsed' : ''}`;
+  const chipClass = `${count > 1 ? ' chip-has-dupes' : ''}${tab.discarded ? ' page-chip--discarded' : ''}${isSelected ? ' is-selected' : ''}${isPlaceholder ? ' page-chip--placeholder' : ''}${collapsed ? ' page-chip--collapsed' : ''}`;
   const safeUrl   = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(tab.url || '') : (tab.url || '').replace(/"/g, '&quot;');
   const safeTitle = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(label) : label.replace(/"/g, '&quot;');
   const safeLabel = runtimeEscapeHtml ? runtimeEscapeHtml(label) : label;
@@ -3425,20 +3486,20 @@ function buildPageChipHtml(tab, group, urlCounts = {}, collapsed = false) {
   const fallbackLabel = runtimeGetFallbackLabel(label, iconData.hostname);
   const safeFallbackUrl = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(fallbackUrl) : fallbackUrl.replace(/"/g, '&quot;');
   // Chrome group cards tint their row drag handles with the native group
-  // color. Inlined so the tint cannot be lost to CSS cascade/ordering (the
-  // handle also carries .drawer-reorder-handle styles later in the sheet).
+  // color. The tint is exposed as a CSS variable (not an inline color) so the
+  // sheet's hover/focus rules can still recolor the handle (C29).
   const chromeGroupColor = group?.isChromeGroup
     ? (CHROME_GROUP_COLOR_MAP[group.chromeGroupColor] || (String(group.chromeGroupColor || '').startsWith('#') ? group.chromeGroupColor : ''))
     : '';
   return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" data-chip-sort-id="${safeSortId}" data-chip-group-id="${safeGroupId}" aria-label="${safeTitle}">
-      <button class="drawer-reorder-handle chip-reorder-handle" type="button" data-chip-drag-handle="tab" aria-pressed="${isSelected ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('dragReorderTabSelect') : 'Drag to reorder; Enter or Space to select'}"${chromeGroupColor ? ` style="color:${chromeGroupColor}"` : ''}>
+      <button class="drawer-reorder-handle chip-reorder-handle" type="button" data-chip-drag-handle="tab" aria-pressed="${isSelected ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('dragReorderTabSelect') : 'Drag to reorder; Enter or Space to select'}"${chromeGroupColor ? ` style="--chrome-group-color:${chromeGroupColor}"` : ''}>
         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M8 6h.01M8 12h.01M8 18h.01M16 6h.01M16 12h.01M16 18h.01" /></svg>
       </button>
       ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" data-fallback-src="${safeFallbackUrl}" data-fallback-srcset="${runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(JSON.stringify(iconData.sources.slice(2))) : JSON.stringify(iconData.sources.slice(2)).replace(/"/g, '&quot;')}">` : ''}
       <span class="chip-favicon chip-favicon-fallback"${faviconUrl ? ' style="display:none"' : ''}>${fallbackLabel}</span>
       <span class="chip-text">${safeLabel}</span>
       <div class="chip-actions">
-        ${sleepControlEnabled && !tab.active ? `<button class="chip-action chip-discard" data-action="discard-tab" data-tab-id="${tab.id}" aria-label="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}" data-tooltip="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}">
+        ${sleepControlEnabled && !tab.active && !isPlaceholder ? `<button class="chip-action chip-discard" data-action="discard-tab" data-tab-id="${tab.id}" aria-label="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}" data-tooltip="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}">
           ${ICONS.moon}
         </button>` : ''}
         <button class="chip-action chip-session-save" data-action="save-single-tab-session" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" aria-label="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}" data-tooltip="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}">
@@ -4930,16 +4991,22 @@ document.addEventListener('click', async (e) => {
         if (tab?.id != null) chromeGroupTabIds.add(Number(tab.id));
       }
     }
-    const tabIds = getSelectedBatchTabIds().filter(id => !pinnedIds.has(id) && !chromeGroupTabIds.has(id));
-    if (!tabIds.length) return;
+    const allSelected = getSelectedBatchTabIds();
+    const tabIds = allSelected.filter(id => !pinnedIds.has(id) && !chromeGroupTabIds.has(id));
+    const skippedCount = allSelected.length - tabIds.length;
+    if (!tabIds.length) {
+      showToast(runtimeT ? runtimeT('toastBatchMergeNoEligible') : 'No eligible tabs to merge');
+      return;
+    }
     beginBatchAction();
 
+    let mergeResult;
     try {
       const title = buildBatchMergeGroupTitle(tabIds);
       const color = typeof runtimeAssignGroupColor === 'function'
         ? runtimeAssignGroupColor('all', chromeGroupMergeColorIndex++)
         : 'blue';
-      await mergeTabsIntoChromeGroup(tabIds, { title, color });
+      mergeResult = await mergeTabsIntoChromeGroup(tabIds, { title, color });
     } catch (err) {
       window.__suppressAutoRefreshUntil = 0;
       showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not create Chrome tab group');
@@ -4947,15 +5014,34 @@ document.addEventListener('click', async (e) => {
     }
 
     // Tabs moving into a native group drop their dashboard manual-group
-    // assignments (same cleanup as the drag-into-Chrome-group path).
-    let nextState = clearTabsFromSessionGroups(sessionGroupsState, tabIds);
-    nextState = pruneSessionGroups(nextState, getOpenTabIdsForSessionPruning());
-    await saveSessionGroups(nextState);
+    // assignments (same cleanup as the drag-into-Chrome-group path). The
+    // group side effect has already happened, so a storage failure must not
+    // leave the selection/suppression dangling (C6).
+    try {
+      let nextState = clearTabsFromSessionGroups(sessionGroupsState, tabIds);
+      nextState = pruneSessionGroups(nextState, getOpenTabIdsForSessionPruning());
+      await saveSessionGroups(nextState);
+    } catch (err) {
+      console.warn('[tab-harbor] batch merge: session cleanup failed after group creation:', err);
+      window.__suppressAutoRefreshUntil = 0;
+      showToast(runtimeT ? runtimeT('toastBatchMergeCleanupFailed') : 'Merged tabs, but could not update saved groups');
+      return;
+    }
 
     await finishBatchAction({ clearSelection: true });
-    showToast(runtimeT
-      ? runtimeT('toastBatchMergedChromeGroup', { count: tabIds.length })
-      : `Merged ${tabIds.length} tabs into a Chrome tab group`);
+    if (!mergeResult.updated) {
+      showToast(runtimeT
+        ? runtimeT('toastBatchMergedGroupRenameFailed', { count: tabIds.length })
+        : `Merged ${tabIds.length} tabs, but could not name the group`);
+    } else if (skippedCount > 0) {
+      showToast(runtimeT
+        ? runtimeT('toastBatchMergedChromeGroupWithSkipped', { count: tabIds.length, skipped: skippedCount })
+        : `Merged ${tabIds.length} tabs into a Chrome tab group (${skippedCount} skipped)`);
+    } else {
+      showToast(runtimeT
+        ? runtimeT('toastBatchMergedChromeGroup', { count: tabIds.length })
+        : `Merged ${tabIds.length} tabs into a Chrome tab group`);
+    }
     return;
   }
 
@@ -5493,6 +5579,10 @@ let pageChipLastKeydownAt = 0;
 document.addEventListener('keydown', (e) => {
   pageChipLastKeydownAt = Date.now();
   if (e.key !== 'Escape') return;
+  // A commit is in flight: leave both the drag state and the selection alone.
+  // Clearing pageChipDragState mid-commit makes the commit read null after an
+  // await and leaves a half-applied move (C9).
+  if (pageChipCommitInFlight) return;
   if (draggedPageChipId && pageChipDragState) {
     clearPageChipDragState({ removeNode: false });
   }

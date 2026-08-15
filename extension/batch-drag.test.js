@@ -13,15 +13,20 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const runtimeJs = fs.readFileSync(path.join(__dirname, 'dashboard-runtime.js'), 'utf8');
+const uiHelpersJs = fs.readFileSync(path.join(__dirname, 'ui-helpers.js'), 'utf8');
 
 // ---------------------------------------------------------------------------
 // Extract a top-level `function NAME(...) { ... }` body by brace matching.
 // ---------------------------------------------------------------------------
 function extractFn(source, name) {
-  const re = new RegExp(`\\bfunction\\s+${name}\\s*\\(`);
+  const re = new RegExp(`\\b(?:async\\s+)?function\\s+${name}\\s*\\(`);
   const m = re.exec(source);
   if (!m) throw new Error(`function ${name} not found`);
-  let i = source.indexOf('{', m.index);
+  // Skip the parameter list (which may itself contain braces for destructured
+  // defaults) and start at the function body brace.
+  const closeParen = source.indexOf(')', m.index);
+  if (closeParen === -1) throw new Error(`function ${name} has no parameter close`);
+  let i = source.indexOf('{', closeParen);
   let depth = 0;
   for (; i < source.length; i++) {
     if (source[i] === '{') depth += 1;
@@ -31,6 +36,13 @@ function extractFn(source, name) {
     }
   }
   return source.slice(m.index, i + 1);
+}
+
+function extractConst(source, name) {
+  const re = new RegExp(`const\\s+${name}\\s*=\\s*\\{[^}]*\\};`);
+  const m = re.exec(source);
+  if (!m) throw new Error(`const ${name} not found`);
+  return m[0];
 }
 
 function chipNode(id) {
@@ -116,7 +128,12 @@ test('buildBatchOrderedIdsFromList ignores non-chip children when computing the 
 // Behavioral: buildBatchMergeGroupTitle
 // ---------------------------------------------------------------------------
 test('buildBatchMergeGroupTitle derives the group name from tab content', () => {
+  // Load the REAL friendlyDomain from ui-helpers.js — a stubbed weaker domain
+  // function would let a broken friendlyDomain call stay green (C1).
   const fn = new Function(`
+    ${extractConst(uiHelpersJs, 'FRIENDLY_DOMAINS')}
+    ${extractFn(uiHelpersJs, 'capitalize')}
+    ${extractFn(uiHelpersJs, 'friendlyDomain')}
     ${extractFn(runtimeJs, 'buildBatchMergeGroupTitle')}
     return buildBatchMergeGroupTitle;
   `)();
@@ -129,18 +146,83 @@ test('buildBatchMergeGroupTitle derives the group name from tab content', () => 
     { id: 4, url: 'chrome://settings', title: 'Settings page' },
   ];
   globalThis.getTabsByIds = (ids) => tabs.filter(t => ids.includes(t.id));
-  globalThis.friendlyDomain = (hostname) => String(hostname || '').split('.')[0];
   globalThis.runtimeT = null;
 
   // Single domain → bare site name; github.com keeps its canonical casing.
   assert.equal(fn([0, 1, 2]), 'GitHub');
   // Mixed domains → most frequent domain with a ×count suffix.
   assert.equal(fn([0, 1, 3]), 'GitHub ×2');
+  // Non-brand domain goes through the real friendlyDomain mapping.
+  assert.equal(fn([3]), 'Hacker News');
   // Unresolvable URL → first tab's title.
   assert.equal(fn([4]), 'Settings page');
   delete globalThis.getTabsByIds;
-  delete globalThis.friendlyDomain;
   delete globalThis.runtimeT;
+});
+
+test('mergeTabsIntoChromeGroup reports update failure after group creation (C5)', async () => {
+  const fn = new Function(`${extractFn(runtimeJs, 'mergeTabsIntoChromeGroup')}\nreturn mergeTabsIntoChromeGroup;`)();
+  globalThis.muteChromeGroupEvents = () => {};
+  globalThis.groupTabsWithStaleRetry = async () => 901;
+  globalThis.chrome = {
+    tabGroups: { update: async () => { throw new Error('rename denied'); } },
+  };
+  const result = await fn([1, 2], { title: 'X', color: 'blue' });
+  assert.equal(result.groupId, 901);
+  assert.equal(result.updated, false);
+  delete globalThis.muteChromeGroupEvents;
+  delete globalThis.groupTabsWithStaleRetry;
+  delete globalThis.chrome;
+});
+
+test('sleepTabsByIds classifies stale, active, failed and discarded tabs (C4)', async () => {
+  const fn = new Function(`${extractFn(runtimeJs, 'sleepTabsByIds')}\nreturn sleepTabsByIds;`)();
+  globalThis.chrome = {
+    tabs: {
+      get: async (id) => id === 1 ? { id: 1, active: false } : id === 2 ? { id: 2, active: true } : id === 3 ? { id: 3, active: false } : null,
+    },
+  };
+  globalThis.discardTab = async (id) => id === 1;
+  const result = await fn([1, 2, 3, 4], { skipActive: true });
+  assert.equal(result.discarded, 1);
+  assert.equal(result.skippedActive, 1);
+  assert.equal(result.failed, 1);
+  assert.equal(result.stale, 1);
+  delete globalThis.chrome;
+  delete globalThis.discardTab;
+});
+
+test('closeTabsSafely keeps every window last tab and tolerates vanished ids (C4)', async () => {
+  const fn = new Function(`${extractFn(runtimeJs, 'closeTabsSafely')}\nreturn closeTabsSafely;`)();
+  const removed = [];
+  globalThis.queryTabsForDashboardWindow = async () => [
+    { id: 1, windowId: 7 },
+    { id: 2, windowId: 7 },
+    { id: 3, windowId: 8 },
+  ];
+  globalThis.ensureWindowsKeepLastTab = (allTabs, toCloseIds) => {
+    const toClose = new Set(toCloseIds);
+    const byWindow = new Map();
+    for (const t of allTabs) {
+      if (!byWindow.has(t.windowId)) byWindow.set(t.windowId, []);
+      byWindow.get(t.windowId).push(t.id);
+    }
+    for (const ids of byWindow.values()) {
+      if (ids.length && ids.every(id => toClose.has(id))) {
+        toClose.delete(ids[0]);
+      }
+    }
+    return [...toClose];
+  };
+  globalThis.chrome = { tabs: { remove: async (id) => removed.push(id) } };
+  globalThis.playCloseSound = () => {};
+  const result = await fn([1, 2, 3]);
+  assert.equal(result.closedCount, 1);
+  assert.deepEqual(removed, [2]);
+  delete globalThis.queryTabsForDashboardWindow;
+  delete globalThis.ensureWindowsKeepLastTab;
+  delete globalThis.chrome;
+  delete globalThis.playCloseSound;
 });
 
 // ---------------------------------------------------------------------------
@@ -217,7 +299,7 @@ test('same-group reorder commits use the drag-start snapshot, not the live selec
 });
 
 test('Escape cancels an in-flight drag before clearing the selection', () => {
-  assert.match(runtimeJs, /if \(e\.key !== 'Escape'\) return;[\s\S]{0,200}if \(draggedPageChipId && pageChipDragState\) \{\s*clearPageChipDragState\(\{ removeNode: false \}\);/);
+  assert.match(runtimeJs, /if \(e\.key !== 'Escape'\) return;[\s\S]{0,300}if \(pageChipCommitInFlight\) return;[\s\S]{0,200}if \(draggedPageChipId && pageChipDragState\) \{\s*clearPageChipDragState\(\{ removeNode: false \}\);/);
 });
 
 test('handle press that never moved toggles; completed drags are never clicks', () => {
@@ -402,6 +484,10 @@ test('sleep/discard failures reset the refresh suppression window (C8)', () => {
   assert.match(runtimeJs, /if \(failed > 0 \|\| discarded === 0\) \{\s*window\.__suppressAutoRefreshUntil = 0;/);
   // Failed group/all sleep resets.
   assert.match(runtimeJs, /if \(discarded === 0\) \{\s*window\.__suppressAutoRefreshUntil = 0;/);
+  // Batch merge: group-creation failure, session-cleanup failure and the
+  // group-card/global merge paths all reset before returning (C2).
+  assert.match(runtimeJs, /catch \(err\) \{\s*window\.__suppressAutoRefreshUntil = 0;\s*showToast\(runtimeT \? runtimeT\('toastGroupCreateFailed'\)/);
+  assert.match(runtimeJs, /window\.__suppressAutoRefreshUntil = 0;\s*showToast\(runtimeT \? runtimeT\('toastBatchMergeCleanupFailed'\)/);
 });
 
 test('chrome group cards survive a lagging tab snapshot with a placeholder row (C12)', () => {
@@ -434,13 +520,13 @@ test('chrome group cards tint their name and row drag handles with the native co
   assert.doesNotMatch(css, /\.mission-card\.chrome-group-card::before/);
   // The NAME mixes the group color toward --ink (readable text, AA contrast);
   // the drag handles keep the pure group color (graphical icons).
-  assert.match(css, /\.mission-card\.chrome-group-card \.mission-name \{\s*color:\s*color-mix\(in srgb, var\(--chrome-group-color, var\(--ink\)\) 55%, var\(--ink\)\);/);
+  assert.match(css, /\.mission-card\.chrome-group-card \.mission-name \{\s*color:\s*color-mix\(in srgb, var\(--chrome-group-color, var\(--ink\)\) 35%, var\(--ink\)\);/);
   assert.match(css, /\.mission-card\.chrome-group-card \.chip-reorder-handle \{\s*color:\s*var\(--chrome-group-color,/);
-  assert.match(css, /\.mission-card\.chrome-group-card \.chip-reorder-handle:hover,[\s\S]{0,120}color:\s*var\(--chrome-group-color,\s*var\(--ink\)\);/);
-  // The tint is also inlined onto the handle at render time, so it cannot be
-  // lost to CSS cascade/ordering against .drawer-reorder-handle.
+  assert.match(css, /\.mission-card\.chrome-group-card \.chip-reorder-handle:hover,[\s\S]{0,300}color:\s*color-mix\(in srgb, var\(--chrome-group-color, var\(--ink\)\) 55%, var\(--ink\)\);/);
+  // The tint is exposed on the handle as a CSS variable (not an inline color)
+  // so the sheet's hover/focus rules can still recolor it.
   assert.match(runtimeJs, /const chromeGroupColor = group\?\.isChromeGroup\s*\?[\s\S]{0,160}CHROME_GROUP_COLOR_MAP\[group\.chromeGroupColor\][\s\S]{0,80}startsWith\('#'\)/);
-  assert.match(runtimeJs, /class="drawer-reorder-handle chip-reorder-handle" type="button" data-chip-drag-handle="tab"[\s\S]{0,160}\$\{chromeGroupColor \? ` style="color:\$\{chromeGroupColor\}"` : ''\}/);
+  assert.match(runtimeJs, /class="drawer-reorder-handle chip-reorder-handle" type="button" data-chip-drag-handle="tab"[\s\S]{0,160}\$\{chromeGroupColor \? ` style="--chrome-group-color:\$\{chromeGroupColor\}"` : ''\}/);
   assert.doesNotMatch(runtimeJs, /function darkenHexColor/);
   assert.match(runtimeJs, /const CHROME_GROUP_COLOR_MAP = \{[\s\S]{0,300}cyan: '#5ba8b3',/);
 });
@@ -569,7 +655,7 @@ test('batch merge folds the selection into one new Chrome tab group, muted', () 
   assert.match(runtimeJs, /const chromeGroupTabIds = new Set\(\);/);
   assert.match(runtimeJs, /if \(!group\?\.isChromeGroup\) continue;/);
   assert.match(runtimeJs, /\.filter\(id => !pinnedIds\.has\(id\) && !chromeGroupTabIds\.has\(id\)\)/);
-  assert.match(runtimeJs, /if \(!tabIds\.length\) return;\s*beginBatchAction\(\);/);
+  assert.match(runtimeJs, /if \(!tabIds\.length\) \{\s*showToast\(runtimeT \? runtimeT\('toastBatchMergeNoEligible'\)[^\n]*;\s*return;\s*\}\s*beginBatchAction\(\);/);
   assert.match(runtimeJs, /window\.__suppressAutoRefreshUntil = 0;\s*showToast\(runtimeT \? runtimeT\('toastGroupCreateFailed'\)/);
   assert.match(runtimeJs, /if \(typeof muteChromeGroupEvents === 'function'\) muteChromeGroupEvents\(\);/);
   assert.match(runtimeJs, /const groupId = await groupTabsWithStaleRetry\(tabIds\);/);
@@ -629,6 +715,15 @@ test('persisted group order never stores __chrome_group__ keys', () => {
   // the replaced non-chrome key stays in the order.
   assert.deepEqual(fn('__chrome_group__:2', 'github.com'), ['github.com', '__session_group__:abc']);
   delete globalThis.domainGroups;
+});
+
+test('saveGroupOrder filters chrome-group keys and loadGroupOrder cleans legacy residue', () => {
+  // C23: the single storage entry point must never write session-local Chrome
+  // group ids into the durable card order, and a pre-filter residue must be
+  // cleaned on load.
+  assert.match(runtimeJs, /const chromeKey = \/\^__chrome_group__:/);
+  assert.match(runtimeJs, /const cleanSessionOrder = \(nextState\?\.sessionOrder \|\| \[\]\)\.map\(String\)\.filter\(key => key && !chromeKey\.test\(key\)\);/);
+  assert.match(runtimeJs, /if \(cleanSessionOrder\.length !== \(groupOrderState\.sessionOrder \|\| \[\]\)\.length/);
 });
 
 test('batch sleep distinguishes failed from skipped-active tabs', () => {
