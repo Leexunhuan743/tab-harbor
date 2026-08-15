@@ -94,8 +94,8 @@ test('saved-session picker scopes visible tabs to the selected entry point', () 
   assert.match(runtimeJs, /const newSessionName = String\(tabSessionPickerState\.newSessionName \|\| ''\)\.trim\(\);/);
   assert.match(runtimeJs, /saveSelectedTabSession\(\s*selectedIds,\s*tabSessionPickerState\.source \|\| 'selected',\s*newSessionName\s*\)/);
   assert.match(runtimeJs, /if \(action === 'save-current-window-session'\) \{[\s\S]{0,280}openTabSessionPicker\(\{ source: 'current-window' \}\)/);
-  assert.match(runtimeJs, /if \(action === 'save-single-tab-session'\) \{[\s\S]{0,360}openTabSessionPicker\(\{\s*source: 'single-tab',\s*initialTabIds: \[tabId\],\s*scopeTabIds: \[tabId\],\s*\}\)/);
-  assert.match(runtimeJs, /if \(action === 'save-domain-session'\) \{[\s\S]{0,720}openTabSessionPicker\(\{\s*source: 'group',\s*initialTabIds: tabIds,\s*scopeTabIds: tabIds,\s*\}\)/);
+  assert.match(runtimeJs, /if \(action === 'save-single-tab-session'\) \{[\s\S]{0,360}openSessionPickerForTabs\(\[tabId\], 'single-tab'\);/);
+  assert.match(runtimeJs, /if \(action === 'save-domain-session'\) \{[\s\S]{0,720}openSessionPickerForTabs\(tabIds, 'group'\);/);
   assert.doesNotMatch(runtimeJs, /saveSelectedTabSession\(\[tabId\], 'single-tab'\)/);
   assert.doesNotMatch(runtimeJs, /saveSelectedTabSession\(tabIds, 'group'\)/);
 });

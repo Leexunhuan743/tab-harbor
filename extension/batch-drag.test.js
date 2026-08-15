@@ -531,7 +531,7 @@ test('batch actions run in user order: clear, dedup, merge, sleep, save, close',
   assert.match(runtimeJs, /data-action="batch-dedup-selection" aria-label="\$\{runtimeT \? runtimeT\('batchCloseDuplicates'\) : 'Close selected duplicates'\}" data-tooltip="\$\{runtimeT \? runtimeT\('batchCloseDuplicates'\) : 'Close selected duplicates'\}">\$\{ICONS\.closeDuplicates\}/);
   assert.match(runtimeJs, /data-action="batch-save-session" aria-label="\$\{runtimeT \? runtimeT\('batchSaveSession'\) : 'Save session'\}" data-tooltip="\$\{runtimeT \? runtimeT\('batchSaveSession'\) : 'Save session'\}">\$\{ICONS\.archive\}/);
   assert.match(runtimeJs, /data-action="clear-chip-selection" aria-label="\$\{runtimeT \? runtimeT\('batchClearSelection'\) : 'Clear selection'\}" data-tooltip="\$\{runtimeT \? runtimeT\('batchClearSelection'\) : 'Clear selection'\}">\$\{ICONS\.deselect\}/);
-  assert.match(runtimeJs, /openTabSessionPicker\(\{\s*source: 'selected',\s*initialTabIds: tabIds,\s*scopeTabIds: tabIds,\s*\}\)/);
+  assert.match(runtimeJs, /openSessionPickerForTabs\(tabIds, 'selected'\)/);
   // The batch buttons are 30px icon buttons with tooltips, and their tooltips
   // are registered in the shared tooltip CSS (hover + focus-visible).
   const css = fs.readFileSync(path.join(__dirname, 'style.css'), 'utf8');

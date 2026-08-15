@@ -1548,6 +1548,16 @@ async function sleepTabsByIds(tabIds, { skipActive = true } = {}) {
   return { discarded, failed, skippedActive, stale, resultsByTabId };
 }
 
+async function openSessionPickerForTabs(tabIds, source) {
+  const normalizedTabIds = (tabIds || []).map(String).filter(Boolean);
+  if (!normalizedTabIds.length) return;
+  await openTabSessionPicker({
+    source,
+    initialTabIds: normalizedTabIds,
+    scopeTabIds: normalizedTabIds,
+  });
+}
+
 function getTabGroupLookup(groups = domainGroups) {
   const lookup = new Map();
   for (const group of Array.isArray(groups) ? groups : []) {
@@ -4829,11 +4839,7 @@ document.addEventListener('click', async (e) => {
     const tabId = actionEl.dataset.tabId || '';
     if (!tabId) return;
 
-    await openTabSessionPicker({
-      source: 'single-tab',
-      initialTabIds: [tabId],
-      scopeTabIds: [tabId],
-    });
+    await openSessionPickerForTabs([tabId], 'single-tab');
     return;
   }
 
@@ -4907,11 +4913,7 @@ document.addEventListener('click', async (e) => {
     e.stopPropagation();
     const tabIds = getSelectedBatchTabIds().map(String);
     if (!tabIds.length) return;
-    await openTabSessionPicker({
-      source: 'selected',
-      initialTabIds: tabIds,
-      scopeTabIds: tabIds,
-    });
+    await openSessionPickerForTabs(tabIds, 'selected');
     return;
   }
 
@@ -5025,11 +5027,7 @@ document.addEventListener('click', async (e) => {
       .filter(Boolean);
     if (!tabIds.length) return;
 
-    await openTabSessionPicker({
-      source: 'group',
-      initialTabIds: tabIds,
-      scopeTabIds: tabIds,
-    });
+    await openSessionPickerForTabs(tabIds, 'group');
     return;
   }
 
