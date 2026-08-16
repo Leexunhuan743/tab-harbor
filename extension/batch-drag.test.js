@@ -74,7 +74,7 @@ test('buildBatchOrderedIdsFromList places the whole batch at the drop point', ()
     ['B', 'C', 'D', 'A', 'E']
   );
 
-  // Non-contiguous selection {A, C} dropped between C and D.
+  // Non-contiguous selection {A, C} dropped at the placeholder between C and D.
   globalThis.pageChipPlaceholderEl = placeholderNode();
   assert.deepEqual(
     fn(list([chipNode('A'), chipNode('B'), chipNode('C'), globalThis.pageChipPlaceholderEl, chipNode('D')]), ['A', 'C']),
@@ -163,13 +163,39 @@ test('buildBatchMergeGroupTitle derives the group name from tab content', () => 
 test('mergeTabsIntoChromeGroup reports update failure after group creation (C5)', async () => {
   const fn = new Function(`${extractFn(runtimeJs, 'mergeTabsIntoChromeGroup')}\nreturn mergeTabsIntoChromeGroup;`)();
   globalThis.muteChromeGroupEvents = () => {};
-  globalThis.groupTabsWithStaleRetry = async () => 901;
+  globalThis.groupTabsWithStaleRetry = async () => ({ groupId: 901, mergedTabIds: [1, 2] });
   globalThis.chrome = {
     tabGroups: { update: async () => { throw new Error('rename denied'); } },
   };
   const result = await fn([1, 2], { title: 'X', color: 'blue' });
   assert.equal(result.groupId, 901);
+  assert.deepEqual(result.mergedTabIds, [1, 2]);
   assert.equal(result.updated, false);
+  delete globalThis.muteChromeGroupEvents;
+  delete globalThis.groupTabsWithStaleRetry;
+  delete globalThis.chrome;
+});
+
+test('mergeTabsIntoChromeGroup resolves a function title from the merged ids (C2)', async () => {
+  // Count-based labels must use the ACTUAL merged ids — stale ids dropped by
+  // groupTabsWithStaleRetry would otherwise inflate the count in the title.
+  const fn = new Function(`${extractFn(runtimeJs, 'mergeTabsIntoChromeGroup')}\nreturn mergeTabsIntoChromeGroup;`)();
+  globalThis.muteChromeGroupEvents = () => {};
+  const updates = [];
+  globalThis.groupTabsWithStaleRetry = async () => ({ groupId: 902, mergedTabIds: [1, 3] });
+  globalThis.chrome = {
+    tabGroups: { update: async (groupId, props) => updates.push({ groupId, props }) },
+  };
+  const result = await fn([1, 2, 3], { title: (ids) => `Open tabs (${ids.length})`, color: 'blue' });
+  assert.equal(result.groupId, 902);
+  assert.deepEqual(result.mergedTabIds, [1, 3]);
+  // The title is derived from the 2 merged ids, not the 3 requested ones.
+  assert.deepEqual(updates, [{ groupId: 902, props: { title: 'Open tabs (2)', color: 'blue' } }]);
+  // A plain string title still works (backwards compatible).
+  const updates2 = [];
+  globalThis.chrome.tabGroups.update = async (groupId, props) => updates2.push({ groupId, props });
+  await fn([1], { title: 'Fixed', color: 'red' });
+  assert.deepEqual(updates2, [{ groupId: 902, props: { title: 'Fixed', color: 'red' } }]);
   delete globalThis.muteChromeGroupEvents;
   delete globalThis.groupTabsWithStaleRetry;
   delete globalThis.chrome;
@@ -350,14 +376,17 @@ test('section header above all cards adds global close-duplicates and merge-all'
   assert.match(runtimeJs, /if \(scope === 'all'\) \{[\s\S]{0,300}for \(const g of domainGroups\) \{[\s\S]{0,200}getOrderedUniqueTabsForGroup\(g\)/);
 });
 
-test('merge-all is titled with its real tab count and retries once on stale ids', () => {
-  // The group title reflects what was actually merged (scope="all" excludes
-  // pinned and non-restorable tabs), so the count is part of the label.
-  assert.match(runtimeJs, /const label = scope === 'all'\s*\?\s*\(runtimeT \? runtimeT\('mergeAllGroupTitle', \{ count: tabIds\.length \}\) : `Open tabs \(\$\{tabIds\.length\}\)`\)/);
+test('merge-all is titled with its real merged tab count and retries once on stale ids', () => {
+  // The group title reflects what was ACTUALLY merged (scope="all" excludes
+  // pinned and non-restorable tabs), so the count is part of the label. The
+  // label is resolved from the merged ids AFTER the stale-retry, so a stale
+  // id dropped between render and click cannot inflate the title count.
+  assert.match(runtimeJs, /const label = scope === 'all'\s*\?\s*\(mergedIds\) => \(runtimeT \? runtimeT\('mergeAllGroupTitle', \{ count: mergedIds\.length \}\) : `Open tabs \(\$\{mergedIds\.length\}\)`\)/);
   // chrome.tabs.group fails atomically on any invalid id; drop ids that no
-  // longer exist and retry once with the survivors.
-  assert.match(runtimeJs, /async function groupTabsWithStaleRetry\(tabIds\) \{[\s\S]{0,200}return await chrome\.tabs\.group\(\{ tabIds \}\);\s*\} catch \(err\) \{[\s\S]{0,250}const liveIds = \[\];[\s\S]{0,200}try \{ await chrome\.tabs\.get\(id\); liveIds\.push\(id\); \} catch/);
-  assert.match(runtimeJs, /const groupId = await groupTabsWithStaleRetry\(tabIds\);/);
+  // longer exist and retry once with the survivors, returning the actual
+  // merged ids for accurate counts/cleanup.
+  assert.match(runtimeJs, /async function groupTabsWithStaleRetry\(tabIds\) \{[\s\S]{0,200}const groupId = await chrome\.tabs\.group\(\{ tabIds: initialIds \}\);\s*return \{ groupId, mergedTabIds: initialIds \};\s*\} catch \(err\) \{[\s\S]{0,300}const liveIds = \[\];[\s\S]{0,200}try \{ await chrome\.tabs\.get\(id\); liveIds\.push\(id\); \} catch/);
+  assert.match(runtimeJs, /const \{ groupId, mergedTabIds \} = await groupTabsWithStaleRetry\(tabIds\);/);
   const i18nJs = fs.readFileSync(path.join(__dirname, 'i18n.js'), 'utf8');
   assert.match(i18nJs, /mergeAllGroupTitle: 'Open tabs \(\{count\}\)'/);
   assert.match(i18nJs, /mergeAllGroupTitle: '打开的标签页 \(\{count\}\)'/);
@@ -406,6 +435,9 @@ test('user-created Chrome groups become first-class cards; their tabs leave doma
   assert.match(runtimeJs, /let userChromeGroups = \[\];\s*if \(typeof queryUserChromeGroups === 'function'\) \{/);
   assert.match(runtimeJs, /userChromeGroups = await queryUserChromeGroups\(windowId\);/);
   assert.match(runtimeJs, /const chromeOwnedTabIds = new Set\(\(userChromeGroups \|\| \[\]\)\.flatMap\(g => g\.tabIds \|\| \[\]\)\);/);
+  // C7 fallback must exclude dashboard-managed mirror groups: only unmanaged
+  // native-group tabs are treated as user-owned, otherwise mirror tabs vanish.
+  assert.match(runtimeJs, /const managedChromeGroupIds = typeof getManagedChromeGroupIds === 'function'[\s\S]{0,200}getManagedChromeGroupIds\(\)[\s\S]{0,200}!managedChromeGroupIds\.has\(tab\.groupId\)/);
   assert.match(runtimeJs, /if \(chromeOwnedTabIds\.has\(tab\.id\)\) continue;/);
   // Chrome cards render first, in tab-strip order, with no toggle gate.
   assert.match(runtimeJs, /const chromeCards = \(userChromeGroups \|\| \[\]\)\s*\.map\(group => \(\{/);
@@ -418,11 +450,13 @@ test('user-created Chrome groups become first-class cards; their tabs leave doma
 });
 
 test('dragging into a Chrome group card joins the native group; dragging out ungroups', () => {
-  // Target is a user Chrome group: chrome.tabs.group with that groupId, muted.
-  assert.match(runtimeJs, /if \(targetGroup\?\.isChromeGroup && targetGroup\.chromeGroupId != null\) \{[\s\S]{0,300}if \(typeof muteChromeGroupEvents === 'function'\) muteChromeGroupEvents\(\);[\s\S]{0,200}await chrome\.tabs\.group\(\{ groupId: Number\(targetGroup\.chromeGroupId\), tabIds: draggedTabIds \}\)/);
+  // Target is a user Chrome group: join with that groupId, muted, and abort on
+  // failure instead of silently clearing session state (C1).
+  assert.match(runtimeJs, /if \(targetGroup\?\.isChromeGroup && targetGroup\.chromeGroupId != null\) \{[\s\S]{0,300}if \(typeof muteChromeGroupEvents === 'function'\) muteChromeGroupEvents\(\);[\s\S]{0,300}await groupTabsWithStaleRetryIntoGroup\(Number\(targetGroup\.chromeGroupId\), draggedTabIds\);/);
   // Leaving a Chrome group card detaches the batch (domain/manual/new targets).
-  assert.match(runtimeJs, /if \(sourceGroups\.some\(group => group\?\.isChromeGroup\)\) \{[\s\S]{0,200}if \(typeof muteChromeGroupEvents === 'function'\) muteChromeGroupEvents\(\);[\s\S]{0,200}await chrome\.tabs\.ungroup\(draggedTabIds\);/);
-  assert.match(runtimeJs, /if \(sourceGroupForNew\?\.isChromeGroup\) \{[\s\S]{0,300}await chrome\.tabs\.ungroup\(unlinkCollected\.tabIds\);/);
+  assert.match(runtimeJs, /if \(sourceGroups\.some\(group => group\?\.isChromeGroup\)\) \{[\s\S]{0,200}if \(typeof muteChromeGroupEvents === 'function'\) muteChromeGroupEvents\(\);[\s\S]{0,200}await ungroupTabsWithStaleRetry\(draggedTabIds\);/);
+  // New-group creation ungroups every moving tab that lives in a Chrome group.
+  assert.match(runtimeJs, /const chromeOwnedMovingTabIds = allMovingCollected\.tabIds\.filter\(id => \{[\s\S]{0,300}await ungroupTabsWithStaleRetry\(chromeOwnedMovingTabIds\);/);
   // In-group reorder on a Chrome card reorders the native group's tabs.
   assert.match(runtimeJs, /if \(sourceGroup\?\.isChromeGroup && sourceGroup\.chromeGroupId != null[\s\S]{0,200}await reorderGroupedTabs\(Number\(sourceGroup\.chromeGroupId\), orderIds\.map\(String\), windowId\);/);
 });
@@ -487,7 +521,7 @@ test('sleep/discard failures reset the refresh suppression window (C8)', () => {
   // Batch merge: group-creation failure, session-cleanup failure and the
   // group-card/global merge paths all reset before returning (C2).
   assert.match(runtimeJs, /catch \(err\) \{\s*window\.__suppressAutoRefreshUntil = 0;\s*showToast\(runtimeT \? runtimeT\('toastGroupCreateFailed'\)/);
-  assert.match(runtimeJs, /window\.__suppressAutoRefreshUntil = 0;\s*showToast\(runtimeT \? runtimeT\('toastBatchMergeCleanupFailed'\)/);
+  assert.match(runtimeJs, /await finishBatchAction\(\{ clearSelection: true \}\);\s*showToast\(runtimeT \? runtimeT\('toastBatchMergeCleanupFailed'\)/);
 });
 
 test('chrome group cards survive a lagging tab snapshot with a placeholder row (C12)', () => {
@@ -519,8 +553,10 @@ test('chrome group cards tint their name and row drag handles with the native co
   // rows' drag handles (hover/focus keep the same tint).
   assert.doesNotMatch(css, /\.mission-card\.chrome-group-card::before/);
   // The NAME mixes the group color toward --ink (readable text, AA contrast);
-  // the drag handles keep the pure group color (graphical icons).
+  // the drag handles keep the pure group color (graphical icons). Hover/focus
+  // step up to the 55% mix so keyboard focus keeps a visible feedback.
   assert.match(css, /\.mission-card\.chrome-group-card \.mission-name \{\s*color:\s*color-mix\(in srgb, var\(--chrome-group-color, var\(--ink\)\) 35%, var\(--ink\)\);/);
+  assert.match(css, /\.mission-card\.chrome-group-card \.mission-rename-trigger:hover \.mission-name,[\s\S]{0,400}color:\s*color-mix\(in srgb, var\(--chrome-group-color, var\(--ink\)\) 55%, var\(--ink\)\);/);
   assert.match(css, /\.mission-card\.chrome-group-card \.chip-reorder-handle \{\s*color:\s*var\(--chrome-group-color,/);
   assert.match(css, /\.mission-card\.chrome-group-card \.chip-reorder-handle:hover,[\s\S]{0,300}color:\s*color-mix\(in srgb, var\(--chrome-group-color, var\(--ink\)\) 55%, var\(--ink\)\);/);
   // The tint is exposed on the handle as a CSS variable (not an inline color)
@@ -649,24 +685,25 @@ test('batch dedup closes duplicates inside the selection only, keeping one per U
 test('batch merge folds the selection into one new Chrome tab group, muted', () => {
   // The batch bar button maps to its own handler.
   assert.match(runtimeJs, /if \(action === 'batch-merge-chrome-group'\) \{/);
-  // Pinned tabs stay outside the merged group (mirrors the section-header
-  // merge-all) and the write is muted so the dashboard cannot echo it.
+  // Pinned tabs stay outside the merged group; tabs already inside a Chrome
+  // group ARE merged (chrome.tabs.group moves them out of the source group).
   assert.match(runtimeJs, /const pinnedIds = new Set\(\(openTabs \|\| \[\]\)\.filter\(t => t\?\.pinned\)\.map\(t => Number\(t\.id\)\)\);/);
-  assert.match(runtimeJs, /const chromeGroupTabIds = new Set\(\);/);
-  assert.match(runtimeJs, /if \(!group\?\.isChromeGroup\) continue;/);
-  assert.match(runtimeJs, /\.filter\(id => !pinnedIds\.has\(id\) && !chromeGroupTabIds\.has\(id\)\)/);
+  assert.match(runtimeJs, /const tabIds = allSelected\.filter\(id => !pinnedIds\.has\(id\)\);/);
+  assert.doesNotMatch(runtimeJs, /const chromeGroupTabIds = new Set\(\);/);
   assert.match(runtimeJs, /if \(!tabIds\.length\) \{\s*showToast\(runtimeT \? runtimeT\('toastBatchMergeNoEligible'\)[^\n]*;\s*return;\s*\}\s*beginBatchAction\(\);/);
   assert.match(runtimeJs, /window\.__suppressAutoRefreshUntil = 0;\s*showToast\(runtimeT \? runtimeT\('toastGroupCreateFailed'\)/);
   assert.match(runtimeJs, /if \(typeof muteChromeGroupEvents === 'function'\) muteChromeGroupEvents\(\);/);
-  assert.match(runtimeJs, /const groupId = await groupTabsWithStaleRetry\(tabIds\);/);
-  assert.match(runtimeJs, /const title = buildBatchMergeGroupTitle\(tabIds\);/);
-  assert.match(runtimeJs, /await chrome\.tabGroups\.update\(groupId, \{ title, color \}\)/);
+  assert.match(runtimeJs, /const \{ groupId, mergedTabIds \} = await groupTabsWithStaleRetry\(tabIds\);/);
+  // The name is resolved from the ACTUAL merged ids (stale ids dropped by the
+  // retry must not drive the group name).
+  assert.match(runtimeJs, /const title = \(mergedIds\) => buildBatchMergeGroupTitle\(mergedIds\);/);
+  assert.match(runtimeJs, /await chrome\.tabGroups\.update\(groupId, \{ title: label, color \}\)/);
   // Merged groups rotate through the accent palette (starting past grey), so
   // consecutive merges are visibly different colors instead of always grey.
   assert.match(runtimeJs, /let chromeGroupMergeColorIndex = 1;/);
   assert.match(runtimeJs, /runtimeAssignGroupColor\('all', chromeGroupMergeColorIndex\+\+\)/);
   // Tabs leaving dashboard groups drop their manual assignments.
-  assert.match(runtimeJs, /clearTabsFromSessionGroups\(sessionGroupsState, tabIds\);/);
+  assert.match(runtimeJs, /clearTabsFromSessionGroups\(sessionGroupsState, mergedTabIds\);/);
   assert.match(runtimeJs, /pruneSessionGroups\(nextState, getOpenTabIdsForSessionPruning\(\)\);/);
   const i18nJs = fs.readFileSync(path.join(__dirname, 'i18n.js'), 'utf8');
   assert.match(i18nJs, /batchMergeChromeGroup: 'Merge into Chrome group'/);
@@ -744,7 +781,8 @@ test('sleeping a stale (ghost) chip re-renders instead of silently corrupting gr
   // chrome.tabs.get and counts it as stale; the per-chip handler re-renders to
   // drop the ghost row and prune its dangling assignment.
   assert.match(runtimeJs, /async function sleepTabsByIds\(tabIds,\s*\{ skipActive = true \} = \{\}\) \{/);
-  assert.match(runtimeJs, /let liveTab = null;\s*try \{ liveTab = await chrome\.tabs\.get\(tabId\); \} catch \{ liveTab = null; \}[\s\S]{0,120}if \(!liveTab\) \{\s*stale \+= 1;/);
+  assert.match(runtimeJs, /const tasks = \(tabIds \|\| \[\]\)\.map\(async \(rawTabId\) => \{/);
+  assert.match(runtimeJs, /const settled = await Promise\.all\(tasks\);/);
   assert.match(runtimeJs, /if \(stale > 0\) \{\s*await renderDashboard\(\);\s*updateBackToTopVisibility\(\);\s*window\.__suppressAutoRefreshUntil = 0;\s*showToast\(runtimeT \? runtimeT\('toastTabAlreadyClosed'\)/);
   // Batch sleep uses the same helper and keeps only chips whose tab id is in
   // resultsByTabId (stale ids are excluded by the helper).
@@ -851,4 +889,164 @@ test('Space on a focused handle keeps the native button activation (no keydown p
 
 test('keyboard expansion hands focus to the first revealed row', () => {
   assert.match(runtimeJs, /if \(e\.detail === 0\) \{\s*const firstHandle = collapsed\[0\]\?\.querySelector\('\[data-chip-drag-handle="tab"\]'\);\s*if \(firstHandle\) firstHandle\.focus\(\);/);
+});
+
+// ---------------------------------------------------------------------------
+// Audit follow-up (2026-08): behavioral tests for the stale-retry helpers —
+// the retry contract (drop stale ids once, rethrow on total/no-stale failure)
+// is the core of the C1 failure-safe drag/merge paths.
+// ---------------------------------------------------------------------------
+
+test('groupTabsWithStaleRetry drops stale ids and retries once with the survivors (C2)', async () => {
+  const fn = new Function(`${extractFn(runtimeJs, 'groupTabsWithStaleRetry')}\nreturn groupTabsWithStaleRetry;`)();
+  const groupCalls = [];
+  globalThis.chrome = {
+    tabs: {
+      group: async (opts) => {
+        groupCalls.push(opts);
+        if (groupCalls.length === 1) throw new Error('invalid tab id');
+        return 901;
+      },
+      get: async (id) => {
+        if (Number(id) === 3) throw new Error('no tab with id 3');
+        return { id };
+      },
+    },
+  };
+  const result = await fn([1, 2, 3]);
+  assert.equal(result.groupId, 901);
+  assert.deepEqual(result.mergedTabIds, [1, 2]);
+  assert.deepEqual(groupCalls, [{ tabIds: [1, 2, 3] }, { tabIds: [1, 2] }]);
+  delete globalThis.chrome;
+});
+
+test('groupTabsWithStaleRetry rethrows when every id is stale (C2)', async () => {
+  const fn = new Function(`${extractFn(runtimeJs, 'groupTabsWithStaleRetry')}\nreturn groupTabsWithStaleRetry;`)();
+  globalThis.chrome = {
+    tabs: {
+      group: async () => { throw new Error('invalid tab id'); },
+      get: async () => { throw new Error('no tab'); },
+    },
+  };
+  await assert.rejects(() => fn([1, 2]), /invalid tab id/);
+  delete globalThis.chrome;
+});
+
+test('groupTabsWithStaleRetry rethrows when no id was stale (C2)', async () => {
+  // All ids are live but grouping still fails: the retry must NOT run (it
+  // would hide a real API failure behind a phantom stale-id retry).
+  const fn = new Function(`${extractFn(runtimeJs, 'groupTabsWithStaleRetry')}\nreturn groupTabsWithStaleRetry;`)();
+  const groupCalls = [];
+  globalThis.chrome = {
+    tabs: {
+      group: async (opts) => {
+        groupCalls.push(opts);
+        throw new Error('grouping denied');
+      },
+      get: async (id) => ({ id }),
+    },
+  };
+  await assert.rejects(() => fn([1, 2]), /grouping denied/);
+  assert.equal(groupCalls.length, 1);
+  delete globalThis.chrome;
+});
+
+test('groupTabsWithStaleRetryIntoGroup retries with live ids against the target group (C1)', async () => {
+  const fn = new Function(`${extractFn(runtimeJs, 'groupTabsWithStaleRetryIntoGroup')}\nreturn groupTabsWithStaleRetryIntoGroup;`)();
+  const groupCalls = [];
+  globalThis.chrome = {
+    tabs: {
+      group: async (opts) => {
+        groupCalls.push(opts);
+        if (groupCalls.length === 1) throw new Error('invalid tab id');
+        return 902;
+      },
+      get: async (id) => {
+        if (Number(id) === 2) throw new Error('no tab with id 2');
+        return { id };
+      },
+    },
+  };
+  const result = await fn(902, [1, 2, 3]);
+  assert.equal(result, 902);
+  assert.deepEqual(groupCalls, [
+    { groupId: 902, tabIds: [1, 2, 3] },
+    { groupId: 902, tabIds: [1, 3] },
+  ]);
+  delete globalThis.chrome;
+});
+
+test('ungroupTabsWithStaleRetry retries with live ids (C1)', async () => {
+  const fn = new Function(`${extractFn(runtimeJs, 'ungroupTabsWithStaleRetry')}\nreturn ungroupTabsWithStaleRetry;`)();
+  const ungroupCalls = [];
+  globalThis.chrome = {
+    tabs: {
+      ungroup: async (ids) => {
+        ungroupCalls.push(ids);
+        if (ungroupCalls.length === 1) throw new Error('invalid tab id');
+      },
+      get: async (id) => {
+        if (Number(id) === 2) throw new Error('no tab with id 2');
+        return { id };
+      },
+    },
+  };
+  await fn([1, 2, 3]);
+  assert.deepEqual(ungroupCalls, [[1, 2, 3], [1, 3]]);
+  delete globalThis.chrome;
+});
+
+// ---------------------------------------------------------------------------
+// Audit follow-up: defense-in-depth contracts and coverage gaps (C13/C16/C17/
+// C22 + dedup suppression ordering).
+// ---------------------------------------------------------------------------
+
+test('every batch handler is guarded by batchActionInFlight and resets it in finally (C22)', () => {
+  // Per-handler: the guard sits right before the flag is raised and the body
+  // is wrapped in try, so a double-click cannot start a second operation.
+  for (const action of ['batch-close-tabs', 'batch-discard-tabs', 'batch-dedup-selection', 'batch-merge-chrome-group']) {
+    assert.match(runtimeJs, new RegExp(
+      `if \\(action === '${action}'\\) \\{[\\s\\S]{0,160}if \\(batchActionInFlight\\) return;[\\s\\S]{0,80}batchActionInFlight = true;[\\s\\S]{0,80}try \\{`
+    ));
+  }
+  // Shared shape: every handler's finally resets the flag and the refresh
+  // suppression, so even a failed render cannot leave the 2s window open.
+  assert.match(runtimeJs, /finally \{\s*batchActionInFlight = false;\s*window\.__suppressAutoRefreshUntil = 0;\s*\}/);
+});
+
+test('dedup-keep-one raises the refresh suppression only after the no-op checks', () => {
+  // The suppression window must come after the empty checks: an early return
+  // can never leak a 2s auto-refresh block.
+  assert.match(runtimeJs, /if \(chromeGroup \? chromeTabIds\.length === 0 : urls\.length === 0\) return;[\s\S]{0,80}window\.__suppressAutoRefreshUntil = Date\.now\(\) \+ 2000;/);
+});
+
+test('placeholder rows never render save/close controls and never count as duplicates (C13)', () => {
+  assert.match(runtimeJs, /\$\{!isPlaceholder \? `<button class="chip-action chip-session-save"/);
+  assert.match(runtimeJs, /\$\{!isPlaceholder \? `<button class="chip-action chip-close"/);
+  // urlCounts skips rows without a URL so placeholder rows cannot look
+  // duplicated against each other.
+  assert.match(runtimeJs, /for \(const tab of tabs\) \{[\s\S]{0,80}if \(!tab\.url\) continue;[\s\S]{0,120}urlCounts\[tab\.url\]/);
+});
+
+test('turning the Chrome-group sync toggle off tears down managed mirrors (C16)', () => {
+  // syncChromeTabGroups sees cachedEnabled=false and calls removeAllChromeGroups.
+  assert.match(runtimeJs, /if \(!enable\) \{[\s\S]{0,120}await syncChromeTabGroupsWithoutImportEcho\(\);/);
+});
+
+test('the retired-import early return sits before the in-flight flag is raised (C17)', () => {
+  // The early return must sit before the in-flight flag is raised: the
+  // short-circuit cannot pay for fetch/load/storage work or leave the flag
+  // raised.
+  assert.match(runtimeJs, /if \(!shouldImportChromeGroupsIntoSessionState\(\)\) \{[\s\S]{0,80}disableChromeTabGroupsImportModeForLocalEdits\(\);\s*return;[\s\S]{0,200}chromeTabGroupsImportInFlight = true/);
+});
+
+test('chrome-group query failure gates the toast and the snapshot fallback (C6/C7)', () => {
+  // The "could not read Chrome tab groups" toast fires ONLY when the whole
+  // query failed (no groups came back); a single group's partial failure must
+  // not misreport the entire result as unavailable.
+  assert.match(runtimeJs, /if \(typeof getChromeGroupsLastError === 'function'[\s\S]{0,120}getChromeGroupsLastError\(\)[\s\S]{0,120}\(userChromeGroups \|\| \[\]\)\.length === 0\) \{/);
+  // The snapshot fallback is gated on the query failing: on a fully
+  // successful query a lagging snapshot must never hide tabs that already
+  // left a user group from every card.
+  assert.match(runtimeJs, /const chromeGroupsQueryFailed = typeof getChromeGroupsLastError === 'function' && Boolean\(getChromeGroupsLastError\(\)\);[\s\S]{0,60}if \(chromeGroupsQueryFailed\) \{/);
 });

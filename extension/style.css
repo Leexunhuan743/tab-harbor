@@ -1,7 +1,8 @@
 /* ============================================================
-   Tab Mission Control — Dashboard Styles
-   Extracted directly from mockup.html — do not modify unless
-   also updating the mockup. This is the approved design.
+   Tab Harbor — Dashboard Styles
+   Living stylesheet for the new-tab dashboard. Theme palettes
+   and their variables live in theme-controls.js (THEME_FAMILIES);
+   this sheet consumes them via var().
    ============================================================ */
 
 :root {
@@ -66,6 +67,8 @@
     --quick-shortcut-icon-wrap-size: 40px;
     --quick-shortcut-icon-size: 22px;
     --quick-shortcut-label-size: 11px;
+    /* User surface/border/badge intensity inputs (0-100) feed the derived
+       floating/panel opacity values below via clamp(). */
     --floating-surface-opacity: clamp(
         82%,
         calc(var(--custom-surface-opacity) + 54%),
@@ -1731,7 +1734,9 @@ body.group-dragging .group-nav-button {
         color-mix(in srgb, var(--workspace-accent) 6%, transparent);
 }
 
-/* Colored top border instead of side bar for grid cards */
+/* Colored top border instead of side bar for grid cards. The base ::before
+   rule is currently disabled (see the commented block below), so the
+   has-*-bar state rules are inert until the base rule is restored. */
 /*.mission-card::before {*/
 /*  content: '';*/
 /*  position: absolute;*/
@@ -1754,16 +1759,20 @@ body.group-dragging .group-nav-button {
 
 /* User-created Chrome group cards wear their native group color on the card
    name and the tab rows' drag handles — a quiet accent that follows the
-   group's real Chrome color without adding a separate bar. The NAME mixes the
-   group color toward --ink so text stays readable (AA ≥ 4.5:1); the drag
-   handles are graphical icons and keep the pure group color. */
+   group's real Chrome color without adding a separate bar. The NAME mixes
+   the group color toward --ink so text stays readable (AA ≥ 4.5:1 for the
+   built-in palette colors on every light theme); the drag handles are
+   graphical icons and keep the pure group color. */
 .mission-card.chrome-group-card .mission-name {
     color: color-mix(in srgb, var(--chrome-group-color, var(--ink)) 35%, var(--ink));
 }
 
 .mission-card.chrome-group-card .mission-rename-trigger:hover .mission-name,
 .mission-card.chrome-group-card .mission-rename-trigger:focus-visible .mission-name {
-    color: color-mix(in srgb, var(--chrome-group-color, var(--ink)) 35%, var(--ink));
+    /* Hover/focus must be visibly different from the resting mix — step up to
+       the 55% mix (same pattern as the drag handles) so keyboard focus keeps
+       a visible, readable feedback in every theme. */
+    color: color-mix(in srgb, var(--chrome-group-color, var(--ink)) 55%, var(--ink));
 }
 
 .mission-card.chrome-group-card .chip-reorder-handle {
@@ -2133,7 +2142,7 @@ body.page-chip-list-dragging .page-chip.is-selected:not(.is-dragging) {
     margin-right: 4px;
 }
 
-/* Title text — wraps naturally, no truncation */
+/* Title text — wraps up to 2 lines, then ellipsis */
 .chip-text {
     flex: 1;
     min-width: 0;
@@ -2284,8 +2293,6 @@ body.page-chip-list-dragging .page-chip.is-selected:not(.is-dragging) {
     color: var(--muted);
     padding: 4px 2px;
 }
-
-/* mission-meta hidden — see above */
 
 .mission-time {
     font-size: 12px;
@@ -3797,7 +3804,7 @@ body.entry-animations-enabled .deferred-column .section-header {
 }
 
 /* ================================================================
-   STATIC DEFAULT VIEW — new elements added for "AI on demand"
+   MISSIONS CARDS — DEFAULT VIEW
    ================================================================ */
 
 /* ---- Neutral status bar (domain-grouped cards, no AI color) ---- */
@@ -3818,9 +3825,8 @@ body.entry-animations-enabled .deferred-column .section-header {
    ================================================================ */
 
 .missions-empty-state {
-    /* Takes the full width — spans all columns */
-    column-span: all;
-
+    /* Full-width strip (column-span is inert without a multi-column
+       container; the missions area is a grid) */
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -3833,7 +3839,7 @@ body.entry-animations-enabled .deferred-column .section-header {
     animation: fadeUp 0.5s ease both;
 }
 
-/* CSS-drawn checkmark in a glowing circle */
+/* Icon in a CSS-drawn glowing circle */
 .empty-checkmark {
     width: 56px;
     height: 56px;

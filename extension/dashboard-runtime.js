@@ -59,6 +59,7 @@ const {
   populateChromeGroupMap,
   queryExistingChromeGroups,
   queryUserChromeGroups,
+  getManagedChromeGroupIds,
   getChromeGroupsLastError,
   reorderGroupedTabs,
   muteChromeGroupEvents,
@@ -129,8 +130,8 @@ let allOpenTabIds = [];
 let sessionGroupsState = normalizeSessionGroups ? normalizeSessionGroups() : { groups: [], assignments: {} };
 const MANUAL_GROUP_PREFIX = '__session_group__:';
 const CHROME_GROUP_PREFIX = '__chrome_group__:';
-// Chrome tab group color names → dashboard accent colors (used by the
-// status bar of user-created Chrome group cards).
+// Chrome tab group color names → dashboard accent colors (used to tint the
+// card name and the tab rows' drag handles of user-created Chrome group cards).
 const CHROME_GROUP_COLOR_MAP = {
   grey: '#8f9a9f',
   blue: '#5b8def',
@@ -189,6 +190,7 @@ let pageChipPlaceholderEl = null;
 let pageChipNewGroupSlotEl = null;
 let pageChipAutoScrollRaf = 0;
 let pageChipCommitInFlight = false;
+let batchActionInFlight = false;
 let tabSessionPickerState = {
   open: false,
   mode: 'new',
@@ -793,13 +795,6 @@ function ensureManualDropGroup(state, targetGroupKey) {
   };
 }
 
-/**
- * fetchOpenTabs()
- *
- * Reads all currently open browser tabs directly from Chrome.
- * Sets the extensionId flag so we can identify Tab Harbor's own pages.
- */
-
 /* ----------------------------------------------------------------
    Hitokoto helper
    ---------------------------------------------------------------- */
@@ -888,6 +883,13 @@ function warmHitokotoCacheInBackground() {
   }).catch(() => { /* silently fail */ });
 }
 
+/**
+ * fetchOpenTabs()
+ *
+ * Reads the open tabs of the dashboard's window directly from Chrome
+ * (all windows when the dashboard window id is unavailable). Flags Tab
+ * Harbor's own pages via isTabOut so duplicate new tabs can be detected.
+ */
 async function fetchOpenTabs() {
   try {
     const newtabUrl = window.location.href;
@@ -1178,6 +1180,13 @@ function scheduleChromeTabGroupsImport() {
       return;
     }
 
+    // The import pipeline is retired; do not pay for fetch/load/storage work
+    // on every Chrome group event just to discover that (C17).
+    if (!shouldImportChromeGroupsIntoSessionState()) {
+      disableChromeTabGroupsImportModeForLocalEdits();
+      return;
+    }
+
     chromeTabGroupsImportInFlight = true;
     try {
       await fetchOpenTabs();
@@ -1225,6 +1234,14 @@ async function applyChromeTabGroupsToggle(nextEnabled) {
     });
     await saveSessionGroups(cleared.state);
     await saveImportedChromeGroupMeta(cleared.importedMeta);
+  }
+
+  // When the user turns the Chrome-group sync toggle off, also tear down the
+  // dashboard-managed mirror groups instead of leaving them hidden and
+  // unmanageable (C16). syncChromeTabGroups sees cachedEnabled=false and calls
+  // removeAllChromeGroups().
+  if (!enable) {
+    await syncChromeTabGroupsWithoutImportEcho();
   }
 
   ensureChromeTabGroupsSubscription();
@@ -1333,6 +1350,9 @@ function animatePageChipItems(listEl, previousRects) {
 }
 
 function syncGroupOrderState(orderKeys) {
+  // A reorder applies to the whole strip: both the session and pinned orders
+  // follow the new key order, and pinning is disabled so a pinned subset
+  // cannot retain a stale order after the reorder.
   groupOrderState = normalizeGroupOrderState({
     ...groupOrderState,
     sessionOrder: orderKeys,
@@ -1439,16 +1459,17 @@ async function closeTabsSafely(tabIds, { playSound = true } = {}) {
   if (tabIds.length) {
     const allTabs = await queryTabsForDashboardWindow();
     const safeToClose = ensureWindowsKeepLastTab(allTabs, tabIds);
-    for (const tabId of safeToClose) {
-      try {
-        await chrome.tabs.remove(tabId);
+    // Close in parallel so large batch operations do not degrade to N serial
+    // Chrome API round-trips; individual failures are still isolated.
+    const results = await Promise.allSettled(safeToClose.map(tabId => chrome.tabs.remove(tabId)));
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
         closedCount += 1;
-        closedTabIds.add(Number(tabId));
-      } catch {
-        // The tab may already be gone; if it is still open, the re-render and
-        // selection-preservation paths below keep it visible/selected.
+        closedTabIds.add(Number(safeToClose[index]));
       }
-    }
+      // Rejected tabs may already be gone; if they are still open, the
+      // re-render and selection-preservation paths keep them visible/selected.
+    });
     if (closedCount > 0 && playSound) playCloseSound();
   }
   return { closedCount, closedTabIds };
@@ -1535,18 +1556,22 @@ async function closeDuplicatesInSelection(tabIds, { playSound = true } = {}) {
 async function mergeTabsIntoChromeGroup(tabIds, { title, color }) {
   // The write is muted so the dashboard's own group event cannot echo.
   if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
-  const groupId = await groupTabsWithStaleRetry(tabIds);
+  const { groupId, mergedTabIds } = await groupTabsWithStaleRetry(tabIds);
+  // `title` may be a function (mergedIds) => label: count-based labels must
+  // use the ACTUAL merged ids — stale ids dropped by groupTabsWithStaleRetry
+  // would otherwise inflate the count in the group title.
+  const label = typeof title === 'function' ? title(mergedTabIds) : title;
   // The group is already created at this point. A rename/color failure must
   // not be reported as "could not create the group" — the caller needs to
   // know the side effect happened so it can still clean up (C5).
   let updated = true;
   try {
-    await chrome.tabGroups.update(groupId, { title, color });
+    await chrome.tabGroups.update(groupId, { title: label, color });
   } catch (err) {
     updated = false;
     console.warn('[tab-harbor] mergeTabsIntoChromeGroup: group created but update failed:', err);
   }
-  return { groupId, updated };
+  return { groupId, updated, mergedTabIds };
 }
 
 async function sleepTabsByIds(tabIds, { skipActive = true } = {}) {
@@ -1556,30 +1581,25 @@ async function sleepTabsByIds(tabIds, { skipActive = true } = {}) {
   let stale = 0;
   const resultsByTabId = new Map();
 
-  for (const rawTabId of tabIds) {
+  const tasks = (tabIds || []).map(async (rawTabId) => {
     const tabId = Number(rawTabId);
-    if (!Number.isFinite(tabId)) { stale += 1; continue; }
+    if (!Number.isFinite(tabId)) return { tabId: null, status: 'stale' };
 
     let liveTab = null;
     try { liveTab = await chrome.tabs.get(tabId); } catch { liveTab = null; }
-    if (!liveTab) {
-      stale += 1;
-      resultsByTabId.set(tabId, { status: 'stale' });
-      continue;
-    }
-    if (skipActive && liveTab?.active) {
-      skippedActive += 1;
-      resultsByTabId.set(tabId, { status: 'skipped-active' });
-      continue;
-    }
+    if (!liveTab) return { tabId, status: 'stale' };
+    if (skipActive && liveTab?.active) return { tabId, status: 'skipped-active' };
     const ok = await discardTab(tabId);
-    if (ok) {
-      discarded += 1;
-      resultsByTabId.set(tabId, { status: 'discarded' });
-    } else {
-      failed += 1;
-      resultsByTabId.set(tabId, { status: 'failed' });
-    }
+    return { tabId, status: ok ? 'discarded' : 'failed' };
+  });
+
+  const settled = await Promise.all(tasks);
+  for (const result of settled) {
+    if (result.status === 'discarded') discarded += 1;
+    else if (result.status === 'failed') failed += 1;
+    else if (result.status === 'skipped-active') skippedActive += 1;
+    else if (result.status === 'stale') stale += 1;
+    if (result.tabId != null) resultsByTabId.set(result.tabId, { status: result.status });
   }
 
   return { discarded, failed, skippedActive, stale, resultsByTabId };
@@ -2667,6 +2687,9 @@ function previewPageChipOrder(clientX, clientY) {
 
 async function saveGroupTabRowOrder(groupKey, orderIds) {
   if (!groupKey || !Array.isArray(orderIds) || !orderIds.length) return;
+  // Chrome-group card rows are session-local and follow the native strip
+  // order; never persist their keys into the durable per-group tab order.
+  if (String(groupKey || '').startsWith('__chrome_group__:')) return;
 
   await saveGroupTabOrder({
     ...groupTabOrderState,
@@ -2754,13 +2777,22 @@ async function moveDraggedPageChipToGroup(targetGroupKey, targetListEl = null) {
   // the tabs leave their previous dashboard/Chrome membership behind.
   if (targetGroup?.isChromeGroup && targetGroup.chromeGroupId != null) {
     if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
+    // The native group write is the source of truth. If it fails (stale tab,
+    // pinned tab, deleted target group, API error), abort the move instead of
+    // silently clearing saved session assignments (C1).
     try {
-      await chrome.tabs.group({ groupId: Number(targetGroup.chromeGroupId), tabIds: draggedTabIds });
-      // Persist the FULL drop order into the native group too:
-      // chrome.tabs.group appends the batch at the group tail, which would
-      // diverge from the panel order when the drop lands mid-card. Build the
-      // whole target order (existing rows + batch at the placeholder) and
-      // reorder the native group to match it, so the strip follows the cards.
+      await groupTabsWithStaleRetryIntoGroup(Number(targetGroup.chromeGroupId), draggedTabIds);
+    } catch (err) {
+      console.warn('[tab-harbor] move-to-chrome-group: join failed:', err);
+      showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not join Chrome tab group');
+      return null;
+    }
+    // Persist the FULL drop order into the native group too:
+    // chrome.tabs.group appends the batch at the group tail, which would
+    // diverge from the panel order when the drop lands mid-card. Build the
+    // whole target order (existing rows + batch at the placeholder) and
+    // reorder the native group to match it, so the strip follows the cards.
+    try {
       const firstWindowId = draggedTabIds.length
         ? (await chrome.tabs.get(draggedTabIds[0]).catch(() => null))?.windowId
         : null;
@@ -2773,8 +2805,10 @@ async function moveDraggedPageChipToGroup(targetGroupKey, targetListEl = null) {
           : draggedTabIds.map(String);
         await reorderGroupedTabs(Number(targetGroup.chromeGroupId), orderForNative.map(String), Number(firstWindowId));
       }
-    } catch {
-      // Tab(s) may have closed mid-drag; the re-render reconciles.
+    } catch (err) {
+      // The join already succeeded; a reorder failure must not roll back the
+      // move or clear the session state. Keep it observable in the console.
+      console.warn('[tab-harbor] move-to-chrome-group: reorder failed:', err);
     }
     let nextState = clearTabsFromSessionGroups(sessionGroupsState, draggedTabIds);
     nextState = pruneSessionGroups(nextState, getOpenTabIdsForSessionPruning());
@@ -2803,7 +2837,13 @@ async function moveDraggedPageChipToGroup(targetGroupKey, targetListEl = null) {
     .filter(Boolean);
   if (sourceGroups.some(group => group?.isChromeGroup)) {
     if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
-    try { await chrome.tabs.ungroup(draggedTabIds); } catch {}
+    try {
+      await ungroupTabsWithStaleRetry(draggedTabIds);
+    } catch (err) {
+      console.warn('[tab-harbor] move-to-group: ungroup failed:', err);
+      showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not leave Chrome tab group');
+      return null;
+    }
     logPageChipDragDebug('move-group-ungroup-chrome', {
       tabCount: draggedTabIds.length,
     });
@@ -2956,14 +2996,24 @@ async function finishPageChipDrag() {
         }
       } else if (createNewGroup) {
         // Leaving a user-created Chrome group card detaches the batch from its
-        // native group; the new manual group stays dashboard-internal (方案B).
-        const sourceGroupForNew = getDomainGroupByKey(sourceGroupKey);
-        if (sourceGroupForNew?.isChromeGroup) {
+        // native group; the new manual group stays dashboard-internal.
+        // Ungroup EVERY moving tab that currently lives in a Chrome group, not
+        // just the anchor chip's source card (C23).
+        if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
+        const allMovingCollected = collectMovingTabIds(getMovingPageChipIds(), '');
+        const chromeOwnedMovingTabIds = allMovingCollected.tabIds.filter(id => {
+          const tab = openTabs.find(t => Number(t.id) === Number(id));
+          return tab && Number.isInteger(tab.groupId) && tab.groupId >= 0;
+        });
+        if (chromeOwnedMovingTabIds.length) {
           try {
-            if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
-            const unlinkCollected = collectMovingTabIds(getMovingPageChipIds(), sourceGroupKey);
-            await chrome.tabs.ungroup(unlinkCollected.tabIds);
-          } catch {}
+            await ungroupTabsWithStaleRetry(chromeOwnedMovingTabIds);
+          } catch (err) {
+            console.warn('[tab-harbor] create-new-group: ungroup failed:', err);
+            showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not leave Chrome tab group');
+            clearPageChipDragState({ removeNode: false });
+            return false;
+          }
         }
         const createdGroup = await createSessionGroupFromDraggedPageChip();
         if (createdGroup) {
@@ -3146,14 +3196,6 @@ async function removeTabAssignments(tabIds = []) {
 }
 
 /**
- * closeTabsByUrls(urls)
- *
- * Closes all open tabs whose hostname matches any of the given URLs.
- * After closing, re-fetches the tab list to keep our state accurate.
- *
- * Special case: file:// URLs are matched exactly (they have no hostname).
- */
-/**
  * ensureWindowsKeepLastTab(allTabs, toCloseIds)
  *
  * Never close the last tab of any window: removing a window's final tab
@@ -3173,6 +3215,14 @@ function ensureWindowsKeepLastTab(allTabs, toCloseIds) {
   return [...toCloseSet];
 }
 
+/**
+ * closeTabsByUrls(urls)
+ *
+ * Closes all open tabs whose hostname matches any of the given URLs.
+ * After closing, re-fetches the tab list to keep our state accurate.
+ *
+ * Special case: file:// URLs are matched exactly (they have no hostname).
+ */
 async function closeTabsByUrls(urls) {
   const result = await closeTabsByUrlsSafely(urls, { exact: false, playSound: false });
   await refreshTabData();
@@ -3192,10 +3242,11 @@ async function closeTabsExact(urls) {
 }
 
 /**
- * focusTab(url)
+ * focusTab(url, tabId = null)
  *
- * Switches Chrome to the tab with the given URL (exact match first,
- * then hostname fallback). Also brings the window to the front.
+ * Switches Chrome to a tab: a numeric tabId wins, otherwise the URL is
+ * matched (exact match first, then hostname fallback). Also brings the
+ * window to the front.
  */
 async function focusTab(url, tabId = null) {
   if (!url && !tabId) return;
@@ -3333,17 +3384,66 @@ async function closeDuplicateTabs(urls, keepOne = true) {
  * was replaced between render and click). Drop ids that no longer exist —
  * verified with chrome.tabs.get — and retry once with the survivors; if that
  * still fails (or nothing was stale), rethrow so the caller can toast.
+ * Returns { groupId, mergedTabIds } so callers can report/clean up using the
+ * actual tabs that were grouped, not the pre-retry list.
  */
 async function groupTabsWithStaleRetry(tabIds) {
+  const initialIds = (tabIds || []).map(Number).filter(Number.isFinite);
   try {
-    return await chrome.tabs.group({ tabIds });
+    const groupId = await chrome.tabs.group({ tabIds: initialIds });
+    return { groupId, mergedTabIds: initialIds };
   } catch (err) {
     const liveIds = [];
-    for (const id of tabIds) {
+    for (const id of initialIds) {
       try { await chrome.tabs.get(id); liveIds.push(id); } catch { /* stale */ }
     }
-    if (liveIds.length === 0 || liveIds.length === tabIds.length) throw err;
-    return chrome.tabs.group({ tabIds: liveIds });
+    if (liveIds.length === 0 || liveIds.length === initialIds.length) throw err;
+    const groupId = await chrome.tabs.group({ tabIds: liveIds });
+    return { groupId, mergedTabIds: liveIds };
+  }
+}
+
+/**
+ * groupTabsWithStaleRetryIntoGroup(groupId, tabIds)
+ *
+ * Same stale-retry contract as groupTabsWithStaleRetry, but joins an existing
+ * Chrome tab group instead of creating a new one. Used by drag-into-Chrome-group
+ * so a single closed tab cannot silently abort the whole move while still
+ * surfacing real API failures (e.g. pinned tabs).
+ */
+async function groupTabsWithStaleRetryIntoGroup(groupId, tabIds) {
+  const initialIds = (tabIds || []).map(Number).filter(Number.isFinite);
+  try {
+    return await chrome.tabs.group({ groupId, tabIds: initialIds });
+  } catch (err) {
+    const liveIds = [];
+    for (const id of initialIds) {
+      try { await chrome.tabs.get(id); liveIds.push(id); } catch { /* stale */ }
+    }
+    if (liveIds.length === 0 || liveIds.length === initialIds.length) throw err;
+    return chrome.tabs.group({ groupId, tabIds: liveIds });
+  }
+}
+
+/**
+ * ungroupTabsWithStaleRetry(tabIds)
+ *
+ * Retry ungroup with only live tab ids when the first atomic call fails. If no
+ * ids survive or none were stale, rethrow so callers can show a failure instead
+ * of silently writing local state that contradicts the browser.
+ */
+async function ungroupTabsWithStaleRetry(tabIds) {
+  const initialIds = (tabIds || []).map(Number).filter(Number.isFinite);
+  if (!initialIds.length) return;
+  try {
+    return await chrome.tabs.ungroup(initialIds);
+  } catch (err) {
+    const liveIds = [];
+    for (const id of initialIds) {
+      try { await chrome.tabs.get(id); liveIds.push(id); } catch { /* stale */ }
+    }
+    if (liveIds.length === 0 || liveIds.length === initialIds.length) throw err;
+    return chrome.tabs.ungroup(liveIds);
   }
 }
 
@@ -3502,12 +3602,12 @@ function buildPageChipHtml(tab, group, urlCounts = {}, collapsed = false) {
         ${sleepControlEnabled && !tab.active && !isPlaceholder ? `<button class="chip-action chip-discard" data-action="discard-tab" data-tab-id="${tab.id}" aria-label="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}" data-tooltip="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}">
           ${ICONS.moon}
         </button>` : ''}
-        <button class="chip-action chip-session-save" data-action="save-single-tab-session" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" aria-label="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}" data-tooltip="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}">
+        ${!isPlaceholder ? `<button class="chip-action chip-session-save" data-action="save-single-tab-session" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" aria-label="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}" data-tooltip="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}">
           ${ICONS.archive}
-        </button>
-        <button class="chip-action chip-close" data-action="close-single-tab" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" aria-label="${runtimeT ? runtimeT('closeThisTab') : 'Close this tab'}" data-tooltip="${runtimeT ? runtimeT('closeThisTab') : 'Close this tab'}">
+        </button>` : ''}
+        ${!isPlaceholder ? `<button class="chip-action chip-close" data-action="close-single-tab" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" aria-label="${runtimeT ? runtimeT('closeThisTab') : 'Close this tab'}" data-tooltip="${runtimeT ? runtimeT('closeThisTab') : 'Close this tab'}">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
-        </button>
+        </button>` : ''}
       </div>
     </div>`;
 }
@@ -3525,10 +3625,9 @@ function buildOverflowChips(extraCount) {
    ---------------------------------------------------------------- */
 
 /**
- * renderDomainCard(group, groupIndex)
+ * renderDomainCard(group)
  *
- * Builds the HTML for one domain group card.
- * group = { domain: string, tabs: [{ url, title, id, windowId, active }] }
+ * Builds the HTML for one domain group card (domain, manual or Chrome group).
  */
 function renderDomainCard(group) {
   const tabs      = group.tabs || [];
@@ -3539,9 +3638,13 @@ function renderDomainCard(group) {
   const renameEditorValue = renameEditorOpen ? (groupRenameEditorState?.value || groupTitle) : groupTitle;
   const safeRenameValue = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(renameEditorValue) : String(renameEditorValue).replace(/"/g, '&quot;');
 
-  // Count duplicates (exact URL match)
+  // Count duplicates (exact URL match). Placeholder rows have no URL yet and
+  // must never look like duplicate tabs (C13).
   const urlCounts = {};
-  for (const tab of tabs) urlCounts[tab.url] = (urlCounts[tab.url] || 0) + 1;
+  for (const tab of tabs) {
+    if (!tab.url) continue;
+    urlCounts[tab.url] = (urlCounts[tab.url] || 0) + 1;
+  }
   const dupeUrls   = Object.entries(urlCounts).filter(([, c]) => c > 1);
   const hasDupes   = dupeUrls.length > 0;
   const totalExtras = dupeUrls.reduce((s, [, c]) => s + c - 1, 0);
@@ -4101,8 +4204,13 @@ async function buildDomainGroups(realTabs = getRealTabs()) {
     }
   }
   // Distinguish "API failure" from "genuinely no groups": surface a throttled
-  // toast instead of silently collapsing every Chrome-group card.
-  if (typeof getChromeGroupsLastError === 'function' && getChromeGroupsLastError()) {
+  // toast ONLY when the whole query failed (no groups came back at all). A
+  // single group's transient query failure must not misreport the entire
+  // result as unavailable — the snapshot fallback below still protects the
+  // affected tabs.
+  if (typeof getChromeGroupsLastError === 'function'
+      && getChromeGroupsLastError()
+      && (userChromeGroups || []).length === 0) {
     const lastToastAt = window.__chromeGroupsErrorToastAt || 0;
     if (Date.now() - lastToastAt > 15000) {
       window.__chromeGroupsErrorToastAt = Date.now();
@@ -4110,6 +4218,26 @@ async function buildDomainGroups(realTabs = getRealTabs()) {
     }
   }
   const chromeOwnedTabIds = new Set((userChromeGroups || []).flatMap(g => g.tabIds || []));
+  // When queryUserChromeGroups failed or partially failed (C7), tabs that the
+  // openTabs snapshot already knows live in an UNMANAGED native Chrome group
+  // must never fall into domain or manual cards — otherwise syncChromeTabGroups
+  // could move them out of the user's real group into a dashboard mirror.
+  // Managed mirror groups are intentionally NOT treated as user-owned: their
+  // tabs belong to domain cards. The fallback is gated on the query failing:
+  // on a fully successful query the live tab list is authoritative, and a
+  // snapshot that lags behind a tab having LEFT a user group must not hide it
+  // from every card until the next fetch.
+  const chromeGroupsQueryFailed = typeof getChromeGroupsLastError === 'function' && Boolean(getChromeGroupsLastError());
+  if (chromeGroupsQueryFailed) {
+    const managedChromeGroupIds = typeof getManagedChromeGroupIds === 'function'
+      ? getManagedChromeGroupIds()
+      : new Set();
+    for (const tab of realTabs) {
+      if (Number.isInteger(tab?.groupId) && tab.groupId >= 0 && !managedChromeGroupIds.has(tab.groupId)) {
+        chromeOwnedTabIds.add(Number(tab.id));
+      }
+    }
+  }
   const manualGroupMap = Object.fromEntries(
     sessionGroupsState.groups.map(group => [
       group.id,
@@ -4325,7 +4453,7 @@ async function renderOpenTabsLayout({ rebuildGroups = true, syncChrome = false, 
  * 3. Groups tabs by domain (with landing pages pulled out to their own group)
  * 4. Renders domain cards
  * 5. Updates footer stats
- * 6. Renders the "Saved for Later" checklist
+ * 6. Renders the todos drawer (deferred column)
  */
 async function renderStaticDashboard() {
   // --- Header ---
@@ -4362,7 +4490,7 @@ async function renderStaticDashboard() {
   // --- Check for duplicate Tab Harbor tabs ---
   checkTabOutDupes();
 
-  // --- Render "Saved for Later" column ---
+  // --- Render the todos drawer (deferred column) ---
   await renderDeferredColumn();
   
   // Setup image error handlers for CSP compliance
@@ -4907,67 +5035,88 @@ document.addEventListener('click', async (e) => {
   // ---- Batch actions for the handle multi-selection ----
   if (action === 'batch-close-tabs') {
     e.stopPropagation();
-    beginBatchAction();
-    const tabIds = getSelectedBatchTabIds();
-    const { closedCount } = await closeTabsSafely(tabIds);
-    await finishBatchAction({ clearSelection: true });
-    showToast(runtimeT ? runtimeT('toastBatchClosed', { count: closedCount }) : `${closedCount} tabs closed`);
-    return;
+    if (batchActionInFlight) return;
+    batchActionInFlight = true;
+    try {
+      beginBatchAction();
+      const tabIds = getSelectedBatchTabIds();
+      const { closedCount } = await closeTabsSafely(tabIds);
+      await finishBatchAction({ clearSelection: true });
+      showToast(runtimeT ? runtimeT('toastBatchClosed', { count: closedCount }) : `${closedCount} tabs closed`);
+      return;
+    } finally {
+      batchActionInFlight = false;
+      window.__suppressAutoRefreshUntil = 0;
+    }
   }
 
   if (action === 'batch-discard-tabs') {
     e.stopPropagation();
     if (!sleepControlEnabled) return;
-    beginBatchAction();
-    // Resolve each selected chip to its live tab id through the current DOM,
-    // then keep the ORIGINAL chip sort ids for every tab that survives. This
-    // preserves selection across all cards even when a chip sort id is not a
-    // plain tab id (e.g. URL-based tokens or placeholder rows).
-    const chipTabIds = getPageChipTabIdMap();
-    const tabIds = [...selectedPageChipIds]
-      .map(chipId => chipTabIds.get(String(chipId)))
-      .filter(tabId => tabId != null);
-    const { discarded, failed, skippedActive, stale, resultsByTabId } = await sleepTabsByIds(tabIds, { skipActive: true });
-    const keptChipIds = [...selectedPageChipIds].filter(chipId => {
-      const tabId = chipTabIds.get(String(chipId));
-      return tabId != null && resultsByTabId.has(tabId);
-    });
-    await finishBatchAction({ keptChipIds });
-    if (discarded > 0) {
-      showToast(runtimeT ? runtimeT('toastTabsDiscarded', { count: discarded }) : `${discarded} tabs sleeping`);
-    } else if (failed > 0) {
-      showToast(runtimeT ? runtimeT('toastTabDiscardFailed') : 'Failed to sleep tab');
-    } else if (skippedActive > 0) {
-      showToast(runtimeT ? runtimeT('toastBatchSleepNone') : 'Selected tabs are active');
-    } else if (stale > 0) {
-      showToast(runtimeT ? runtimeT('toastTabAlreadyClosed') : 'Tab already closed');
+    if (batchActionInFlight) return;
+    batchActionInFlight = true;
+    try {
+      beginBatchAction();
+      // Resolve each selected chip to its live tab id through the current DOM,
+      // then keep the ORIGINAL chip sort ids for every tab that survives. This
+      // preserves selection across all cards even when a chip sort id is not a
+      // plain tab id (e.g. URL-based tokens or placeholder rows).
+      const chipTabIds = getPageChipTabIdMap();
+      const tabIds = [...selectedPageChipIds]
+        .map(chipId => chipTabIds.get(String(chipId)))
+        .filter(tabId => tabId != null);
+      const { discarded, failed, skippedActive, stale, resultsByTabId } = await sleepTabsByIds(tabIds, { skipActive: true });
+      const keptChipIds = [...selectedPageChipIds].filter(chipId => {
+        const tabId = chipTabIds.get(String(chipId));
+        return tabId != null && resultsByTabId.has(tabId);
+      });
+      await finishBatchAction({ keptChipIds });
+      if (discarded > 0) {
+        showToast(runtimeT ? runtimeT('toastTabsDiscarded', { count: discarded }) : `${discarded} tabs sleeping`);
+      } else if (failed > 0) {
+        showToast(runtimeT ? runtimeT('toastTabDiscardFailed') : 'Failed to sleep tab');
+      } else if (skippedActive > 0) {
+        showToast(runtimeT ? runtimeT('toastBatchSleepNone') : 'Selected tabs are active');
+      } else if (stale > 0) {
+        showToast(runtimeT ? runtimeT('toastTabAlreadyClosed') : 'Tab already closed');
+      }
+      return;
+    } finally {
+      batchActionInFlight = false;
+      window.__suppressAutoRefreshUntil = 0;
     }
-    return;
   }
 
   // ---- Deduplicate within the selection, keep one copy per URL ----
   if (action === 'batch-dedup-selection') {
     e.stopPropagation();
-    beginBatchAction();
-    const chipTabIds = getPageChipTabIdMap();
-    const tabIds = getSelectedBatchTabIds();
-    const { closedCount, closedTabIds } = await closeDuplicatesInSelection(tabIds);
-    // Keep the ORIGINAL chip sort ids that survive dedup, so selection is
-    // preserved on every card even when a chip id is not a plain tab id.
-    // refreshPageChipSelectionClasses prunes any id that no longer has a row.
-    const keptChipIds = [...selectedPageChipIds].filter(chipId => {
-      const tabId = chipTabIds.get(String(chipId));
-      return tabId != null && !closedTabIds.has(tabId);
-    });
-    await finishBatchAction({ keptChipIds });
-    if (closedCount > 0) {
-      showToast(runtimeT
-        ? runtimeT('toastBatchClosedDuplicates', { count: closedCount })
-        : `Closed ${closedCount} duplicate tabs`);
-    } else {
-      showToast(runtimeT ? runtimeT('toastBatchNoDuplicates') : 'No duplicate tabs in selection');
+    if (batchActionInFlight) return;
+    batchActionInFlight = true;
+    try {
+      beginBatchAction();
+      const chipTabIds = getPageChipTabIdMap();
+      const tabIds = getSelectedBatchTabIds();
+      const { closedCount, closedTabIds } = await closeDuplicatesInSelection(tabIds);
+      // Keep the ORIGINAL chip sort ids that survive dedup, so selection is
+      // preserved on every card even when a chip id is not a plain tab id.
+      // refreshPageChipSelectionClasses prunes any id that no longer has a row.
+      const keptChipIds = [...selectedPageChipIds].filter(chipId => {
+        const tabId = chipTabIds.get(String(chipId));
+        return tabId != null && !closedTabIds.has(tabId);
+      });
+      await finishBatchAction({ keptChipIds });
+      if (closedCount > 0) {
+        showToast(runtimeT
+          ? runtimeT('toastBatchClosedDuplicates', { count: closedCount })
+          : `Closed ${closedCount} duplicate tabs`);
+      } else {
+        showToast(runtimeT ? runtimeT('toastBatchNoDuplicates') : 'No duplicate tabs in selection');
+      }
+      return;
+    } finally {
+      batchActionInFlight = false;
+      window.__suppressAutoRefreshUntil = 0;
     }
-    return;
   }
 
   if (action === 'batch-save-session') {
@@ -4981,68 +5130,72 @@ document.addEventListener('click', async (e) => {
   // ---- Merge the whole selection into ONE new Chrome tab group ----
   if (action === 'batch-merge-chrome-group') {
     e.stopPropagation();
-    // Skip pinned tabs and tabs already inside a user-created Chrome group,
-    // mirroring the section-header merge-all behavior.
-    const pinnedIds = new Set((openTabs || []).filter(t => t?.pinned).map(t => Number(t.id)));
-    const chromeGroupTabIds = new Set();
-    for (const group of domainGroups) {
-      if (!group?.isChromeGroup) continue;
-      for (const tab of (group.tabs || [])) {
-        if (tab?.id != null) chromeGroupTabIds.add(Number(tab.id));
+    if (batchActionInFlight) return;
+    batchActionInFlight = true;
+    try {
+      // Skip pinned tabs (Chrome cannot group them). Tabs already inside a
+      // Chrome group ARE merged: chrome.tabs.group without a groupId moves them
+      // out of their source group and into the newly created group.
+      const pinnedIds = new Set((openTabs || []).filter(t => t?.pinned).map(t => Number(t.id)));
+      const allSelected = getSelectedBatchTabIds();
+      const tabIds = allSelected.filter(id => !pinnedIds.has(id));
+      const skippedCount = allSelected.length - tabIds.length;
+      if (!tabIds.length) {
+        showToast(runtimeT ? runtimeT('toastBatchMergeNoEligible') : 'No eligible tabs to merge');
+        return;
       }
-    }
-    const allSelected = getSelectedBatchTabIds();
-    const tabIds = allSelected.filter(id => !pinnedIds.has(id) && !chromeGroupTabIds.has(id));
-    const skippedCount = allSelected.length - tabIds.length;
-    if (!tabIds.length) {
-      showToast(runtimeT ? runtimeT('toastBatchMergeNoEligible') : 'No eligible tabs to merge');
-      return;
-    }
-    beginBatchAction();
+      beginBatchAction();
 
-    let mergeResult;
-    try {
-      const title = buildBatchMergeGroupTitle(tabIds);
-      const color = typeof runtimeAssignGroupColor === 'function'
-        ? runtimeAssignGroupColor('all', chromeGroupMergeColorIndex++)
-        : 'blue';
-      mergeResult = await mergeTabsIntoChromeGroup(tabIds, { title, color });
-    } catch (err) {
+      let mergeResult;
+      try {
+        // Resolve the name from the ACTUAL merged ids: stale ids dropped by
+        // groupTabsWithStaleRetry must not drive the group name.
+        const title = (mergedIds) => buildBatchMergeGroupTitle(mergedIds);
+        const color = typeof runtimeAssignGroupColor === 'function'
+          ? runtimeAssignGroupColor('all', chromeGroupMergeColorIndex++)
+          : 'blue';
+        mergeResult = await mergeTabsIntoChromeGroup(tabIds, { title, color });
+      } catch (err) {
+        window.__suppressAutoRefreshUntil = 0;
+        showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not create Chrome tab group');
+        return;
+      }
+
+      // Tabs moving into a native group drop their dashboard manual-group
+      // assignments (same cleanup as the drag-into-Chrome-group path). The
+      // group side effect has already happened, so a storage failure must not
+      // leave the selection/suppression dangling (C6/C22).
+      const mergedTabIds = mergeResult?.mergedTabIds || tabIds;
+      try {
+        let nextState = clearTabsFromSessionGroups(sessionGroupsState, mergedTabIds);
+        nextState = pruneSessionGroups(nextState, getOpenTabIdsForSessionPruning());
+        await saveSessionGroups(nextState);
+      } catch (err) {
+        console.warn('[tab-harbor] batch merge: session cleanup failed after group creation:', err);
+        await finishBatchAction({ clearSelection: true });
+        showToast(runtimeT ? runtimeT('toastBatchMergeCleanupFailed') : 'Merged tabs, but could not update saved groups');
+        return;
+      }
+
+      await finishBatchAction({ clearSelection: true });
+      if (!mergeResult.updated) {
+        showToast(runtimeT
+          ? runtimeT('toastBatchMergedGroupRenameFailed', { count: mergedTabIds.length })
+          : `Merged ${mergedTabIds.length} tabs, but could not name the group`);
+      } else if (skippedCount > 0) {
+        showToast(runtimeT
+          ? runtimeT('toastBatchMergedChromeGroupWithSkipped', { count: mergedTabIds.length, skipped: skippedCount })
+          : `Merged ${mergedTabIds.length} tabs into a Chrome tab group (${skippedCount} skipped)`);
+      } else {
+        showToast(runtimeT
+          ? runtimeT('toastBatchMergedChromeGroup', { count: mergedTabIds.length })
+          : `Merged ${mergedTabIds.length} tabs into a Chrome tab group`);
+      }
+      return;
+    } finally {
+      batchActionInFlight = false;
       window.__suppressAutoRefreshUntil = 0;
-      showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not create Chrome tab group');
-      return;
     }
-
-    // Tabs moving into a native group drop their dashboard manual-group
-    // assignments (same cleanup as the drag-into-Chrome-group path). The
-    // group side effect has already happened, so a storage failure must not
-    // leave the selection/suppression dangling (C6).
-    try {
-      let nextState = clearTabsFromSessionGroups(sessionGroupsState, tabIds);
-      nextState = pruneSessionGroups(nextState, getOpenTabIdsForSessionPruning());
-      await saveSessionGroups(nextState);
-    } catch (err) {
-      console.warn('[tab-harbor] batch merge: session cleanup failed after group creation:', err);
-      window.__suppressAutoRefreshUntil = 0;
-      showToast(runtimeT ? runtimeT('toastBatchMergeCleanupFailed') : 'Merged tabs, but could not update saved groups');
-      return;
-    }
-
-    await finishBatchAction({ clearSelection: true });
-    if (!mergeResult.updated) {
-      showToast(runtimeT
-        ? runtimeT('toastBatchMergedGroupRenameFailed', { count: tabIds.length })
-        : `Merged ${tabIds.length} tabs, but could not name the group`);
-    } else if (skippedCount > 0) {
-      showToast(runtimeT
-        ? runtimeT('toastBatchMergedChromeGroupWithSkipped', { count: tabIds.length, skipped: skippedCount })
-        : `Merged ${tabIds.length} tabs into a Chrome tab group (${skippedCount} skipped)`);
-    } else {
-      showToast(runtimeT
-        ? runtimeT('toastBatchMergedChromeGroup', { count: tabIds.length })
-        : `Merged ${tabIds.length} tabs into a Chrome tab group`);
-    }
-    return;
   }
 
   if (action === 'clear-chip-selection') {
@@ -5064,7 +5217,9 @@ document.addEventListener('click', async (e) => {
 
     const urls      = group.tabs.map(t => t.url);
     // Landing pages and custom groups (whose domain key isn't a real hostname)
-    // must use exact URL matching to avoid closing unrelated tabs
+    // must use exact URL matching to avoid closing unrelated tabs. Chrome-group
+    // cards are scoped by their own tab ids: URL matching would close same-URL
+    // tabs outside the group (C12).
     const useExact  = group.domain === '__landing-pages__' || !!group.label;
 
     // Start the card exit immediately so the close feels instant; the tabs
@@ -5080,21 +5235,28 @@ document.addEventListener('click', async (e) => {
 
     // Close the tabs in the background (the card is already exiting), then
     // rebuild so the nav and remaining cards reflect the closed group.
+    let closeResult = { closedCount: 0 };
     try {
-      await closeTabsByUrlsSafely(urls, { exact: useExact, playSound: false });
+      if (group.isChromeGroup) {
+        const tabIds = group.tabs.map(t => Number(t.id)).filter(Number.isFinite);
+        closeResult = await closeTabsSafely(tabIds, { playSound: false });
+      } else {
+        closeResult = await closeTabsByUrlsSafely(urls, { exact: useExact, playSound: false });
+      }
     } catch { /* swallow: tabs may already be gone */ }
     await renderDashboard();
     window.__suppressAutoRefreshUntil = 0;
 
+    const closedCount = group.isChromeGroup ? closeResult.closedCount : urls.length;
     const groupLabel = group.domain === '__landing-pages__'
       ? (runtimeT ? runtimeT('homepagesLabel') : 'Homepages')
       : (group.label || friendlyDomain(group.domain));
     const tabsWord = runtimeT
-      ? (urls.length === 1 ? runtimeT('tabsWordSingular') : runtimeT('tabsWordPlural'))
-      : `tab${urls.length !== 1 ? 's' : ''}`;
+      ? (closedCount === 1 ? runtimeT('tabsWordSingular') : runtimeT('tabsWordPlural'))
+      : `tab${closedCount !== 1 ? 's' : ''}`;
     showToast(runtimeT
-      ? runtimeT('closedTabsFromGroup', { count: urls.length, tabsWord, groupLabel })
-      : `Closed ${urls.length} ${tabsWord} from ${groupLabel}`);
+      ? runtimeT('closedTabsFromGroup', { count: closedCount, tabsWord, groupLabel })
+      : `Closed ${closedCount} ${tabsWord} from ${groupLabel}`);
 
     const statTabs = document.getElementById('statTabs');
     if (statTabs) statTabs.textContent = openTabs.length;
@@ -5210,9 +5372,13 @@ document.addEventListener('click', async (e) => {
     // subscription (same mute contract as every other group write path).
     if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
 
+    let mergeResult;
     try {
+      // The merge-all label is count-based: resolve it from the ACTUAL merged
+      // ids so stale ids dropped by groupTabsWithStaleRetry cannot inflate the
+      // count in the group title.
       const label = scope === 'all'
-        ? (runtimeT ? runtimeT('mergeAllGroupTitle', { count: tabIds.length }) : `Open tabs (${tabIds.length})`)
+        ? (mergedIds) => (runtimeT ? runtimeT('mergeAllGroupTitle', { count: mergedIds.length }) : `Open tabs (${mergedIds.length})`)
         : getGroupDisplayLabel(group);
       // Merged groups rotate through the accent palette (not always grey):
       // both the section-header merge-all and the per-domain merge use the
@@ -5220,30 +5386,70 @@ document.addEventListener('click', async (e) => {
       const color = typeof runtimeAssignGroupColor === 'function'
         ? runtimeAssignGroupColor(scope === 'all' ? 'all' : group.domain, chromeGroupMergeColorIndex++)
         : 'blue';
-      await mergeTabsIntoChromeGroup(tabIds, { title: label, color });
+      mergeResult = await mergeTabsIntoChromeGroup(tabIds, { title: label, color });
     } catch (err) {
       window.__suppressAutoRefreshUntil = 0;
       showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not create Chrome tab group');
       return;
     }
 
+    // Tabs moving into a native group drop their dashboard manual-group
+    // assignments, matching the batch-merge and drag-into-Chrome-group paths
+    // (C2). Use the actual merged ids so stale tabs are not carried forward.
+    const mergedTabIds = mergeResult?.mergedTabIds || tabIds;
+    let cleanupFailed = false;
+    try {
+      let nextState = clearTabsFromSessionGroups(sessionGroupsState, mergedTabIds);
+      nextState = pruneSessionGroups(nextState, getOpenTabIdsForSessionPruning());
+      await saveSessionGroups(nextState);
+    } catch (err) {
+      cleanupFailed = true;
+      console.warn('[tab-harbor] group-card merge: session cleanup failed:', err);
+    }
+
     // Rebuild so the card reflects the new native group right away.
     await renderDashboard();
     window.__suppressAutoRefreshUntil = 0;
-    showToast(runtimeT ? runtimeT('toastGroupCreated') : 'Created Chrome tab group');
+
+    if (cleanupFailed) {
+      showToast(runtimeT ? runtimeT('toastBatchMergeCleanupFailed') : 'Merged tabs, but could not update saved groups');
+    } else if (mergeResult.updated) {
+      showToast(runtimeT ? runtimeT('toastGroupCreated') : 'Created Chrome tab group');
+    } else {
+      showToast(runtimeT
+        ? runtimeT('toastBatchMergedGroupRenameFailed', { count: mergedTabIds.length })
+        : `Merged ${mergedTabIds.length} tabs, but could not name the group`);
+    }
     return;
   }
 
   // ---- Close duplicates, keep one copy ----
   if (action === 'dedup-keep-one') {
+    // Chrome-group cards dedup within their own tab set only; URL-wide
+    // matching would close same-URL tabs outside the group (C12).
+    const chromeCard = actionEl.closest('.mission-card.chrome-group-card');
+    const chromeGroupId = chromeCard?.dataset?.chromeGroupId;
+    const chromeGroup = chromeGroupId
+      ? domainGroups.find(g => g.isChromeGroup && String(g.chromeGroupId) === String(chromeGroupId))
+      : null;
     const urlsEncoded = actionEl.dataset.dupeUrls || '';
     const urls = urlsEncoded.split(',').map(u => decodeURIComponent(u)).filter(Boolean);
-    if (urls.length === 0) return;
+    const chromeTabIds = chromeGroup
+      ? chromeGroup.tabs.map(t => Number(t.id)).filter(Number.isFinite)
+      : [];
+
+    // No-op selections must return BEFORE the refresh-suppression window is
+    // raised: an early return can never leak a 2s auto-refresh block.
+    if (chromeGroup ? chromeTabIds.length === 0 : urls.length === 0) return;
 
     // Suppress auto-refresh to prevent animation spam
     window.__suppressAutoRefreshUntil = Date.now() + 2000;
 
-    await closeDuplicatesByUrls(urls, { keepOne: true, playSound: false });
+    if (chromeGroup) {
+      await closeDuplicatesInSelection(chromeTabIds, { playSound: false });
+    } else {
+      await closeDuplicatesByUrls(urls, { keepOne: true, playSound: false });
+    }
     playCloseSound();
 
     // Rebuild the open-tabs area right away so the kept copy shows
@@ -5527,10 +5733,10 @@ function buildBatchMergeGroupTitle(tabIds) {
  * syncPageChipBatchBar()
  *
  * While a multi-selection exists, the open-tabs section header transforms in
- * place: the title becomes the selection count and the three icon actions
- * (sleep / save / close all) are replaced by the batch actions (close / sleep
- * / save / clear selection). The row keeps the section header's height and
- * quiet style — no separate strip is appended.
+ * place: the title becomes the selection count and the header's icon actions
+ * are replaced by the batch action bar (clear / dedup / merge / sleep / save
+ * / close). The row keeps the section header's height and quiet style — no
+ * separate strip is appended.
  */
 function syncPageChipBatchBar() {
   const count = selectedPageChipIds.size;
@@ -5924,7 +6130,13 @@ document.addEventListener('pointerdown', (e) => {
   const button = e.target.closest('.group-nav-button[data-nav-kind="open-tabs"]');
   if (!button) return;
 
-  draggedGroupId = button.dataset.groupId || '';
+  const groupId = button.dataset.groupId || '';
+  // Chrome-group cards follow the native browser strip and are intentionally
+  // not persisted in the dashboard group order; do not start a drag that can
+  // never be saved (C18).
+  if (String(groupId).startsWith('__chrome_group__:')) return;
+
+  draggedGroupId = groupId;
   draggedGroupButtonEl = button;
   const rect = button.getBoundingClientRect();
   dragStartPoint = {

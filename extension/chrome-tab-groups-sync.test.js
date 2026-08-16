@@ -33,6 +33,11 @@ globalThis.chrome = {
       set: async (items) => {
         Object.assign(mockStorage, items);
       },
+      remove: async (keys) => {
+        for (const key of [].concat(keys)) {
+          delete mockStorage[key];
+        }
+      },
     },
   },
   tabs: {
@@ -81,6 +86,9 @@ const {
   reorderGroupedTabs,
   assignGroupColor,
   getGroupTitle,
+  isGroupIdentityFree,
+  pickUncollidingGroupColor,
+  currentMappingCandidates,
 } = globalThis.TabOutChromeTabGroups;
 
 test('assignGroupColor returns blue for session groups', () => {
@@ -190,8 +198,11 @@ test('syncChromeTabGroups creates groups when enabled', async () => {
   assert.equal(updateCallArgs.length, 2);
   assert.equal(updateCallArgs[0].collapsed, true);
   assert.equal(updateCallArgs[1].collapsed, true);
+  // Mirrors rotate through the palette (grey, then red) — the order is part
+  // of the title+color fingerprint, so it is asserted as a behavior anchor.
   assert.equal(updateCallArgs[0].color, 'grey');
   assert.equal(updateCallArgs[1].color, 'red');
+  // getChromeGroupCount counts distinct group keys, not per-window mappings.
   assert.equal(getChromeGroupCount(), 2);
 });
 
@@ -224,6 +235,41 @@ test('syncChromeTabGroups handles tabs in different windows', async () => {
 
   // Should create 1 group for each window → 2 total chrome.tabs.group calls
   assert.equal(groupCallCount, 2);
+});
+
+test('syncChromeTabGroups skips unmanaged user-group tabs but keeps managed mirror tabs', async () => {
+  resetChromeGroupState();
+  const groupCalls = [];
+
+  globalThis.chrome.tabs.group = async (opts) => {
+    groupCalls.push(opts);
+    return 900 + groupCalls.length;
+  };
+  globalThis.chrome.tabGroups.update = async () => {};
+  globalThis.chrome.tabGroups.query = async () => [{ id: 101, title: 'GitHub', color: 'grey' }];
+  globalThis.chrome.tabs.query = async (opts) => [];
+
+  await saveChromeTabGroupsSetting(true);
+  populateChromeGroupMap([
+    { virtualGroupKey: 'github.com', windowId: 1, chromeGroupId: 101 },
+  ]);
+
+  const groups = [
+    {
+      domain: 'github.com',
+      tabs: [
+        // Managed mirror tab: must still be included in the mirror sync.
+        { id: 1, windowId: 1, url: 'https://github.com', groupId: 101 },
+        // Unmanaged user-created group tab: must never be pulled into the mirror.
+        { id: 2, windowId: 1, url: 'https://github.com/2', groupId: 202 },
+      ],
+    },
+  ];
+
+  await syncChromeTabGroups(groups);
+
+  assert.equal(groupCalls.length, 1);
+  assert.deepEqual(groupCalls[0].tabIds, [1]);
 });
 
 test('syncChromeTabGroups reorders tabs inside a chrome group to match desired order', async () => {
@@ -316,6 +362,170 @@ test('reorderGroupedTabs applies a full desired order at the group start (mid-ca
     { tabId: 1, windowId: 7, index: 1 },
     { tabId: 2, windowId: 7, index: 2 },
   ]);
+});
+
+test('reorderGroupedTabs only moves tabs that are actually in the group (C15 superset)', async () => {
+  resetChromeGroupState();
+  const moveCalls = [];
+  globalThis.chrome.tabs.move = async (tabId, opts) => {
+    moveCalls.push({ tabId, ...opts });
+  };
+  globalThis.chrome.tabs.query = async (opts) => {
+    if (opts?.groupId === 901) {
+      return [
+        { id: 1, groupId: 901, windowId: 7, index: 0 },
+        { id: 2, groupId: 901, windowId: 7, index: 1 },
+      ];
+    }
+    return [];
+  };
+
+  // desired includes id 3, which is NOT in the group (a caller may pass a
+  // superset after a partial failure). Only ids actually in the group may be
+  // moved — dragging an absent id would pull an ungrouped tab into the strip.
+  await reorderGroupedTabs(901, ['2', '1', '3'], 7);
+
+  assert.deepEqual(moveCalls, [
+    { tabId: 2, windowId: 7, index: 0 },
+    { tabId: 1, windowId: 7, index: 1 },
+  ]);
+});
+
+test('loadPersistedChromeGroupMap keeps the current mapping among ambiguous candidates (C4)', async () => {
+  resetChromeGroupState();
+  await saveChromeTabGroupsSetting(true);
+  // The mirror mapping established this session points at 901 — the NON-first
+  // candidate. A blind first-match bind would pick 900 (the user's group); the
+  // ambiguous-binding preference must keep 901.
+  await populateChromeGroupMap([{ virtualGroupKey: 'github.com', windowId: 1, chromeGroupId: 901 }]);
+  // Seed persisted meta as if an earlier sync stored the mirror fingerprint.
+  await chrome.storage.local.set({
+    chromeTabGroupsMeta: { 'github.com': { '1': { title: 'Github', color: 'grey' } } },
+  });
+  // Two groups share the fingerprint: 900 (user's group) and 901 (our mirror).
+  globalThis.chrome.tabGroups.query = async () => [
+    { id: 900, windowId: 1, title: 'Github', color: 'grey' },
+    { id: 901, windowId: 1, title: 'Github', color: 'grey' },
+  ];
+
+  await loadPersistedChromeGroupMap();
+
+  const managed = getManagedChromeGroupIds();
+  assert.ok(managed.has(901), 'the current mirror mapping is kept (not the first-match guess)');
+  assert.ok(!managed.has(900), 'the user group is not hijacked');
+  delete globalThis.chrome.tabGroups.query;
+});
+
+test('syncChromeTabGroups avoids a colliding title+color when creating a new mirror (C4)', async () => {
+  resetChromeGroupState();
+  const updates = [];
+  globalThis.friendlyDomain = () => 'Github';
+  globalThis.chrome.tabs.group = async (opts) => opts.groupId ?? 902;
+  globalThis.chrome.tabs.query = async (opts) => opts?.groupId === 902 ? [] : [];
+  // A user-created group already holds the mirror's would-be fingerprint.
+  globalThis.chrome.tabGroups.query = async () => [
+    { id: 101, windowId: 1, title: 'Github', color: 'grey' },
+  ];
+  globalThis.chrome.tabGroups.update = async (groupId, props) => updates.push({ groupId, props });
+
+  await saveChromeTabGroupsSetting(true);
+  const groups = [{
+    domain: 'github.com',
+    tabs: [{ id: 1, windowId: 1, url: 'https://github.com', groupId: -1 }],
+  }];
+  await syncChromeTabGroups(groups);
+
+  // The new mirror must not reuse the colliding grey identity, otherwise the
+  // title+color fingerprint stays ambiguous and churns on every load.
+  const mirrorUpdate = updates.find(u => u.groupId === 902);
+  assert.ok(mirrorUpdate, 'a new mirror group was created');
+  assert.notEqual(mirrorUpdate.props.color, 'grey');
+  delete globalThis.friendlyDomain;
+  delete globalThis.chrome.tabs.group;
+  delete globalThis.chrome.tabs.query;
+  delete globalThis.chrome.tabGroups.query;
+  delete globalThis.chrome.tabGroups.update;
+});
+
+test('isGroupIdentityFree detects title+color collisions per window (C4)', () => {
+  const groups = [
+    { id: 1, windowId: 5, title: 'GitHub', color: 'grey' },
+    { id: 2, windowId: 5, title: 'GitHub', color: 'red' },
+    { id: 3, windowId: 6, title: 'GitHub', color: 'grey' },
+  ];
+  // Same window + same title+color → not free.
+  assert.equal(isGroupIdentityFree('GitHub', 'grey', 5, groups), false);
+  // Same window but different color → free.
+  assert.equal(isGroupIdentityFree('GitHub', 'blue', 5, groups), true);
+  // Same title+color in a window that itself holds such a group → not free.
+  assert.equal(isGroupIdentityFree('GitHub', 'grey', 6, groups), false);
+  // Same title+color in a window with no such group → free.
+  assert.equal(isGroupIdentityFree('GitHub', 'grey', 7, groups), true);
+  // No live groups → free.
+  assert.equal(isGroupIdentityFree('X', 'grey', 1, []), true);
+  assert.equal(isGroupIdentityFree('X', 'grey', 1, null), true);
+});
+
+test('pickUncollidingGroupColor returns the preferred color when free, else rotates (C4)', () => {
+  const colliding = (color) => [{ id: 1, windowId: 5, title: 'GitHub', color }];
+  // Preferred grey is free → stays grey.
+  assert.equal(pickUncollidingGroupColor('GitHub', 'grey', 5, colliding('red')), 'grey');
+  // Grey is taken → the first free palette color (red) is chosen.
+  assert.equal(pickUncollidingGroupColor('GitHub', 'grey', 5, colliding('grey')), 'red');
+  // Every palette color is taken → falls back to the preferred color.
+  const allTaken = ['grey', 'red', 'green', 'pink', 'purple', 'cyan', 'orange']
+    .map((color, i) => ({ id: i + 1, windowId: 5, title: 'GitHub', color }));
+  assert.equal(pickUncollidingGroupColor('GitHub', 'grey', 5, allTaken), 'grey');
+});
+
+test('currentMappingCandidates prefers the in-session mapping per window key (C4)', async () => {
+  resetChromeGroupState();
+  await populateChromeGroupMap([
+    { virtualGroupKey: 'github.com', windowId: 1, chromeGroupId: 501 },
+    { virtualGroupKey: 'github.com', windowId: 2, chromeGroupId: 502 },
+  ]);
+  const matches = [
+    { id: 500, windowId: 1, title: 'Github', color: 'grey' },
+    { id: 501, windowId: 1, title: 'Github', color: 'grey' },
+    { id: 502, windowId: 2, title: 'Github', color: 'grey' },
+  ];
+  // Per-window key: only that window's mapping counts.
+  assert.deepEqual(currentMappingCandidates('github.com', '1', matches), [{ windowId: 1, id: 501 }]);
+  // Legacy 'any' key: every in-session window mapping among the candidates.
+  // Note: per-window returns the live group's numeric windowId, while 'any'
+  // returns the map's string window key — both are valid reconciled keys.
+  assert.deepEqual(
+    currentMappingCandidates('github.com', 'any', matches).sort((a, b) => a.windowId - b.windowId),
+    [{ windowId: '1', id: 501 }, { windowId: '2', id: 502 }]
+  );
+  // No in-session mapping → nothing kept.
+  assert.deepEqual(currentMappingCandidates('other.com', 'any', matches), []);
+  assert.deepEqual(currentMappingCandidates('other.com', '1', matches), []);
+});
+
+test('legacy flat meta keeps the in-session mapping among ambiguous candidates (C4)', async () => {
+  resetChromeGroupState();
+  // A session mapping in window 1; the legacy flat snapshot (no window id)
+  // is seeded AFTER the mapping's persist so it cannot be clobbered.
+  await populateChromeGroupMap([
+    { virtualGroupKey: 'github.com', windowId: 1, chromeGroupId: 501 },
+  ]);
+  await chrome.storage.local.set({
+    chromeTabGroupsMeta: { 'github.com': { title: 'Github', color: 'grey' } },
+  });
+  // Two windows share the fingerprint — ambiguous for the flat key. The
+  // in-session window-1 mapping (501) must still be retained, not skipped.
+  globalThis.chrome.tabGroups.query = async () => [
+    { id: 501, windowId: 1, title: 'Github', color: 'grey' },
+    { id: 502, windowId: 2, title: 'Github', color: 'grey' },
+  ];
+
+  await loadPersistedChromeGroupMap();
+
+  const managed = getManagedChromeGroupIds();
+  assert.ok(managed.has(501), 'the in-session mapping is kept for legacy flat meta');
+  assert.ok(!managed.has(502), 'the other window group is not hijacked');
+  delete globalThis.chrome.tabGroups.query;
 });
 
 test('syncChromeTabGroups no longer reorders the window tab strip (card order follows Chrome)', async () => {
@@ -474,6 +684,31 @@ test('queryUserChromeGroups records failures so the dashboard can distinguish em
   globalThis.chrome.tabGroups.query = async () => [];
   await queryUserChromeGroups(1);
   assert.equal(getChromeGroupsLastError(), '');
+});
+
+test('queryUserChromeGroups keeps other groups when one group query partially fails (C6)', async () => {
+  resetChromeGroupState();
+  // 202's tab query rejects transiently; 303 succeeds. The partial failure
+  // must not drag the whole result down to "no groups", nor be cleared like a
+  // clean success — the diagnostic stays so the dashboard can tell part-failed
+  // from "really no groups".
+  globalThis.chrome.tabGroups.query = async () => [
+    { id: 202, title: 'Work', color: 'blue', windowId: 1 },
+    { id: 303, title: 'Research', color: 'red', windowId: 1 },
+  ];
+  globalThis.chrome.tabs.query = async (opts) => {
+    if (opts?.groupId === 202) throw new Error('transient query failure');
+    if (opts?.groupId === 303) return [{ id: 31, index: 2 }];
+    return [];
+  };
+
+  const groups = await queryUserChromeGroups(1);
+  // The healthy group survives in the result.
+  assert.deepEqual(groups.map(g => g.id), [303]);
+  // The partial failure is NOT cleared like a clean success.
+  assert.ok(getChromeGroupsLastError().length > 0);
+  delete globalThis.chrome.tabGroups.query;
+  delete globalThis.chrome.tabs.query;
 });
 
 test('syncChromeTabGroups reuses chromeGroupMap populated by populateChromeGroupMap', async () => {
@@ -645,9 +880,14 @@ test('persisted group meta reloads per window, so a same-title same-color user g
   ]);
   await persistChromeGroupMap();
 
-  // Simulate restart: fresh map, same live groups.
+  // Simulate restart: fresh map, same live groups. In real Chrome the
+  // persisted meta survives a restart; resetChromeGroupState clears storage,
+  // so re-seed the same meta the persist step wrote above.
   resetChromeGroupState();
   await loadChromeTabGroupsSetting();
+  await chrome.storage.local.set({
+    chromeTabGroupsMeta: { 'github.com': { '1': { title: 'GitHub', color: 'grey' } } },
+  });
   await loadPersistedChromeGroupMap();
 
   const managed = getManagedChromeGroupIds();

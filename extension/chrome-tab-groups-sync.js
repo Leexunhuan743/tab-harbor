@@ -43,8 +43,7 @@
       [chrome.tabGroups?.onUpdated, (group) => {
         // Chrome passes the full updated TabGroup object (there is no separate
         // changeInfo parameter). Collapse-only updates also arrive here; the
-        // dashboard side debounces the re-render, and the import pipeline is
-        // retired, so a full notify is safe.
+        // dashboard side debounces the re-render, so a full notify is safe.
         notifyChromeGroupSubscribers({ source: 'tabGroups.onUpdated', group });
       }],
       [chrome.tabGroups?.onRemoved, group => notifyChromeGroupSubscribers({ source: 'tabGroups.onRemoved', group })],
@@ -85,10 +84,73 @@
     }
   }
 
+  // Session groups and the landing-pages card keep dedicated colors (blue /
+  // yellow); regular domain mirrors cycle through the shared palette. The
+  // assigned color is part of a mirror's title+color identity fingerprint
+  // (see loadPersistedChromeGroupMap), so the palette order must stay stable.
   function assignGroupColor(groupKey, index) {
     if (groupKey.startsWith('__session_group__:')) return 'blue';
     if (groupKey === '__landing-pages__') return 'yellow';
     return GROUP_COLORS[index % GROUP_COLORS.length];
+  }
+
+  /**
+   * currentMappingCandidates(groupKey, windowIdKey, matches)
+   *
+   * Returns the in-session mappings that are still among the ambiguous
+   * candidates (each as { windowId, id }). For per-window meta keys only that
+   * window's mapping counts; for legacy flat meta ('any' key) the in-session
+   * map is keyed by the real window id, so every window mapping of this group
+   * key is considered — the session may legitimately hold mirrors for the same
+   * group key in several windows (C4 follow-up).
+   */
+  function currentMappingCandidates(groupKey, windowIdKey, matches) {
+    const windowMap = chromeGroupMap?.[groupKey];
+    if (!windowMap) return [];
+    if (windowIdKey !== 'any') {
+      const currentId = windowMap[windowIdKey];
+      const match = currentId != null ? matches.find(g => Number(g.id) === Number(currentId)) : null;
+      return match ? [{ windowId: match.windowId, id: match.id }] : [];
+    }
+    const kept = [];
+    for (const [windowIdStr, chromeGroupId] of Object.entries(windowMap)) {
+      if (chromeGroupId != null && matches.some(g => Number(g.id) === Number(chromeGroupId))) {
+        kept.push({ windowId: windowIdStr, id: chromeGroupId });
+      }
+    }
+    return kept;
+  }
+
+  /**
+   * isGroupIdentityFree(title, color, windowId, currentGroups)
+   *
+   * A mirror's identity is its window + title + color fingerprint. Returns
+   * true when no group in the given window already carries that fingerprint.
+   * Used before creating a new mirror so its identity can never stay
+   * ambiguous for loadPersistedChromeGroupMap (C4 follow-up).
+   */
+  function isGroupIdentityFree(title, color, windowId, currentGroups) {
+    if (!Array.isArray(currentGroups)) return true;
+    return !currentGroups.some(g =>
+      Number(g.windowId) === Number(windowId) &&
+      g.title === title &&
+      g.color === color
+    );
+  }
+
+  /**
+   * pickUncollidingGroupColor(title, preferred, windowId, currentGroups)
+   *
+   * Returns the first palette color that keeps the mirror's fingerprint
+   * unique in the window; falls back to the preferred color when every
+   * palette color collides (extreme case).
+   */
+  function pickUncollidingGroupColor(title, preferred, windowId, currentGroups) {
+    if (!Array.isArray(currentGroups)) return preferred;
+    for (const color of GROUP_COLORS) {
+      if (isGroupIdentityFree(title, color, windowId, currentGroups)) return color;
+    }
+    return preferred;
   }
 
   async function loadChromeTabGroupsSetting() {
@@ -155,12 +217,24 @@
             (windowIdKey === 'any' || Number(g.windowId) === Number(windowIdKey)) &&
             g.title === info.title && g.color === info.color
           );
-          // Legacy flat snapshots carry no window id. If more than one window
-          // has a same-title+color group, auto-binding would be a coin toss
-          // that can mark a user group as a mirror — skip and let the next
-          // persist (or a toggle off/on) rebuild a correct per-window mapping.
-          if (windowIdKey === 'any' && matches.length > 1) {
-            console.warn(`[tab-harbor] ambiguous legacy chromeTabGroupsMeta for ${groupKey}; skipping auto-bind`);
+          // If more than one group has the same title+color (legacy flat
+          // snapshots across windows, or same-window duplicates after the
+          // per-window migration), auto-binding would be a coin toss that can
+          // mark a user group as a mirror. Prefer the mapping THIS session
+          // already established when it is still among the candidates — that
+          // group is the mirror we created/managed, so reusing it is not a
+          // guess. Otherwise skip and let the next persist (or a toggle off/on)
+          // rebuild a correct mapping (C4).
+          if (matches.length > 1) {
+            const currentMatches = currentMappingCandidates(groupKey, windowIdKey, matches);
+            if (currentMatches.length > 0) {
+              for (const cm of currentMatches) {
+                if (!reconciled[groupKey]) reconciled[groupKey] = {};
+                reconciled[groupKey][cm.windowId] = cm.id;
+              }
+              continue;
+            }
+            console.warn(`[tab-harbor] ambiguous chromeTabGroupsMeta for ${groupKey}; skipping auto-bind`);
             continue;
           }
           const match = matches[0];
@@ -222,9 +296,16 @@
       .sort((a, b) => a.index - b.index);
     if (!currentTabs.length) return;
 
+    // Only move tabs that are actually in the target group. Callers may pass a
+    // superset (e.g. after a partial group failure); moving absent ids would
+    // drag ungrouped tabs into the group's strip area (C15).
+    const currentSet = new Set(currentTabs.map(tab => String(tab.id)));
+    const idsToMove = desiredIds.filter(id => currentSet.has(String(id)));
+    if (idsToMove.length <= 1) return;
+
     const currentOrder = currentTabs.map(tab => tab.id);
-    if (currentOrder.length === desiredIds.length &&
-        currentOrder.every((tabId, index) => tabId === desiredIds[index])) {
+    if (idsToMove.length === currentOrder.length &&
+        currentOrder.every((tabId, index) => tabId === idsToMove[index])) {
       return;
     }
 
@@ -238,7 +319,7 @@
       console.warn('[tab-harbor] reorderGroupedTabs: no usable windowId, skipping reorder');
       return;
     }
-    for (const [offset, tabId] of desiredIds.entries()) {
+    for (const [offset, tabId] of idsToMove.entries()) {
       try {
         await chrome.tabs.move(tabId, { windowId: effectiveWindowId, index: baseIndex + offset });
       } catch (err) {
@@ -293,6 +374,7 @@
    */
   async function queryUserChromeGroups(windowId) {
     if (!isChromeApiAvailable()) return [];
+    let hadPartialFailure = false;
     try {
       const groups = await chrome.tabGroups.query({});
       const managed = getManagedChromeGroupIds();
@@ -300,7 +382,18 @@
       const result = [];
       for (const group of inWindow) {
         if (managed.has(group.id)) continue;
-        const tabs = await chrome.tabs.query({ groupId: group.id }).catch(() => []);
+        let tabs = [];
+        try {
+          tabs = await chrome.tabs.query({ groupId: group.id });
+        } catch (err) {
+          // C6: a single group's tab query failing must not be silently
+          // treated as "this group is empty"; keep the diagnostic so the
+          // dashboard can distinguish API failure from genuinely no groups.
+          hadPartialFailure = true;
+          chromeGroupsLastError = err?.message || String(err || 'queryUserChromeGroups tabs.query failed');
+          console.warn(`[tab-harbor] queryUserChromeGroups: tabs.query failed for group ${group.id}:`, err);
+          continue;
+        }
         if (!tabs.length) continue;
         const positions = tabs.map(t => t.index).filter(Number.isFinite);
         result.push({
@@ -313,7 +406,7 @@
           tabIds: tabs.map(t => t.id).filter(id => id != null),
         });
       }
-      chromeGroupsLastError = '';
+      if (!hadPartialFailure) chromeGroupsLastError = '';
       return result.sort((a, b) => a.minIndex - b.minIndex);
     } catch (err) {
       // Never silently pretend there are no user groups: keep a diagnostic and
@@ -336,6 +429,7 @@
     if (!isChromeApiAvailable()) return;
 
     // Build desired state: { groupKey: { windowId: [tabIds] } }
+    const managedGroupIds = getManagedChromeGroupIds();
     const desired = {};
     for (const group of domainGroups) {
       const groupKey = group.domain;
@@ -345,6 +439,12 @@
       if (groupKey.startsWith('__session_group__:') || groupKey.startsWith('__chrome_group__:')) continue;
       for (const tab of (group.tabs || [])) {
         if (tab.id == null) continue;
+        // C7 safety net: tabs that the live snapshot reports as already inside
+        // an UNMANAGED native Chrome group must never be pushed into a
+        // dashboard mirror, even if queryUserChromeGroups failed and the card
+        // was not built. Tabs inside dashboard-managed mirror groups stay in
+        // desired so sync can continue managing those mirrors.
+        if (Number.isInteger(tab.groupId) && tab.groupId >= 0 && !managedGroupIds.has(tab.groupId)) continue;
         const windowId = tab.windowId != null ? tab.windowId : 0;
         if (!desired[groupKey]) desired[groupKey] = {};
         if (!desired[groupKey][windowId]) desired[groupKey][windowId] = [];
@@ -424,6 +524,16 @@
           // In import mode, only reuse existing groups — don't create new ones
           if (importMode) continue;
 
+          // C4 follow-up: creating a mirror whose title+color fingerprint
+          // already exists in this window (a user-created group, or the residue
+          // of an earlier ambiguous fingerprint) would keep the identity
+          // ambiguous and churn a new mirror on every load. Pick a
+          // non-colliding color so the new mirror gets a unique fingerprint.
+          let creationColor = groupColor;
+          if (!isGroupIdentityFree(title, groupColor, windowId, currentGroups)) {
+            creationColor = pickUncollidingGroupColor(title, groupColor, windowId, currentGroups);
+          }
+
           // Create new group
           try {
             chromeGroupId = await chrome.tabs.group({ tabIds });
@@ -442,7 +552,7 @@
 
           if (chromeGroupId != null) {
             try {
-              await chrome.tabGroups.update(chromeGroupId, { title, color: groupColor, collapsed: true });
+              await chrome.tabGroups.update(chromeGroupId, { title, color: creationColor, collapsed: true });
             } catch {}
           }
         } else {
@@ -612,6 +722,9 @@
     STORAGE_KEY,
     assignGroupColor,
     getGroupTitle,
+    isGroupIdentityFree,
+    pickUncollidingGroupColor,
+    currentMappingCandidates,
   };
 
   if (typeof module !== 'undefined' && module.exports) {

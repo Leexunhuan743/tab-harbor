@@ -592,6 +592,8 @@ test('theme menu styles and custom background layer are defined', () => {
   assert.match(css, /\.drawer-title-btn\.is-active,\s*\.drawer-title-btn\[aria-selected="true"\]\s*\{[\s\S]*text-decoration-color:\s*var\(--drawer-tab-underline-active\);/);
   assert.match(css, /\.archive-clear-btn\s*\{[\s\S]*color:\s*var\(--workspace-chip-text\);/);
   assert.match(css, /\.todo-detail-card\s*\{[\s\S]*background:\s*color-mix\(\s*in\s+srgb,\s*var\(--card-bg\)\s+96%,\s*var\(--paper\)\s+4%\s*\);/);
+  // Image handling anchors: the compress path is kept and the legacy
+  // readFileAsDataUrl path must stay gone.
   assert.match(appJs, /compressImageFileForStorage/);
   assert.doesNotMatch(appJs, /readFileAsDataUrl/);
   assert.match(html, /<script src="background-image\.js"><\/script>/);
@@ -1255,7 +1257,11 @@ test('popup scrolls inside panels only, never the document', () => {
   assert.match(popupJs, /popup-tab-close-btn\.is-loading'\)\) return;/);
   // Deduplicating tabs re-renders the open-tabs area immediately instead of
   // leaving stale duplicate chips until the next event-driven refresh.
-  assert.match(runtimeJs, /if \(action === 'dedup-keep-one'\) \{[\s\S]*await closeDuplicatesByUrls\(urls, \{ keepOne: true, playSound: false \}\);\s*playCloseSound\(\);[\s\S]*await renderDashboard\(\);/);
+  // Chrome-group cards dedup within their own tab set (C12); regular cards
+  // keep the URL-wide path. Each branch gets its own assertion — a single
+  // alternation would also match a version that dropped the C12 scoping.
+  assert.match(runtimeJs, /if \(action === 'dedup-keep-one'\) \{[\s\S]*await closeDuplicatesInSelection\(chromeTabIds, \{ playSound: false \}\)[\s\S]*playCloseSound\(\);[\s\S]*await renderDashboard\(\);/);
+  assert.match(runtimeJs, /if \(action === 'dedup-keep-one'\) \{[\s\S]*await closeDuplicatesByUrls\(urls, \{ keepOne: true, playSound: false \}\)[\s\S]*playCloseSound\(\);[\s\S]*await renderDashboard\(\);/);
   // Cards can merge all their tabs into one native Chrome tab group; the
   // section header reuses the action with scope="all" to group every card.
   assert.match(runtimeJs, /data-action="group-card-tabs" data-domain-id="\$\{stableId\}"/);
