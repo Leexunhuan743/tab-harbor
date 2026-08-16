@@ -2494,7 +2494,7 @@ body.page-chip-list-dragging .page-chip.is-selected:not(.is-dragging) {
 }
 
 .workspace-page-switch-btn {
-    min-height: 24px;
+    min-height: 28px;
     padding: 0;
     border: none;
     border-radius: 0;
@@ -2502,7 +2502,7 @@ body.page-chip-list-dragging .page-chip.is-selected:not(.is-dragging) {
     color: color-mix(in srgb, var(--muted) 82%, var(--ink) 18%);
     cursor: pointer;
     font-family: "Public Sans", sans-serif;
-    font-size: var(--ui-font-12);
+    font-size: var(--ui-font-14);
     font-weight: 600;
     transition:
         color 0.15s ease,
