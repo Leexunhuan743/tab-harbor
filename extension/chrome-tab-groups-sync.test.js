@@ -91,6 +91,19 @@ const {
   currentMappingCandidates,
 } = globalThis.TabOutChromeTabGroups;
 
+// Stub chrome.tabGroups.query with REAL semantics: when queryInfo.windowId is
+// given, only groups of that window are returned (the implementation relies on
+// this filtering after the windowId-parameter migration).
+function stubTabGroupsQuery(groups) {
+  globalThis.chrome.tabGroups.query = async (opts) => {
+    let all = typeof groups === 'function' ? groups() : groups;
+    if (opts && opts.windowId != null) {
+      all = all.filter(g => Number(g.windowId) === Number(opts.windowId));
+    }
+    return all;
+  };
+}
+
 test('assignGroupColor returns blue for session groups', () => {
   assert.equal(assignGroupColor('__session_group__:g1', 0), 'blue');
   assert.equal(assignGroupColor('__session_group__:g2', 5), 'blue');
@@ -651,12 +664,12 @@ test('queryUserChromeGroups returns unmanaged groups with strip positions, sorte
   populateChromeGroupMap([
     { virtualGroupKey: 'github.com', windowId: 1, chromeGroupId: 101 },
   ]);
-  globalThis.chrome.tabGroups.query = async () => [
+  stubTabGroupsQuery([
     { id: 101, title: 'GitHub', color: 'grey', windowId: 1 },
     { id: 202, title: 'Work', color: 'blue', windowId: 1 },
     { id: 303, title: 'Research', color: 'red', windowId: 1 },
     { id: 404, title: 'Other window', color: 'green', windowId: 2 },
-  ];
+  ]);
   globalThis.chrome.tabs.query = async (opts) => {
     if (opts?.groupId === 101) return [{ id: 10, index: 0 }];
     if (opts?.groupId === 202) return [{ id: 21, index: 4 }, { id: 22, index: 5 }];
@@ -692,10 +705,10 @@ test('queryUserChromeGroups keeps other groups when one group query partially fa
   // must not drag the whole result down to "no groups", nor be cleared like a
   // clean success — the diagnostic stays so the dashboard can tell part-failed
   // from "really no groups".
-  globalThis.chrome.tabGroups.query = async () => [
+  stubTabGroupsQuery([
     { id: 202, title: 'Work', color: 'blue', windowId: 1 },
     { id: 303, title: 'Research', color: 'red', windowId: 1 },
-  ];
+  ]);
   globalThis.chrome.tabs.query = async (opts) => {
     if (opts?.groupId === 202) throw new Error('transient query failure');
     if (opts?.groupId === 303) return [{ id: 31, index: 2 }];
@@ -1016,11 +1029,11 @@ test('syncChromeTabGroupExpansionForTab expands target group and collapses sibli
   ]);
 
   const updateCalls = [];
-  globalThis.chrome.tabGroups.query = async () => [
+  stubTabGroupsQuery([
     { id: 101, windowId: 1, collapsed: true },
     { id: 102, windowId: 1, collapsed: false },
     { id: 103, windowId: 2, collapsed: false },
-  ];
+  ]);
   globalThis.chrome.tabGroups.update = async (id, opts) => {
     updateCalls.push({ id, ...opts });
   };
@@ -1045,10 +1058,10 @@ test('syncChromeTabGroupExpansionForTab leaves user-created groups untouched', a
   ]);
 
   const updateCalls = [];
-  globalThis.chrome.tabGroups.query = async () => [
+  stubTabGroupsQuery([
     { id: 101, windowId: 1, collapsed: false },
     { id: 102, windowId: 1, collapsed: false },
-  ];
+  ]);
   globalThis.chrome.tabGroups.update = async (id, opts) => {
     updateCalls.push({ id, ...opts });
   };
@@ -1065,10 +1078,10 @@ test('syncChromeTabGroupExpansionForTab skips work when Chrome sync is disabled'
   await saveChromeTabGroupsSetting(false);
 
   let queryCount = 0;
-  globalThis.chrome.tabGroups.query = async () => {
+  stubTabGroupsQuery(() => {
     queryCount++;
     return [];
-  };
+  });
 
   await syncChromeTabGroupExpansionForTab({ groupId: 101, windowId: 1 });
 
@@ -1085,13 +1098,13 @@ test('collapseChromeTabGroupsInWindow collapses only dashboard-managed groups in
   ]);
 
   const updateCalls = [];
-  globalThis.chrome.tabGroups.query = async () => [
+  stubTabGroupsQuery([
     { id: 101, windowId: 1, collapsed: false },
     // User group in the same window and expanded: removing the managed filter
     // would collapse it too, so this mock is what makes the guard visible.
     { id: 102, windowId: 1, collapsed: false },
     { id: 103, windowId: 2, collapsed: false },
-  ];
+  ]);
   globalThis.chrome.tabGroups.update = async (id, opts) => {
     updateCalls.push({ id, ...opts });
   };

@@ -376,11 +376,15 @@
     if (!isChromeApiAvailable()) return [];
     let hadPartialFailure = false;
     try {
-      const groups = await chrome.tabGroups.query({});
+      // Let the API filter by window (windowId is always a real window id from
+      // getDashboardWindowIdForOpenTabs); fall back to an unfiltered query only
+      // for a defensive non-finite id.
+      const groups = Number.isFinite(Number(windowId))
+        ? await chrome.tabGroups.query({ windowId: Number(windowId) })
+        : await chrome.tabGroups.query({});
       const managed = getManagedChromeGroupIds();
-      const inWindow = groups.filter(g => Number(g.windowId) === Number(windowId));
       const result = [];
-      for (const group of inWindow) {
+      for (const group of groups) {
         if (managed.has(group.id)) continue;
         let tabs = [];
         try {
@@ -452,7 +456,9 @@
       }
     }
 
-    // Collect current Chrome tab groups to check existence
+    // Collect current Chrome tab groups to check existence. Full-window query
+    // on purpose: this sync manages mirrors across every window represented in
+    // `desired` and also cleans stale mappings in other windows.
     let currentGroups = [];
     try {
       currentGroups = await chrome.tabGroups.query({});
@@ -622,7 +628,7 @@
 
     let groups = [];
     try {
-      groups = await chrome.tabGroups.query({});
+      groups = await chrome.tabGroups.query({ windowId: targetWindowId });
     } catch {
       return;
     }
@@ -632,9 +638,7 @@
     // Tab Harbor new-tab page gains focus, and must not fight the user's own
     // group layout.
     const managed = getManagedChromeGroupIds();
-    const groupsInWindow = groups.filter(group =>
-      Number(group?.windowId) === targetWindowId && managed.has(group.id)
-    );
+    const groupsInWindow = groups.filter(group => managed.has(group.id));
     muteChromeGroupEvents();
 
     for (const group of groupsInWindow) {
@@ -655,7 +659,7 @@
 
     let groups = [];
     try {
-      groups = await chrome.tabGroups.query({});
+      groups = await chrome.tabGroups.query({ windowId: targetWindowId });
     } catch {
       return;
     }
@@ -665,9 +669,7 @@
     // user group, leave every group untouched.
     const managed = getManagedChromeGroupIds();
     if (!managed.has(targetGroupId)) return;
-    const groupsInWindow = groups.filter(group =>
-      Number(group?.windowId) === targetWindowId && managed.has(group.id)
-    );
+    const groupsInWindow = groups.filter(group => managed.has(group.id));
     muteChromeGroupEvents();
 
     for (const group of groupsInWindow) {
