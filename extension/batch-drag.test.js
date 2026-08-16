@@ -1150,3 +1150,82 @@ test('ensureWindowsKeepLastTab never empties a window (real implementation)', ()
   // A single-tab window whose only tab is in the close set is protected.
   assert.deepEqual(fn([{ id: 9, windowId: 9, active: false }], [9]), []);
 });
+
+// ---------------------------------------------------------------------------
+// Behavioral: restore-created tabs start ASLEEP (discard-on-restore)
+// ---------------------------------------------------------------------------
+
+test('openSavedTabsInCurrentWindow discards every background tab but keeps the first active one loaded', async () => {
+  const fn = new Function(`
+    ${extractFn(runtimeJs, 'discardTab')}
+    ${extractFn(runtimeJs, 'openSavedTabsInCurrentWindow')}
+    return openSavedTabsInCurrentWindow;
+  `)();
+
+  const discarded = [];
+  globalThis.getCurrentWindowId = async () => 501;
+  globalThis.chrome = {
+    windows: { getCurrent: async () => ({ id: 501 }) },
+    tabs: {
+      create: async (opts) => ({
+        id: opts.url === 'https://a.test' ? 1001 : opts.url === 'https://b.test' ? 1002 : 1003,
+        url: opts.url,
+        active: !!opts.active,
+        windowId: opts.windowId ?? 501,
+      }),
+      discard: async (id) => { discarded.push(Number(id)); },
+      query: async () => [],
+    },
+  };
+
+  const result = await fn([
+    { url: 'https://a.test' },
+    { url: 'https://b.test' },
+    { url: 'https://c.test' },
+  ]);
+
+  // The first tab is created active and must NOT be discarded; the two
+  // background tabs are discarded right after creation (restored tabs start
+  // asleep so a large session does not load every page at once).
+  assert.deepEqual(discarded, [1002, 1003]);
+  // The restored id list is unaffected by the discards.
+  assert.deepEqual(result.restoredTabs.map(t => t.id), [1001, 1002, 1003]);
+  delete globalThis.getCurrentWindowId;
+  delete globalThis.chrome;
+});
+
+test('openSavedTabsInNewWindow discards every background tab of the restored session', async () => {
+  const fn = new Function(`
+    ${extractFn(runtimeJs, 'discardTab')}
+    ${extractFn(runtimeJs, 'openSavedTabsInNewWindow')}
+    return openSavedTabsInNewWindow;
+  `)();
+
+  const discarded = [];
+  globalThis.chrome = {
+    windows: {
+      create: async (opts) => ({ id: 502, tabs: [{ id: 2001, url: opts.url, active: true }] }),
+    },
+    tabs: {
+      create: async (opts) => ({
+        id: opts.url === 'https://a.test' ? 2001 : opts.url === 'https://b.test' ? 2002 : 2003,
+        url: opts.url,
+        active: !!opts.active,
+        windowId: opts.windowId ?? 502,
+      }),
+      discard: async (id) => { discarded.push(Number(id)); },
+      query: async () => [],
+    },
+  };
+
+  const result = await fn([
+    { url: 'https://a.test' },
+    { url: 'https://b.test' },
+    { url: 'https://c.test' },
+  ]);
+
+  // The first tab comes from windows.create (active) and is never discarded.
+  assert.deepEqual(discarded, [2002, 2003]);
+  assert.deepEqual(result.restoredTabs.map(t => t.id), [2001, 2002, 2003]);
+  delete globalThis.chrome;
+});

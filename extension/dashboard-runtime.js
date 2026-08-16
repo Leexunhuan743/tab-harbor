@@ -2052,6 +2052,14 @@ async function openSavedTabsInCurrentWindow(tabs = []) {
       url: tab.url,
       active: false,
     });
+    // Restored tabs start ASLEEP: tabs.create loads the URL immediately, which
+    // spikes CPU/memory when a session holds many tabs. Discard right after
+    // creation — the tab keeps its URL and Chrome reloads it on activation.
+    // Fire-and-forget: discardTab catches its own failures and the restored id
+    // list below is unaffected (discard keeps the tab id and group).
+    if (createdTab?.id != null) {
+      discardTab(Number(createdTab.id));
+    }
     restoredTabs.push({
       id: createdTab.id,
       url: tab.url,
@@ -2093,6 +2101,14 @@ async function openSavedTabsInNewWindow(tabs = []) {
       url: tab.url,
       active: false,
     });
+    // Restored tabs start ASLEEP: tabs.create loads the URL immediately, which
+    // spikes CPU/memory when a session holds many tabs. Discard right after
+    // creation — the tab keeps its URL and Chrome reloads it on activation.
+    // Fire-and-forget: discardTab catches its own failures and the restored id
+    // list below is unaffected (discard keeps the tab id and group).
+    if (createdTab?.id != null) {
+      discardTab(Number(createdTab.id));
+    }
     restoredTabs.push({
       id: createdTab.id,
       url: tab.url,
@@ -2125,26 +2141,34 @@ async function restoreSavedTabSession(sessionId) {
   }
 
   const restoreMode = runtimeGetSavedSessionRestoreMode ? runtimeGetSavedSessionRestoreMode() : 'new-window';
-  const { restoredTabs, windowId } = restoreMode === 'current-window'
-    ? await openSavedTabsInCurrentWindow(session.tabs)
-    : await openSavedTabsInNewWindow(session.tabs);
 
-  const { state: nextSessionGroups, chromeGroupPlans } = runtimeCreateRestoredSessionGroups({
-    existingState: sessionGroupsState,
-    session,
-    restoredTabs,
-    now: new Date().toISOString(),
+  // Run under the refresh-suppression window: the burst of tabs.create and the
+  // deferred discard events echo back as tabs-changed → debounced renderDashboard
+  // calls. The restore already renders explicitly below, so suppressing that
+  // echo avoids a redundant post-restore refresh. The explicit renderDashboard
+  // call is unaffected — suppression only gates the event-driven refresh path.
+  return runWithSuppressedRefresh(async () => {
+    const { restoredTabs, windowId } = restoreMode === 'current-window'
+      ? await openSavedTabsInCurrentWindow(session.tabs)
+      : await openSavedTabsInNewWindow(session.tabs);
+
+    const { state: nextSessionGroups, chromeGroupPlans } = runtimeCreateRestoredSessionGroups({
+      existingState: sessionGroupsState,
+      session,
+      restoredTabs,
+      now: new Date().toISOString(),
+    });
+    // Re-create native Chrome groups that were saved with the session: fresh
+    // groups with the recorded title/color, tabs in the recorded order.
+    await restoreChromeGroupsForSession(chromeGroupPlans, windowId);
+    await saveSessionGroups(nextSessionGroups);
+    await renderDashboard();
+
+    return {
+      restoredCount: restoredTabs.length,
+      windowId,
+    };
   });
-  // Re-create native Chrome groups that were saved with the session: fresh
-  // groups with the recorded title/color, tabs in the recorded order.
-  await restoreChromeGroupsForSession(chromeGroupPlans, windowId);
-  await saveSessionGroups(nextSessionGroups);
-  await renderDashboard();
-
-  return {
-    restoredCount: restoredTabs.length,
-    windowId,
-  };
 }
 
 /**
