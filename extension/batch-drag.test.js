@@ -445,8 +445,12 @@ test('user-created Chrome groups become first-class cards; their tabs leave doma
   assert.match(runtimeJs, /isChromeGroup: true,/);
   assert.match(runtimeJs, /chromeGroupId: group\.id,/);
   assert.match(runtimeJs, /if \(chromeCards\.length > 0\) \{\s*domainGroups = \[\.\.\.chromeCards, \.\.\.applyGroupOrder\(\[\.\.\.manualGroups, \.\.\.automaticGroups\], groupOrderState\)\];/);
-  // Native groups are recognized live; the import pipeline is retired.
-  assert.match(runtimeJs, /function shouldImportChromeGroupsIntoSessionState\(\) \{[\s\S]{0,400}return false;/);
+  // Native groups are recognized live; the import pipeline is retired. The
+  // function must ALWAYS return false — a conditional false (e.g. flag-gated)
+  // would re-enable the retired pipeline, so the unconditional form is the
+  // behavioral anchor.
+  assert.match(runtimeJs, /function shouldImportChromeGroupsIntoSessionState\(\) \{[\s\S]{0,400}return false;\s*\}/);
+  assert.doesNotMatch(runtimeJs, /function shouldImportChromeGroupsIntoSessionState\(\) \{[\s\S]{0,400}return true/);
 });
 
 test('dragging into a Chrome group card joins the native group; dragging out ungroups', () => {
@@ -552,11 +556,12 @@ test('chrome group cards tint their name and row drag handles with the native co
   // No separate top bar: the group color lives on the card name and the tab
   // rows' drag handles (hover/focus keep the same tint).
   assert.doesNotMatch(css, /\.mission-card\.chrome-group-card::before/);
-  // The NAME mixes the group color toward --ink (readable text, AA contrast);
-  // the drag handles keep the pure group color (graphical icons). Hover/focus
-  // step up to the 55% mix so keyboard focus keeps a visible feedback.
-  assert.match(css, /\.mission-card\.chrome-group-card \.mission-name \{\s*color:\s*color-mix\(in srgb, var\(--chrome-group-color, var\(--ink\)\) 35%, var\(--ink\)\);/);
-  assert.match(css, /\.mission-card\.chrome-group-card \.mission-rename-trigger:hover \.mission-name,[\s\S]{0,400}color:\s*color-mix\(in srgb, var\(--chrome-group-color, var\(--ink\)\) 55%, var\(--ink\)\);/);
+  // The NAME uses the pure native group color so it visually matches the
+  // group chip in the browser tab strip; hover/focus feedback is an underline
+  // (keyboard focus stays visible without relying on color contrast). The
+  // drag handles keep the pure group color too.
+  assert.match(css, /\.mission-card\.chrome-group-card \.mission-name \{\s*color:\s*var\(--chrome-group-color, var\(--ink\)\);/);
+  assert.match(css, /\.mission-card\.chrome-group-card \.mission-rename-trigger:hover \.mission-name,[\s\S]{0,400}text-decoration:\s*underline;/);
   assert.match(css, /\.mission-card\.chrome-group-card \.chip-reorder-handle \{\s*color:\s*var\(--chrome-group-color,/);
   assert.match(css, /\.mission-card\.chrome-group-card \.chip-reorder-handle:hover,[\s\S]{0,300}color:\s*color-mix\(in srgb, var\(--chrome-group-color, var\(--ink\)\) 55%, var\(--ink\)\);/);
   // The tint is exposed on the handle as a CSS variable (not an inline color)
@@ -1049,4 +1054,99 @@ test('chrome-group query failure gates the toast and the snapshot fallback (C6/C
   // successful query a lagging snapshot must never hide tabs that already
   // left a user group from every card.
   assert.match(runtimeJs, /const chromeGroupsQueryFailed = typeof getChromeGroupsLastError === 'function' && Boolean\(getChromeGroupsLastError\(\)\);[\s\S]{0,60}if \(chromeGroupsQueryFailed\) \{/);
+});
+
+// ---------------------------------------------------------------------------
+// Audit follow-up (2026-08): behavioral tests for the unified close/dedup
+// helpers — the URL-matching branches and the keep-one selection were only
+// mirrored by regex assertions before.
+// ---------------------------------------------------------------------------
+
+test('closeTabsByUrlsSafely matches hostnames, exact URLs and file:// exactly', async () => {
+  const fn = new Function(`${extractFn(runtimeJs, 'closeTabsByUrlsSafely')}\nreturn closeTabsByUrlsSafely;`)();
+  let captured = null;
+  globalThis.runtimeGetCanonicalTabUrl = (url) => url;
+  globalThis.getTabCanonicalUrl = (tab) => String(tab?.url || '');
+  globalThis.queryTabsForDashboardWindow = async () => [
+    { id: 1, windowId: 1, url: 'https://example.com/a' },
+    { id: 2, windowId: 1, url: 'https://example.com/b' },
+    { id: 3, windowId: 1, url: 'https://other.org/x' },
+    { id: 4, windowId: 1, url: 'file:///tmp/note.md' },
+    { id: 5, windowId: 1, url: 'https://sub.example.com/c' },
+  ];
+  globalThis.closeTabsSafely = async (ids) => {
+    captured = ids;
+    return { closedCount: ids.length, closedTabIds: new Set(ids) };
+  };
+
+  // Hostname match is exact (no subdomain folding): example.com covers the
+  // two example.com tabs; the subdomain and other hosts stay.
+  await fn(['https://example.com/'], { exact: false, playSound: false });
+  assert.deepEqual(captured.sort(), [1, 2]);
+  // Exact match: only the identical URL.
+  captured = null;
+  await fn(['https://example.com/a'], { exact: true, playSound: false });
+  assert.deepEqual(captured, [1]);
+  // file:// URLs are always matched exactly, never by hostname.
+  captured = null;
+  await fn(['file:///tmp/note.md'], { exact: false, playSound: false });
+  assert.deepEqual(captured, [4]);
+  // Unparseable input URLs are skipped, nothing closes.
+  captured = null;
+  await fn(['not a url'], { exact: false, playSound: false });
+  assert.deepEqual(captured, []);
+
+  delete globalThis.runtimeGetCanonicalTabUrl;
+  delete globalThis.getTabCanonicalUrl;
+  delete globalThis.queryTabsForDashboardWindow;
+  delete globalThis.closeTabsSafely;
+});
+
+test('closeDuplicatesByUrls keeps the active copy when keepOne is set', async () => {
+  const fn = new Function(`${extractFn(runtimeJs, 'closeDuplicatesByUrls')}\nreturn closeDuplicatesByUrls;`)();
+  let captured = null;
+  globalThis.runtimeGetCanonicalTabUrl = (url) => url;
+  globalThis.getTabCanonicalUrl = (tab) => String(tab?.url || '');
+  globalThis.queryTabsForDashboardWindow = async () => [
+    { id: 1, windowId: 1, url: 'https://example.com/x', active: false },
+    { id: 2, windowId: 1, url: 'https://example.com/x', active: true },
+    { id: 3, windowId: 1, url: 'https://example.com/y', active: false },
+  ];
+  globalThis.closeTabsSafely = async (ids) => {
+    captured = ids;
+    return { closedCount: ids.length, closedTabIds: new Set(ids) };
+  };
+
+  // keepOne: the active copy (2) survives.
+  await fn(['https://example.com/x'], { keepOne: true, playSound: false });
+  assert.deepEqual(captured, [1]);
+  // keepOne=false: every copy closes.
+  captured = null;
+  await fn(['https://example.com/x'], { keepOne: false, playSound: false });
+  assert.deepEqual(captured.sort(), [1, 2]);
+  // No matches → nothing closes.
+  captured = null;
+  await fn(['https://nowhere.example'], { keepOne: true, playSound: false });
+  assert.deepEqual(captured, []);
+
+  delete globalThis.runtimeGetCanonicalTabUrl;
+  delete globalThis.getTabCanonicalUrl;
+  delete globalThis.queryTabsForDashboardWindow;
+  delete globalThis.closeTabsSafely;
+});
+
+test('ensureWindowsKeepLastTab never empties a window (real implementation)', () => {
+  const fn = new Function(`${extractFn(runtimeJs, 'ensureWindowsKeepLastTab')}\nreturn ensureWindowsKeepLastTab;`)();
+  const allTabs = [
+    { id: 1, windowId: 7, active: true },
+    { id: 2, windowId: 7, active: false },
+    { id: 3, windowId: 8, active: false },
+  ];
+  // Window 7 would lose both tabs: the active one (1) is kept. Window 8's
+  // only tab (3) is kept too.
+  assert.deepEqual(fn(allTabs, [1, 2, 3]), [2]);
+  // A window with tabs outside the close set is not protected: 1 is closable.
+  assert.deepEqual(fn(allTabs, [1]), [1]);
+  // A single-tab window whose only tab is in the close set is protected.
+  assert.deepEqual(fn([{ id: 9, windowId: 9, active: false }], [9]), []);
 });

@@ -1759,20 +1759,23 @@ body.group-dragging .group-nav-button {
 
 /* User-created Chrome group cards wear their native group color on the card
    name and the tab rows' drag handles — a quiet accent that follows the
-   group's real Chrome color without adding a separate bar. The NAME mixes
-   the group color toward --ink so text stays readable (AA ≥ 4.5:1 for the
-   built-in palette colors on every light theme); the drag handles are
-   graphical icons and keep the pure group color. */
+   group's real Chrome color without adding a separate bar. The NAME uses
+   the pure native group color so it visually matches the group chip in the
+   browser tab strip (light palettes may show lower contrast for very light
+   group colors — accepted tradeoff for visual consistency). Hover/focus
+   feedback uses an underline instead of a color shift so keyboard focus
+   stays visible without relying on contrast. The drag handles keep the
+   pure group color too. */
 .mission-card.chrome-group-card .mission-name {
-    color: color-mix(in srgb, var(--chrome-group-color, var(--ink)) 35%, var(--ink));
+    color: var(--chrome-group-color, var(--ink));
 }
 
 .mission-card.chrome-group-card .mission-rename-trigger:hover .mission-name,
 .mission-card.chrome-group-card .mission-rename-trigger:focus-visible .mission-name {
-    /* Hover/focus must be visibly different from the resting mix — step up to
-       the 55% mix (same pattern as the drag handles) so keyboard focus keeps
-       a visible, readable feedback in every theme. */
-    color: color-mix(in srgb, var(--chrome-group-color, var(--ink)) 55%, var(--ink));
+    color: var(--chrome-group-color, var(--ink));
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    text-decoration-thickness: 1.5px;
 }
 
 .mission-card.chrome-group-card .chip-reorder-handle {

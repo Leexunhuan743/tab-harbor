@@ -139,7 +139,7 @@ test('desk settings separates appearance and feature controls', () => {
 });
 
 test('manual sleep control places per-tab moon action first', () => {
-  assert.match(runtimeJs, /function buildPageChipHtml\(tab, group, urlCounts = \{\}, collapsed = false\) \{[\s\S]*<div class="chip-actions">\s*\$\{sleepControlEnabled && !tab\.active && !isPlaceholder \? `<button class="chip-action chip-discard"[\s\S]*<button class="chip-action chip-session-save"/);
+  assert.match(runtimeJs, /function buildPageChipHtml\(tab, group, urlCounts = \{\}, collapsed = false\) \{[\s\S]*<div class="chip-actions">\s*\$\{sleepControlEnabled && !tab\.active && !tab\.discarded && !isPlaceholder \? `<button class="chip-action chip-discard"[\s\S]*<button class="chip-action chip-session-save"/);
   assert.match(runtimeJs, /const pageChips = orderedTabs\.map\(\(tab, index\) => buildPageChipHtml\(tab, group, urlCounts, index >= 8 && !isOverflowExpanded\)\)\.join\(''\)[\s\S]*buildOverflowChips\(extraCount\)/);
 });
 
@@ -1395,6 +1395,10 @@ test('discard tab supports per-chip, group-level, and global sleep-all with gate
   assert.match(runtimeJs, /data-action="sleep-all-open-tabs"/);
   assert.match(runtimeJs, /page-chip--discarded/);
   assert.match(runtimeJs, /if \(action === 'discard-tab'\)\s*\{[\s\S]*await fetchOpenTabs\(\);[\s\S]*await renderDashboard\(\);/);
+  // Group/global sleep skip already-discarded tabs, so "nothing left to
+  // sleep" is a silent no-op instead of a misleading failure toast.
+  assert.match(runtimeJs, /getOrderedUniqueTabsForGroup\(group\)\.filter\(t => !t\.active && !t\.discarded\)/);
+  assert.match(runtimeJs, /getRealTabs\(\)\.filter\(t => !t\.active && !t\.discarded\)/);
   assert.match(runtimeJs, /if \(action === 'sleep-domain-tabs'\)\s*\{[\s\S]*await fetchOpenTabs\(\);[\s\S]*await renderDashboard\(\);/);
   // The section-header sleep-all uses its own "all tabs" label; the per-group
   // card keeps the "in group" label.
@@ -1403,6 +1407,10 @@ test('discard tab supports per-chip, group-level, and global sleep-all with gate
   const i18nJs = fs.readFileSync(path.join(__dirname, 'i18n.js'), 'utf8');
   assert.match(i18nJs, /sleepAllOpenTabsButton: 'Sleep all tabs'/);
   assert.match(i18nJs, /sleepAllOpenTabsButton: '休眠全部标签页'/);
+  // Both keys must stay distinct with their own wording — collapsing them to
+  // a shared string would silently rename one of the two buttons.
+  assert.match(i18nJs, /sleepAllTabsButton: 'Sleep all tabs in group'/);
+  assert.match(i18nJs, /sleepAllTabsButton: '休眠组内全部标签页'/);
 
   const css = fs.readFileSync(path.join(__dirname, 'style.css'), 'utf8');
   assert.match(css, /\.chip-discard:hover\s*\{[\s\S]*color:\s*var\(--muted\);/);

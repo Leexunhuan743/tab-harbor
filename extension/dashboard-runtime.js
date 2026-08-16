@@ -3216,32 +3216,6 @@ function ensureWindowsKeepLastTab(allTabs, toCloseIds) {
 }
 
 /**
- * closeTabsByUrls(urls)
- *
- * Closes all open tabs whose hostname matches any of the given URLs.
- * After closing, re-fetches the tab list to keep our state accurate.
- *
- * Special case: file:// URLs are matched exactly (they have no hostname).
- */
-async function closeTabsByUrls(urls) {
-  const result = await closeTabsByUrlsSafely(urls, { exact: false, playSound: false });
-  await refreshTabData();
-  return result;
-}
-
-/**
- * closeTabsExact(urls)
- *
- * Closes tabs by exact URL match (not hostname). Used for landing pages
- * so closing "Gmail inbox" doesn't also close individual email threads.
- */
-async function closeTabsExact(urls) {
-  const result = await closeTabsByUrlsSafely(urls, { exact: true, playSound: false });
-  await refreshTabData();
-  return result;
-}
-
-/**
  * focusTab(url, tabId = null)
  *
  * Switches Chrome to a tab: a numeric tabId wins, otherwise the URL is
@@ -3365,19 +3339,6 @@ async function runDefaultSearch(query) {
 }
 
 /**
- * closeDuplicateTabs(urls, keepOne)
- *
- * Closes duplicate tabs for the given list of URLs.
- * keepOne=true → keep one copy of each, close the rest.
- * keepOne=false → close all copies.
- */
-async function closeDuplicateTabs(urls, keepOne = true) {
-  const result = await closeDuplicatesByUrls(urls, { keepOne, playSound: false });
-  await refreshTabData();
-  return result;
-}
-
-/**
  * groupTabsWithStaleRetry(tabIds)
  *
  * chrome.tabs.group fails atomically when any id is invalid (a tab closed or
@@ -3451,6 +3412,9 @@ async function ungroupTabsWithStaleRetry(tabIds) {
  * closeTabOutDupes()
  *
  * Closes all duplicate Tab Harbor new-tab pages except the current one.
+ * The close itself goes through closeTabsSafely so the shared
+ * window-last-tab protection applies: a window whose ONLY tab would be
+ * closed keeps it instead of closing the window.
  */
 async function closeTabOutDupes() {
   const newtabUrl = window.location.href;
@@ -3470,7 +3434,7 @@ async function closeTabOutDupes() {
     tabOutTabs.find(t => t.active) ||
     tabOutTabs[0];
   const toClose = tabOutTabs.filter(t => t.id !== keep.id).map(t => t.id);
-  if (toClose.length > 0) await chrome.tabs.remove(toClose);
+  if (toClose.length > 0) await closeTabsSafely(toClose, { playSound: false });
   await fetchOpenTabs();
 }
 
@@ -3599,7 +3563,7 @@ function buildPageChipHtml(tab, group, urlCounts = {}, collapsed = false) {
       <span class="chip-favicon chip-favicon-fallback"${faviconUrl ? ' style="display:none"' : ''}>${fallbackLabel}</span>
       <span class="chip-text">${safeLabel}</span>
       <div class="chip-actions">
-        ${sleepControlEnabled && !tab.active && !isPlaceholder ? `<button class="chip-action chip-discard" data-action="discard-tab" data-tab-id="${tab.id}" aria-label="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}" data-tooltip="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}">
+        ${sleepControlEnabled && !tab.active && !tab.discarded && !isPlaceholder ? `<button class="chip-action chip-discard" data-action="discard-tab" data-tab-id="${tab.id}" aria-label="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}" data-tooltip="${runtimeT ? runtimeT('discardTab') : 'Sleep tab'}">
           ${ICONS.moon}
         </button>` : ''}
         ${!isPlaceholder ? `<button class="chip-action chip-session-save" data-action="save-single-tab-session" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" aria-label="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}" data-tooltip="${runtimeT ? runtimeT('saveTabSession') : 'Save tab session'}">
@@ -5066,9 +5030,14 @@ document.addEventListener('click', async (e) => {
         .map(chipId => chipTabIds.get(String(chipId)))
         .filter(tabId => tabId != null);
       const { discarded, failed, skippedActive, stale, resultsByTabId } = await sleepTabsByIds(tabIds, { skipActive: true });
+      // Chips that could not be resolved to a numeric tab id did not take
+      // part in the sleep, so they were not affected — keep them selected.
+      // Chips whose tab was processed stay selected when the tab survived
+      // (stale/failed/skipped-active included); rows that are really gone
+      // are pruned by refreshPageChipSelectionClasses after the render.
       const keptChipIds = [...selectedPageChipIds].filter(chipId => {
         const tabId = chipTabIds.get(String(chipId));
-        return tabId != null && resultsByTabId.has(tabId);
+        return tabId == null || resultsByTabId.has(tabId);
       });
       await finishBatchAction({ keptChipIds });
       if (discarded > 0) {
@@ -5099,10 +5068,12 @@ document.addEventListener('click', async (e) => {
       const { closedCount, closedTabIds } = await closeDuplicatesInSelection(tabIds);
       // Keep the ORIGINAL chip sort ids that survive dedup, so selection is
       // preserved on every card even when a chip id is not a plain tab id.
-      // refreshPageChipSelectionClasses prunes any id that no longer has a row.
+      // Chips without a resolvable numeric tab id did not take part in the
+      // dedup — keep them selected. refreshPageChipSelectionClasses prunes
+      // any id that no longer has a row.
       const keptChipIds = [...selectedPageChipIds].filter(chipId => {
         const tabId = chipTabIds.get(String(chipId));
-        return tabId != null && !closedTabIds.has(tabId);
+        return tabId == null || !closedTabIds.has(tabId);
       });
       await finishBatchAction({ keptChipIds });
       if (closedCount > 0) {
@@ -5285,7 +5256,10 @@ document.addEventListener('click', async (e) => {
     const group = domainGroups.find(g => getStableGroupId(g.domain) === domainId);
     if (!group) return;
 
-    const tabIds = getOrderedUniqueTabsForGroup(group).filter(t => !t.active).map(t => t.id);
+    // Already-discarded rows have no sleep button and cannot be discarded
+    // again; filter them out so "nothing left to sleep" is a silent no-op
+    // instead of a misleading failure toast.
+    const tabIds = getOrderedUniqueTabsForGroup(group).filter(t => !t.active && !t.discarded).map(t => t.id);
     if (!tabIds.length) return;
 
     window.__suppressAutoRefreshUntil = Date.now() + 2000;
@@ -5310,7 +5284,9 @@ document.addEventListener('click', async (e) => {
 
   // ---- Sleep all open tabs ----
   if (action === 'sleep-all-open-tabs') {
-    const tabIds = getRealTabs().filter(t => !t.active).map(t => t.id);
+    // Same as the per-group path: already-discarded tabs are not sleepable
+    // again, so an all-slept window is a silent no-op, not a false failure.
+    const tabIds = getRealTabs().filter(t => !t.active && !t.discarded).map(t => t.id);
     if (!tabIds.length) return;
 
     window.__suppressAutoRefreshUntil = Date.now() + 2000;
