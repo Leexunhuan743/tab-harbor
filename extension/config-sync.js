@@ -59,7 +59,12 @@
       exportedAt: new Date().toISOString(),
     };
     for (const key of STORAGE_KEYS) {
-      config[key] = key in data ? data[key] : null;
+      // chrome.storage.local.get(keys[]) resolves every requested key — unset
+      // keys come back as undefined, not absent. Serialize those as explicit
+      // null so importConfig can reset them to defaults on the target device
+      // (a missing key would be skipped by the importer instead).
+      const value = data[key];
+      config[key] = value === undefined ? null : value;
     }
     return JSON.stringify(config, null, 2);
   }

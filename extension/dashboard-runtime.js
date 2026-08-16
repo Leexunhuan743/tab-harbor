@@ -191,6 +191,11 @@ let pageChipNewGroupSlotEl = null;
 let pageChipAutoScrollRaf = 0;
 let pageChipCommitInFlight = false;
 let batchActionInFlight = false;
+// Card-level (per-domain / section-header) actions run without the batch
+// bar's begin/finish wrapper, so they get their own re-entrancy guard:
+// double-clicks or rapid keyboard activation must not run the same
+// side-effecting action twice (merge would re-create the group).
+let cardActionInFlight = false;
 let tabSessionPickerState = {
   open: false,
   mode: 'new',
@@ -1227,12 +1232,15 @@ async function applyChromeTabGroupsToggle(nextEnabled) {
   if (enable && shouldImportChromeGroupsIntoSessionState()) {
     importedCount = await importChromeNativeGroupsIntoSessionGroups();
   } else if (!enable && typeof reconcileChromeTabGroupImports === 'function') {
+    // The import pipeline is retired: importedChromeGroupMeta entries are
+    // historical records, and the session groups they point to are now
+    // ordinary manual groups the user may still be using. Turning the toggle
+    // off must not delete those groups — only clear the stale metadata.
     const cleared = reconcileChromeTabGroupImports({
       currentState: sessionGroupsState,
       importedMeta: importedChromeGroupMeta,
       nativeGroups: [],
     });
-    await saveSessionGroups(cleared.state);
     await saveImportedChromeGroupMeta(cleared.importedMeta);
   }
 
@@ -1622,6 +1630,7 @@ function getTabGroupLookup(groups = domainGroups) {
       key: String(group?.domain || ''),
       label: getGroupDisplayLabel(group),
       manualGroupId: String(group?.manualGroupId || ''),
+      chromeGroupColor: String(group?.chromeGroupColor || ''),
     };
     for (const tab of Array.isArray(group?.tabs) ? group.tabs : []) {
       if (tab?.id != null) lookup.set(String(tab.id), groupEntry);
@@ -2120,12 +2129,15 @@ async function restoreSavedTabSession(sessionId) {
     ? await openSavedTabsInCurrentWindow(session.tabs)
     : await openSavedTabsInNewWindow(session.tabs);
 
-  const nextSessionGroups = runtimeCreateRestoredSessionGroups({
+  const { state: nextSessionGroups, chromeGroupPlans } = runtimeCreateRestoredSessionGroups({
     existingState: sessionGroupsState,
     session,
     restoredTabs,
     now: new Date().toISOString(),
   });
+  // Re-create native Chrome groups that were saved with the session: fresh
+  // groups with the recorded title/color, tabs in the recorded order.
+  await restoreChromeGroupsForSession(chromeGroupPlans, windowId);
   await saveSessionGroups(nextSessionGroups);
   await renderDashboard();
 
@@ -2133,6 +2145,66 @@ async function restoreSavedTabSession(sessionId) {
     restoredCount: restoredTabs.length,
     windowId,
   };
+}
+
+/**
+ * restoreChromeGroupsForSession(plans, windowId)
+ *
+ * Executes saved-session Chrome-group plans: creates a fresh native Chrome
+ * group per plan (the recorded group id is session-local and cannot be
+ * reused), restores its title/color and orders the tabs as recorded. A
+ * same-title group already in the window gets a " (2)"/" (3)" suffix so the
+ * restored group stays independent instead of merging. Writes are muted so
+ * the dashboard's own group events cannot echo.
+ */
+async function restoreChromeGroupsForSession(plans, windowId) {
+  if (!Array.isArray(plans) || !plans.length) return;
+  let existingTitles = new Set();
+  try {
+    const groups = await chrome.tabGroups.query({});
+    existingTitles = new Set(groups
+      .filter(g => windowId == null || Number(g.windowId) === Number(windowId))
+      .map(g => String(g.title || ''))
+      .filter(Boolean));
+  } catch { /* keep the empty set: creation still proceeds */ }
+
+  for (const plan of plans) {
+    const planTabIds = (Array.isArray(plan?.tabIds) ? plan.tabIds : [])
+      .map(Number)
+      .filter(Number.isFinite);
+    if (!planTabIds.length) continue;
+
+    let title = String(plan?.title || '').trim();
+    // Same-title group already in the window → independent group with a
+    // " (N)" suffix instead of merging into the existing one.
+    if (title && existingTitles.has(title)) {
+      let suffix = 2;
+      let candidate = `${title} (${suffix})`;
+      while (existingTitles.has(candidate)) {
+        suffix += 1;
+        candidate = `${title} (${suffix})`;
+      }
+      title = candidate;
+    }
+    if (title) existingTitles.add(title);
+
+    if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
+    try {
+      const groupId = await chrome.tabs.group({ tabIds: planTabIds });
+      if (groupId == null) continue;
+      await chrome.tabGroups.update(groupId, {
+        title,
+        color: String(plan?.color || 'grey'),
+      });
+      // The tabs were created in recorded order; reorder the native group to
+      // match the saved in-group order exactly.
+      if (typeof reorderGroupedTabs === 'function') {
+        await reorderGroupedTabs(groupId, planTabIds.map(String), windowId);
+      }
+    } catch (err) {
+      console.warn('[tab-harbor] restoreChromeGroupsForSession failed:', err);
+    }
+  }
 }
 
 async function removeOpenTabByIdOrUrl(tabId, tabUrl) {
@@ -3960,6 +4032,8 @@ async function handleConfigImportInput(inputEl) {
     const text = await file.text();
     const result = await configSync.importConfig(text);
     setThemeMenuOpen(false, { restoreFocus: true });
+    // Reset the input so selecting the same file again re-triggers change.
+    inputEl.value = '';
     showToast(runtimeT
       ? runtimeT('toastConfigImported', { keys: result.importedKeys.length })
       : `Imported ${result.importedKeys.length} setting${result.importedKeys.length !== 1 ? 's' : ''}`);
@@ -4964,6 +5038,12 @@ document.addEventListener('click', async (e) => {
     // dangling assignment.
     const { discarded, failed, stale } = await sleepTabsByIds([tabId], { skipActive: false });
     if (stale > 0) {
+      // The chip outlived its tab: prune the dangling assignment right away
+      // (same as the success branch) so the re-render drops both the ghost
+      // row and its stale manual-group entry, even if the background refresh
+      // message is suppressed by the window below.
+      await fetchOpenTabs();
+      await loadSessionGroups(getOpenTabIdsForSessionPruning());
       await renderDashboard();
       updateBackToTopVisibility();
       window.__suppressAutoRefreshUntil = 0;
@@ -4980,6 +5060,7 @@ document.addEventListener('click', async (e) => {
     await fetchOpenTabs();
     await loadSessionGroups(getOpenTabIdsForSessionPruning());
     await renderDashboard();
+    updateBackToTopVisibility();
     window.__suppressAutoRefreshUntil = 0;
 
     showToast(runtimeT ? runtimeT('toastTabDiscarded') : 'Tab sleeping');
@@ -5177,61 +5258,67 @@ document.addEventListener('click', async (e) => {
 
   // ---- Close all tabs in a domain group ----
   if (action === 'close-domain-tabs') {
-    const domainId = actionEl.dataset.domainId;
-    const group    = domainGroups.find(g => {
-      return 'domain-' + g.domain.replace(/[^a-z0-9]/g, '-') === domainId;
-    });
-    if (!group) return;
-
-    // Suppress auto-refresh to prevent animation spam
-    window.__suppressAutoRefreshUntil = Date.now() + 2000;
-
-    const urls      = group.tabs.map(t => t.url);
-    // Landing pages and custom groups (whose domain key isn't a real hostname)
-    // must use exact URL matching to avoid closing unrelated tabs. Chrome-group
-    // cards are scoped by their own tab ids: URL matching would close same-URL
-    // tabs outside the group (C12).
-    const useExact  = group.domain === '__landing-pages__' || !!group.label;
-
-    // Start the card exit immediately so the close feels instant; the tabs
-    // close in the background below (the suppressed refresh syncs the rest).
-    if (card) {
-      playCloseSound();
-      animateCardOut(card);
-    }
-
-    // Remove from in-memory groups
-    const idx = domainGroups.indexOf(group);
-    if (idx !== -1) domainGroups.splice(idx, 1);
-
-    // Close the tabs in the background (the card is already exiting), then
-    // rebuild so the nav and remaining cards reflect the closed group.
-    let closeResult = { closedCount: 0 };
+    if (cardActionInFlight) return;
+    cardActionInFlight = true;
     try {
-      if (group.isChromeGroup) {
-        const tabIds = group.tabs.map(t => Number(t.id)).filter(Number.isFinite);
-        closeResult = await closeTabsSafely(tabIds, { playSound: false });
-      } else {
-        closeResult = await closeTabsByUrlsSafely(urls, { exact: useExact, playSound: false });
+      const domainId = actionEl.dataset.domainId;
+      const group    = domainGroups.find(g => {
+        return 'domain-' + g.domain.replace(/[^a-z0-9]/g, '-') === domainId;
+      });
+      if (!group) return;
+
+      // Suppress auto-refresh to prevent animation spam
+      window.__suppressAutoRefreshUntil = Date.now() + 2000;
+
+      const urls      = group.tabs.map(t => t.url);
+      // Landing pages and custom groups (whose domain key isn't a real hostname)
+      // must use exact URL matching to avoid closing unrelated tabs. Chrome-group
+      // cards are scoped by their own tab ids: URL matching would close same-URL
+      // tabs outside the group (C12).
+      const useExact  = group.domain === '__landing-pages__' || !!group.label;
+
+      // Start the card exit immediately so the close feels instant; the tabs
+      // close in the background below (the suppressed refresh syncs the rest).
+      if (card) {
+        playCloseSound();
+        animateCardOut(card);
       }
-    } catch { /* swallow: tabs may already be gone */ }
-    await renderDashboard();
-    window.__suppressAutoRefreshUntil = 0;
 
-    const closedCount = group.isChromeGroup ? closeResult.closedCount : urls.length;
-    const groupLabel = group.domain === '__landing-pages__'
-      ? (runtimeT ? runtimeT('homepagesLabel') : 'Homepages')
-      : (group.label || friendlyDomain(group.domain));
-    const tabsWord = runtimeT
-      ? (closedCount === 1 ? runtimeT('tabsWordSingular') : runtimeT('tabsWordPlural'))
-      : `tab${closedCount !== 1 ? 's' : ''}`;
-    showToast(runtimeT
-      ? runtimeT('closedTabsFromGroup', { count: closedCount, tabsWord, groupLabel })
-      : `Closed ${closedCount} ${tabsWord} from ${groupLabel}`);
+      // Remove from in-memory groups
+      const idx = domainGroups.indexOf(group);
+      if (idx !== -1) domainGroups.splice(idx, 1);
 
-    const statTabs = document.getElementById('statTabs');
-    if (statTabs) statTabs.textContent = openTabs.length;
-    return;
+      // Close the tabs in the background (the card is already exiting), then
+      // rebuild so the nav and remaining cards reflect the closed group.
+      let closeResult = { closedCount: 0 };
+      try {
+        if (group.isChromeGroup) {
+          const tabIds = group.tabs.map(t => Number(t.id)).filter(Number.isFinite);
+          closeResult = await closeTabsSafely(tabIds, { playSound: false });
+        } else {
+          closeResult = await closeTabsByUrlsSafely(urls, { exact: useExact, playSound: false });
+        }
+      } catch { /* swallow: tabs may already be gone */ }
+      await renderDashboard();
+      window.__suppressAutoRefreshUntil = 0;
+
+      const closedCount = group.isChromeGroup ? closeResult.closedCount : urls.length;
+      const groupLabel = group.domain === '__landing-pages__'
+        ? (runtimeT ? runtimeT('homepagesLabel') : 'Homepages')
+        : (group.label || friendlyDomain(group.domain));
+      const tabsWord = runtimeT
+        ? (closedCount === 1 ? runtimeT('tabsWordSingular') : runtimeT('tabsWordPlural'))
+        : `tab${closedCount !== 1 ? 's' : ''}`;
+      showToast(runtimeT
+        ? runtimeT('closedTabsFromGroup', { count: closedCount, tabsWord, groupLabel })
+        : `Closed ${closedCount} ${tabsWord} from ${groupLabel}`);
+
+      const statTabs = document.getElementById('statTabs');
+      if (statTabs) statTabs.textContent = openTabs.length;
+      return;
+    } finally {
+      cardActionInFlight = false;
+    }
   }
 
   // ---- Save a whole domain group as one session snapshot (then close it) ----
@@ -5252,34 +5339,40 @@ document.addEventListener('click', async (e) => {
 
   // ---- Sleep all tabs in a domain group ----
   if (action === 'sleep-domain-tabs') {
-    const domainId = actionEl.dataset.domainId || '';
-    const group = domainGroups.find(g => getStableGroupId(g.domain) === domainId);
-    if (!group) return;
+    if (cardActionInFlight) return;
+    cardActionInFlight = true;
+    try {
+      const domainId = actionEl.dataset.domainId || '';
+      const group = domainGroups.find(g => getStableGroupId(g.domain) === domainId);
+      if (!group) return;
 
-    // Already-discarded rows have no sleep button and cannot be discarded
-    // again; filter them out so "nothing left to sleep" is a silent no-op
-    // instead of a misleading failure toast.
-    const tabIds = getOrderedUniqueTabsForGroup(group).filter(t => !t.active && !t.discarded).map(t => t.id);
-    if (!tabIds.length) return;
+      // Already-discarded rows have no sleep button and cannot be discarded
+      // again; filter them out so "nothing left to sleep" is a silent no-op
+      // instead of a misleading failure toast.
+      const tabIds = getOrderedUniqueTabsForGroup(group).filter(t => !t.active && !t.discarded).map(t => t.id);
+      if (!tabIds.length) return;
 
-    window.__suppressAutoRefreshUntil = Date.now() + 2000;
+      window.__suppressAutoRefreshUntil = Date.now() + 2000;
 
-    const { discarded } = await sleepTabsByIds(tabIds, { skipActive: true });
-    if (discarded === 0) {
+      const { discarded } = await sleepTabsByIds(tabIds, { skipActive: true });
+      if (discarded === 0) {
+        window.__suppressAutoRefreshUntil = 0;
+        showToast(runtimeT ? runtimeT('toastTabDiscardFailed') || 'Failed to sleep tabs' : 'Failed to sleep tabs');
+        return;
+      }
+
+      await fetchOpenTabs();
+      await loadSessionGroups(getOpenTabIdsForSessionPruning());
+      await renderDashboard();
       window.__suppressAutoRefreshUntil = 0;
-      showToast(runtimeT ? runtimeT('toastTabDiscardFailed') || 'Failed to sleep tabs' : 'Failed to sleep tabs');
+
+      showToast(runtimeT
+        ? runtimeT('toastTabsDiscarded', { count: discarded })
+        : `${discarded} tabs sleeping`);
       return;
+    } finally {
+      cardActionInFlight = false;
     }
-
-    await fetchOpenTabs();
-    await loadSessionGroups(getOpenTabIdsForSessionPruning());
-    await renderDashboard();
-    window.__suppressAutoRefreshUntil = 0;
-
-    showToast(runtimeT
-      ? runtimeT('toastTabsDiscarded', { count: discarded })
-      : `${discarded} tabs sleeping`);
-    return;
   }
 
   // ---- Sleep all open tabs ----
@@ -5311,132 +5404,150 @@ document.addEventListener('click', async (e) => {
 
   // ---- Merge tabs into one Chrome tab group ----
   if (action === 'group-card-tabs') {
-    const scope = actionEl.dataset.scope || '';
-    const domainId = actionEl.dataset.domainId || '';
-    const group = scope === 'all' ? null : domainGroups.find(g => getStableGroupId(g.domain) === domainId);
-    if (scope !== 'all' && !group) return;
+    if (cardActionInFlight) return;
+    cardActionInFlight = true;
+    try {
+      const scope = actionEl.dataset.scope || '';
+      const domainId = actionEl.dataset.domainId || '';
+      const group = scope === 'all' ? null : domainGroups.find(g => getStableGroupId(g.domain) === domainId);
+      if (scope !== 'all' && !group) return;
 
-    const tabIds = [];
-    if (scope === 'all') {
-      // Section-header variant: merge every open tab (all cards) into one
-      // Chrome tab group. Pinned tabs and existing Chrome-group cards stay
-      // outside the merged group.
-      for (const g of domainGroups) {
-        if (g.isChromeGroup) continue;
-        for (const tab of getOrderedUniqueTabsForGroup(g)) {
+      const tabIds = [];
+      if (scope === 'all') {
+        // Section-header variant: merge every open tab (all cards) into one
+        // Chrome tab group. Pinned tabs and existing Chrome-group cards stay
+        // outside the merged group.
+        for (const g of domainGroups) {
+          if (g.isChromeGroup) continue;
+          for (const tab of getOrderedUniqueTabsForGroup(g)) {
+            const id = Number(tab?.id);
+            if (!Number.isInteger(id) || id <= 0) continue;
+            if (tab?.pinned) continue;
+            tabIds.push(id);
+          }
+        }
+      } else if (group) {
+        // Per-domain merge: pinned tabs stay outside the merged Chrome group,
+        // matching the section-header merge-all path (Chrome cannot group them).
+        for (const tab of getOrderedUniqueTabsForGroup(group)) {
           const id = Number(tab?.id);
           if (!Number.isInteger(id) || id <= 0) continue;
           if (tab?.pinned) continue;
           tabIds.push(id);
         }
       }
-    } else if (group) {
-      // Per-domain merge: pinned tabs stay outside the merged Chrome group,
-      // matching the section-header merge-all path (Chrome cannot group them).
-      for (const tab of getOrderedUniqueTabsForGroup(group)) {
-        const id = Number(tab?.id);
-        if (!Number.isInteger(id) || id <= 0) continue;
-        if (tab?.pinned) continue;
-        tabIds.push(id);
+      if (!tabIds.length) return;
+
+      // Suppress auto-refresh to prevent animation spam
+      window.__suppressAutoRefreshUntil = Date.now() + 2000;
+      // The dashboard's own group write must not echo through the event
+      // subscription (same mute contract as every other group write path).
+      if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
+
+      let mergeResult;
+      try {
+        // The merge-all label is count-based: resolve it from the ACTUAL merged
+        // ids so stale ids dropped by groupTabsWithStaleRetry cannot inflate the
+        // count in the group title.
+        const label = scope === 'all'
+          ? (mergedIds) => (runtimeT ? runtimeT('mergeAllGroupTitle', { count: mergedIds.length }) : `Open tabs (${mergedIds.length})`)
+          : getGroupDisplayLabel(group);
+        // Merged groups rotate through the accent palette (not always grey):
+        // both the section-header merge-all and the per-domain merge use the
+        // same shared counter so consecutive merges get different colors.
+        const color = typeof runtimeAssignGroupColor === 'function'
+          ? runtimeAssignGroupColor(scope === 'all' ? 'all' : group.domain, chromeGroupMergeColorIndex++)
+          : 'blue';
+        mergeResult = await mergeTabsIntoChromeGroup(tabIds, { title: label, color });
+      } catch (err) {
+        window.__suppressAutoRefreshUntil = 0;
+        showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not create Chrome tab group');
+        return;
       }
-    }
-    if (!tabIds.length) return;
 
-    // Suppress auto-refresh to prevent animation spam
-    window.__suppressAutoRefreshUntil = Date.now() + 2000;
-    // The dashboard's own group write must not echo through the event
-    // subscription (same mute contract as every other group write path).
-    if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
+      // Tabs moving into a native group drop their dashboard manual-group
+      // assignments, matching the batch-merge and drag-into-Chrome-group paths
+      // (C2). Use the actual merged ids so stale tabs are not carried forward.
+      const mergedTabIds = mergeResult?.mergedTabIds || tabIds;
+      let cleanupFailed = false;
+      try {
+        let nextState = clearTabsFromSessionGroups(sessionGroupsState, mergedTabIds);
+        nextState = pruneSessionGroups(nextState, getOpenTabIdsForSessionPruning());
+        await saveSessionGroups(nextState);
+      } catch (err) {
+        cleanupFailed = true;
+        console.warn('[tab-harbor] group-card merge: session cleanup failed:', err);
+      }
 
-    let mergeResult;
-    try {
-      // The merge-all label is count-based: resolve it from the ACTUAL merged
-      // ids so stale ids dropped by groupTabsWithStaleRetry cannot inflate the
-      // count in the group title.
-      const label = scope === 'all'
-        ? (mergedIds) => (runtimeT ? runtimeT('mergeAllGroupTitle', { count: mergedIds.length }) : `Open tabs (${mergedIds.length})`)
-        : getGroupDisplayLabel(group);
-      // Merged groups rotate through the accent palette (not always grey):
-      // both the section-header merge-all and the per-domain merge use the
-      // same shared counter so consecutive merges get different colors.
-      const color = typeof runtimeAssignGroupColor === 'function'
-        ? runtimeAssignGroupColor(scope === 'all' ? 'all' : group.domain, chromeGroupMergeColorIndex++)
-        : 'blue';
-      mergeResult = await mergeTabsIntoChromeGroup(tabIds, { title: label, color });
-    } catch (err) {
+      // The merge consumes the selection (matching the batch-merge path, which
+      // calls finishBatchAction({ clearSelection: true })): without this the
+      // handle multi-selection would keep highlighting rows that now live in
+      // the native group.
+      clearPageChipSelection();
+
+      // Rebuild so the card reflects the new native group right away.
+      await renderDashboard();
       window.__suppressAutoRefreshUntil = 0;
-      showToast(runtimeT ? runtimeT('toastGroupCreateFailed') : 'Could not create Chrome tab group');
+
+      if (cleanupFailed) {
+        showToast(runtimeT ? runtimeT('toastBatchMergeCleanupFailed') : 'Merged tabs, but could not update saved groups');
+      } else if (mergeResult.updated) {
+        showToast(runtimeT ? runtimeT('toastGroupCreated') : 'Created Chrome tab group');
+      } else {
+        showToast(runtimeT
+          ? runtimeT('toastBatchMergedGroupRenameFailed', { count: mergedTabIds.length })
+          : `Merged ${mergedTabIds.length} tabs, but could not name the group`);
+      }
       return;
+    } finally {
+      cardActionInFlight = false;
     }
-
-    // Tabs moving into a native group drop their dashboard manual-group
-    // assignments, matching the batch-merge and drag-into-Chrome-group paths
-    // (C2). Use the actual merged ids so stale tabs are not carried forward.
-    const mergedTabIds = mergeResult?.mergedTabIds || tabIds;
-    let cleanupFailed = false;
-    try {
-      let nextState = clearTabsFromSessionGroups(sessionGroupsState, mergedTabIds);
-      nextState = pruneSessionGroups(nextState, getOpenTabIdsForSessionPruning());
-      await saveSessionGroups(nextState);
-    } catch (err) {
-      cleanupFailed = true;
-      console.warn('[tab-harbor] group-card merge: session cleanup failed:', err);
-    }
-
-    // Rebuild so the card reflects the new native group right away.
-    await renderDashboard();
-    window.__suppressAutoRefreshUntil = 0;
-
-    if (cleanupFailed) {
-      showToast(runtimeT ? runtimeT('toastBatchMergeCleanupFailed') : 'Merged tabs, but could not update saved groups');
-    } else if (mergeResult.updated) {
-      showToast(runtimeT ? runtimeT('toastGroupCreated') : 'Created Chrome tab group');
-    } else {
-      showToast(runtimeT
-        ? runtimeT('toastBatchMergedGroupRenameFailed', { count: mergedTabIds.length })
-        : `Merged ${mergedTabIds.length} tabs, but could not name the group`);
-    }
-    return;
   }
 
   // ---- Close duplicates, keep one copy ----
   if (action === 'dedup-keep-one') {
-    // Chrome-group cards dedup within their own tab set only; URL-wide
-    // matching would close same-URL tabs outside the group (C12).
-    const chromeCard = actionEl.closest('.mission-card.chrome-group-card');
-    const chromeGroupId = chromeCard?.dataset?.chromeGroupId;
-    const chromeGroup = chromeGroupId
-      ? domainGroups.find(g => g.isChromeGroup && String(g.chromeGroupId) === String(chromeGroupId))
-      : null;
-    const urlsEncoded = actionEl.dataset.dupeUrls || '';
-    const urls = urlsEncoded.split(',').map(u => decodeURIComponent(u)).filter(Boolean);
-    const chromeTabIds = chromeGroup
-      ? chromeGroup.tabs.map(t => Number(t.id)).filter(Number.isFinite)
-      : [];
+    if (cardActionInFlight) return;
+    cardActionInFlight = true;
+    try {
+      // Chrome-group cards dedup within their own tab set only; URL-wide
+      // matching would close same-URL tabs outside the group (C12).
+      const chromeCard = actionEl.closest('.mission-card.chrome-group-card');
+      const chromeGroupId = chromeCard?.dataset?.chromeGroupId;
+      const chromeGroup = chromeGroupId
+        ? domainGroups.find(g => g.isChromeGroup && String(g.chromeGroupId) === String(chromeGroupId))
+        : null;
+      const urlsEncoded = actionEl.dataset.dupeUrls || '';
+      const urls = urlsEncoded.split(',').map(u => decodeURIComponent(u)).filter(Boolean);
+      const chromeTabIds = chromeGroup
+        ? chromeGroup.tabs.map(t => Number(t.id)).filter(Number.isFinite)
+        : [];
 
-    // No-op selections must return BEFORE the refresh-suppression window is
-    // raised: an early return can never leak a 2s auto-refresh block.
-    if (chromeGroup ? chromeTabIds.length === 0 : urls.length === 0) return;
+      // No-op selections must return BEFORE the refresh-suppression window is
+      // raised: an early return can never leak a 2s auto-refresh block.
+      if (chromeGroup ? chromeTabIds.length === 0 : urls.length === 0) return;
 
-    // Suppress auto-refresh to prevent animation spam
-    window.__suppressAutoRefreshUntil = Date.now() + 2000;
+      // Suppress auto-refresh to prevent animation spam
+      window.__suppressAutoRefreshUntil = Date.now() + 2000;
 
-    if (chromeGroup) {
-      await closeDuplicatesInSelection(chromeTabIds, { playSound: false });
-    } else {
-      await closeDuplicatesByUrls(urls, { keepOne: true, playSound: false });
+      if (chromeGroup) {
+        await closeDuplicatesInSelection(chromeTabIds, { playSound: false });
+      } else {
+        await closeDuplicatesByUrls(urls, { keepOne: true, playSound: false });
+      }
+      playCloseSound();
+
+      // Rebuild the open-tabs area right away so the kept copy shows
+      // immediately. The suppression above deliberately drops the event-driven
+      // refresh, so without this call the stale duplicate chips would stay
+      // visible until the next unsuppressed tab event (~2s later).
+      await renderDashboard();
+      window.__suppressAutoRefreshUntil = 0;
+
+      showToast(runtimeT ? runtimeT('toastClosedDuplicatesKeptOne') : 'Closed duplicates, kept one copy each');
+      return;
+    } finally {
+      cardActionInFlight = false;
     }
-    playCloseSound();
-
-    // Rebuild the open-tabs area right away so the kept copy shows
-    // immediately. The suppression above deliberately drops the event-driven
-    // refresh, so without this call the stale duplicate chips would stay
-    // visible until the next unsuppressed tab event (~2s later).
-    await renderDashboard();
-    window.__suppressAutoRefreshUntil = 0;
-
-    showToast(runtimeT ? runtimeT('toastClosedDuplicatesKeptOne') : 'Closed duplicates, kept one copy each');
-    return;
   }
 
   // ---- Close ALL open tabs ----

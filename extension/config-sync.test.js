@@ -94,6 +94,42 @@ test('exportConfig works with empty/missing data', async () => {
   });
 });
 
+test('exportConfig serializes unset keys as null under real Chrome get semantics', async () => {
+  // Real chrome.storage.local.get(keys[]) resolves EVERY requested key —
+  // unset keys come back as undefined (not absent). exportConfig must turn
+  // those into explicit null so a later import resets them to defaults on the
+  // target device; a missing key would be skipped by the importer instead.
+  const store = { themePreferences: { mode: 'dark' } };
+  const chromeLike = {
+    storage: {
+      local: {
+        async get(keys) {
+          const result = {};
+          for (const key of keys) result[key] = key in store ? store[key] : undefined;
+          return result;
+        },
+        async set(payload) {
+          Object.assign(store, payload);
+        },
+      },
+    },
+  };
+  const originalChrome = globalThis.chrome;
+  globalThis.chrome = chromeLike;
+  try {
+    const json = await exportConfig();
+    const parsed = JSON.parse(json);
+
+    assert.deepEqual(parsed.themePreferences, { mode: 'dark' });
+    assert.equal(parsed.quickShortcuts, null);
+    assert.equal(parsed.savedTabSessions, null);
+    assert.equal(parsed.popupView, null);
+    for (const key of STORAGE_KEYS) assert.ok(key in parsed, `missing ${key}`);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test('importConfig writes the complete configuration to storage', async () => {
   const incoming = {
     version: CONFIG_VERSION,

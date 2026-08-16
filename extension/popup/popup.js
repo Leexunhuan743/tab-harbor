@@ -211,6 +211,14 @@ async function loadPopupView() {
   try {
     const stored = await chrome.storage.local.get(POPUP_VIEW_KEY);
     popupState.view = stored[POPUP_VIEW_KEY] === 'tabs' ? 'tabs' : 'shortcuts';
+    // Keep the synchronous first-frame mirror in sync: chrome.storage is the
+    // source of truth (config import/export round-trips through it), so when
+    // it differs from the localStorage mirror, persist the resolved view back
+    // instead of letting the two diverge permanently (which would flash the
+    // stale first frame on every popup open).
+    try {
+      localStorage.setItem(POPUP_VIEW_KEY, popupState.view);
+    } catch { /* storage may be unavailable; chrome.storage remains authoritative */ }
   } catch {
     popupState.view = 'shortcuts';
   }

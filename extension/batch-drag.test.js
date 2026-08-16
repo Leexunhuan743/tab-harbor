@@ -359,7 +359,7 @@ test('multi-select mode: clicking a row toggles it instead of activating the tab
   // the guard checks key + window only (no keydown bypass — row bodies are
   // not keyboard-focusable, so a recent keydown must not re-toggle the row).
   assert.match(runtimeJs, /const toggleGuardHit = Boolean\(key\)\s*&& pageChipPointerToggleGuard\.key === key\s*&& Date\.now\(\) < pageChipPointerToggleGuard\.until;\s*if \(toggleGuardHit\) return;/);
-  assert.doesNotMatch(runtimeJs, /const toggleGuardHit = Boolean\(key\)[\s\S]{0,60}Date\.now\(\) - pageChipLastKeydownAt > 120/);
+  assert.doesNotMatch(runtimeJs, /toggleGuardHit = Boolean\(key\)[\s\S]{0,2000}(Date\.now\(\) - pageChipLastKeydownAt > 120)/);
 });
 
 test('section header above all cards adds global close-duplicates and merge-all', () => {
@@ -788,7 +788,7 @@ test('sleeping a stale (ghost) chip re-renders instead of silently corrupting gr
   assert.match(runtimeJs, /async function sleepTabsByIds\(tabIds,\s*\{ skipActive = true \} = \{\}\) \{/);
   assert.match(runtimeJs, /const tasks = \(tabIds \|\| \[\]\)\.map\(async \(rawTabId\) => \{/);
   assert.match(runtimeJs, /const settled = await Promise\.all\(tasks\);/);
-  assert.match(runtimeJs, /if \(stale > 0\) \{\s*await renderDashboard\(\);\s*updateBackToTopVisibility\(\);\s*window\.__suppressAutoRefreshUntil = 0;\s*showToast\(runtimeT \? runtimeT\('toastTabAlreadyClosed'\)/);
+  assert.match(runtimeJs, /if \(stale > 0\) \{\s*(?:\/\/[^\n]*\n\s*)*await fetchOpenTabs\(\);\s*await loadSessionGroups\(getOpenTabIdsForSessionPruning\(\)\);\s*await renderDashboard\(\);\s*updateBackToTopVisibility\(\);\s*window\.__suppressAutoRefreshUntil = 0;\s*showToast\(runtimeT \? runtimeT\('toastTabAlreadyClosed'\)/);
   // Batch sleep uses the same helper and keeps only chips whose tab id is in
   // resultsByTabId (stale ids are excluded by the helper).
   assert.match(runtimeJs, /const \{ discarded, failed, skippedActive, stale, resultsByTabId \} = await sleepTabsByIds\(tabIds, \{ skipActive: true \}\);/);

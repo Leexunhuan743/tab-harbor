@@ -1043,6 +1043,14 @@ test('saved session restore supports both current-window and new-window modes', 
   assert.match(runtimeJs, /async function restoreSavedTabToBrowser\(tabUrl\)/);
   assert.match(runtimeJs, /const \{ windowId \} = await openSavedTabsInCurrentWindow\(\[\{ url: tabUrl \}]\);/);
   assert.match(sessionManagerJs, /runtime\.restoreSavedTabToBrowser/);
+  // Saved sessions re-create native Chrome groups (fresh groups with the
+  // recorded title/color, ordered tabs) after the tabs are opened.
+  assert.match(runtimeJs, /const \{ state: nextSessionGroups, chromeGroupPlans \} = runtimeCreateRestoredSessionGroups\(\{/);
+  assert.match(runtimeJs, /await restoreChromeGroupsForSession\(chromeGroupPlans, windowId\);/);
+  assert.match(runtimeJs, /async function restoreChromeGroupsForSession\(plans, windowId\) \{/);
+  assert.match(runtimeJs, /const groupId = await chrome\.tabs\.group\(\{ tabIds: planTabIds \}\);/);
+  assert.match(runtimeJs, /await chrome\.tabGroups\.update\(groupId, \{/);
+  assert.match(runtimeJs, /reorderGroupedTabs\(groupId, planTabIds\.map\(String\), windowId\)/);
 });
 
 test('saved tabs top nav supports icon and name display modes', () => {
