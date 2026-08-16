@@ -1048,7 +1048,13 @@ test('saved session restore supports both current-window and new-window modes', 
   assert.match(runtimeJs, /const \{ state: nextSessionGroups, chromeGroupPlans \} = runtimeCreateRestoredSessionGroups\(\{/);
   assert.match(runtimeJs, /await restoreChromeGroupsForSession\(chromeGroupPlans, windowId\);/);
   assert.match(runtimeJs, /async function restoreChromeGroupsForSession\(plans, windowId\) \{/);
-  assert.match(runtimeJs, /const groupId = await chrome\.tabs\.group\(\{ tabIds: planTabIds \}\);/);
+  assert.match(runtimeJs, /const groupId = await chrome\.tabs\.group\(groupOptions\);/);
+  // Chrome creates the fresh group in the CALLER's window by default, which
+  // would drag tabs created in the restore target window across windows;
+  // createProperties.windowId pins the new group to the target window so a
+  // new-window restore keeps chrome-group tabs in place with the other tabs.
+  assert.match(runtimeJs, /const groupOptions = windowId != null\s*\? \{ tabIds: planTabIds, createProperties: \{ windowId: Number\(windowId\) \} \}\s*: \{ tabIds: planTabIds \};/);
+  assert.match(runtimeJs, /const groupId = await chrome\.tabs\.group\(groupOptions\);/);
   assert.match(runtimeJs, /await chrome\.tabGroups\.update\(groupId, \{/);
   assert.match(runtimeJs, /reorderGroupedTabs\(groupId, planTabIds\.map\(String\), windowId\)/);
 });

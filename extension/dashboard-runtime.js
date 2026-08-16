@@ -2161,9 +2161,12 @@ async function restoreChromeGroupsForSession(plans, windowId) {
   if (!Array.isArray(plans) || !plans.length) return;
   let existingTitles = new Set();
   try {
-    const groups = await chrome.tabGroups.query({});
+    // Same-title conflict check is scoped to the restore target window; let
+    // the API filter instead of pulling every window's groups.
+    const groups = windowId != null
+      ? await chrome.tabGroups.query({ windowId: Number(windowId) })
+      : await chrome.tabGroups.query({});
     existingTitles = new Set(groups
-      .filter(g => windowId == null || Number(g.windowId) === Number(windowId))
       .map(g => String(g.title || ''))
       .filter(Boolean));
   } catch { /* keep the empty set: creation still proceeds */ }
@@ -2190,7 +2193,17 @@ async function restoreChromeGroupsForSession(plans, windowId) {
 
     if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
     try {
-      const groupId = await chrome.tabs.group({ tabIds: planTabIds });
+      // Chrome creates the new group in the CALLER's window by default, which
+      // would drag tabs created in the restore target window across windows
+      // (observed: new-window restore split the session across two windows,
+      // chrome-group tabs flashing into the dashboard window). Pinning the new
+      // group to the target window via createProperties.windowId keeps every
+      // restored tab in place — the group appears directly in the target
+      // window with no tab relocation.
+      const groupOptions = windowId != null
+        ? { tabIds: planTabIds, createProperties: { windowId: Number(windowId) } }
+        : { tabIds: planTabIds };
+      const groupId = await chrome.tabs.group(groupOptions);
       if (groupId == null) continue;
       await chrome.tabGroups.update(groupId, {
         title,
