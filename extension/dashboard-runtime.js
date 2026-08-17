@@ -2054,11 +2054,12 @@ async function openSavedTabsInCurrentWindow(tabs = []) {
     });
     // Restored tabs start ASLEEP: tabs.create loads the URL immediately, which
     // spikes CPU/memory when a session holds many tabs. Discard right after
-    // creation — the tab keeps its URL and Chrome reloads it on activation.
-    // Fire-and-forget: discardTab catches its own failures and the restored id
-    // list below is unaffected (discard keeps the tab id and group).
+    // the navigation commits (early in the load) so the URL is kept and the
+    // page is never fully rendered; the tab reloads on activation. Fire-and-
+    // forget: background's duplicate-blank-tab cleanup exempts freshly-created
+    // tabs and discarded tabs, so a restore batch is never closed.
     if (createdTab?.id != null) {
-      discardTab(Number(createdTab.id));
+      discardRestoredTabAfterCommit(createdTab.id, tab.url);
     }
     restoredTabs.push({
       id: createdTab.id,
@@ -2103,11 +2104,12 @@ async function openSavedTabsInNewWindow(tabs = []) {
     });
     // Restored tabs start ASLEEP: tabs.create loads the URL immediately, which
     // spikes CPU/memory when a session holds many tabs. Discard right after
-    // creation — the tab keeps its URL and Chrome reloads it on activation.
-    // Fire-and-forget: discardTab catches its own failures and the restored id
-    // list below is unaffected (discard keeps the tab id and group).
+    // the navigation commits (early in the load) so the URL is kept and the
+    // page is never fully rendered; the tab reloads on activation. Fire-and-
+    // forget: background's duplicate-blank-tab cleanup exempts freshly-created
+    // tabs and discarded tabs, so a restore batch is never closed.
     if (createdTab?.id != null) {
-      discardTab(Number(createdTab.id));
+      discardRestoredTabAfterCommit(createdTab.id, tab.url);
     }
     restoredTabs.push({
       id: createdTab.id,
@@ -3562,6 +3564,40 @@ async function discardTab(tabId) {
     console.error('Failed to discard tab:', err);
     return false;
   }
+}
+
+/**
+ * discardRestoredTabAfterCommit(tabId, targetUrl)
+ *
+ * Discards a freshly-created restored tab once its navigation has committed
+ * (the tab's url is no longer blank/about:blank). Discarding a tab while its
+ * navigation is still pending cancels the navigation and resets the tab to
+ * about:blank in Edge — the recorded URL is lost and activating the tab later
+ * would reload a blank page instead of the saved page. Polling stops as soon
+ * as the url is committed, which happens early in the load (first bytes), so
+ * the page is never fully rendered; a timeout degrades to a normally-loading
+ * tab on slow networks. Fire-and-forget: the restored id list is unaffected
+ * (discard keeps the tab id), and failures are swallowed by discardTab.
+ */
+async function discardRestoredTabAfterCommit(tabId, targetUrl) {
+  const numericId = Number(tabId);
+  if (!Number.isFinite(numericId)) return;
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    let live = null;
+    try {
+      live = await chrome.tabs.get(numericId);
+    } catch {
+      return; // tab already gone — nothing to sleep
+    }
+    const url = String(live?.url || '');
+    if (url && url !== 'about:blank' && url !== 'chrome://newtab/') {
+      await discardTab(numericId);
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  // Timeout: leave the tab loading normally.
 }
 
 

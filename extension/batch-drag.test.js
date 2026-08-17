@@ -1158,6 +1158,7 @@ test('ensureWindowsKeepLastTab never empties a window (real implementation)', ()
 test('openSavedTabsInCurrentWindow discards every background tab but keeps the first active one loaded', async () => {
   const fn = new Function(`
     ${extractFn(runtimeJs, 'discardTab')}
+    ${extractFn(runtimeJs, 'discardRestoredTabAfterCommit')}
     ${extractFn(runtimeJs, 'openSavedTabsInCurrentWindow')}
     return openSavedTabsInCurrentWindow;
   `)();
@@ -1173,6 +1174,13 @@ test('openSavedTabsInCurrentWindow discards every background tab but keeps the f
         active: !!opts.active,
         windowId: opts.windowId ?? 501,
       }),
+      // The restored tabs are already committed (url set) so the discard
+      // helper sleeps them immediately instead of polling.
+      get: async (id) => ({
+        id,
+        url: id === 1001 ? 'https://a.test' : id === 1002 ? 'https://b.test' : 'https://c.test',
+        active: false,
+      }),
       discard: async (id) => { discarded.push(Number(id)); },
       query: async () => [],
     },
@@ -1185,8 +1193,8 @@ test('openSavedTabsInCurrentWindow discards every background tab but keeps the f
   ]);
 
   // The first tab is created active and must NOT be discarded; the two
-  // background tabs are discarded right after creation (restored tabs start
-  // asleep so a large session does not load every page at once).
+  // background tabs are discarded once their navigation commits (restored
+  // tabs start asleep so a large session does not load every page at once).
   assert.deepEqual(discarded, [1002, 1003]);
   // The restored id list is unaffected by the discards.
   assert.deepEqual(result.restoredTabs.map(t => t.id), [1001, 1002, 1003]);
@@ -1197,6 +1205,7 @@ test('openSavedTabsInCurrentWindow discards every background tab but keeps the f
 test('openSavedTabsInNewWindow discards every background tab of the restored session', async () => {
   const fn = new Function(`
     ${extractFn(runtimeJs, 'discardTab')}
+    ${extractFn(runtimeJs, 'discardRestoredTabAfterCommit')}
     ${extractFn(runtimeJs, 'openSavedTabsInNewWindow')}
     return openSavedTabsInNewWindow;
   `)();
@@ -1212,6 +1221,11 @@ test('openSavedTabsInNewWindow discards every background tab of the restored ses
         url: opts.url,
         active: !!opts.active,
         windowId: opts.windowId ?? 502,
+      }),
+      get: async (id) => ({
+        id,
+        url: id === 2001 ? 'https://a.test' : id === 2002 ? 'https://b.test' : 'https://c.test',
+        active: false,
       }),
       discard: async (id) => { discarded.push(Number(id)); },
       query: async () => [],

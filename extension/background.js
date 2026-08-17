@@ -13,6 +13,13 @@ if (TAB_HARBOR_BG_DEBUG)
 
 // ─── Auto-close duplicate new tabs ───────────────────────────────────────────
 
+// Tabs created within this window are exempt from duplicate-blank-tab cleanup:
+// session restore creates many tabs in a burst and their navigation has not
+// committed yet (url is empty), which would otherwise look like a pile of
+// accidentally-opened blank new-tab pages and get closed.
+const NEW_TAB_GRACE_PERIOD_MS = 5000;
+const createdRecentlyAt = new Map(); // tabId -> timestamp
+
 function getNewTabUrls() {
   return new Set([
     chrome.runtime.getURL("index.html"),
@@ -21,6 +28,20 @@ function getNewTabUrls() {
 }
 
 function isNewTabBlank(tab, newTabUrls) {
+  // A discarded (sleeping) tab is never an accidentally-opened blank new-tab
+  // page: session restore creates tabs and discards them so they start asleep,
+  // and a discarded tab may carry an empty/uncommitted url.
+  if (tab?.discarded) return false;
+  // Freshly-created tabs may not have committed their navigation yet (empty
+  // url). Give a restore batch (or any burst of new tabs) a grace period so
+  // the cleanup does not close tabs that are about to navigate to a real page.
+  if (tab?.id != null) {
+    const createdAt = createdRecentlyAt.get(tab.id);
+    if (createdAt != null && Date.now() - createdAt < NEW_TAB_GRACE_PERIOD_MS) {
+      return false;
+    }
+    if (createdAt != null) createdRecentlyAt.delete(tab.id);
+  }
   const knownNewTabUrls =
     newTabUrls instanceof Set
       ? newTabUrls
@@ -112,6 +133,7 @@ chrome.runtime.onStartup.addListener(() => {
 
 // Update badge and notify Tab Harbor pages whenever a tab is opened
 chrome.tabs.onCreated.addListener((tab) => {
+  if (tab?.id != null) createdRecentlyAt.set(tab.id, Date.now());
   updateBadge();
   notifyTabHarborPages({ source: "tabs.onCreated", triggerTabId: tab?.id });
   closeDuplicateNewTabs();
