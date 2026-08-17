@@ -2229,7 +2229,7 @@ async function openSavedTabsInCurrentWindow(tabs = []) {
   const entries = (Array.isArray(tabs) ? tabs : []).map((tab, sourceIndex) => ({ tab, sourceIndex }));
   const [firstEntry, ...restEntries] = entries;
   const firstTab = firstEntry?.tab;
-  if (!firstTab?.url) return { restoredTabs: [], windowId: null };
+  if (!firstTab?.url) return { restoredTabs: [], windowId: null, backgroundTabDiscards: [] };
 
   const currentWindowId = await getCurrentWindowId();
   const firstCreatedTab = currentWindowId != null
@@ -2246,6 +2246,12 @@ async function openSavedTabsInCurrentWindow(tabs = []) {
   const restoredTabs = firstCreatedTab?.id != null
     ? [{ id: firstCreatedTab.id, url: firstTab.url, sourceIndex: firstEntry.sourceIndex }]
     : [];
+  // Queue the active first tab too. Chrome will reject it while it is active,
+  // but once the user switches away the shared retry path can sleep it just
+  // like every other restored tab.
+  const backgroundTabDiscards = firstCreatedTab?.id != null
+    ? [{ tabId: firstCreatedTab.id, url: firstTab.url }]
+    : [];
 
   for (const { tab, sourceIndex } of restEntries) {
     const createdTab = await chrome.tabs.create({
@@ -2253,14 +2259,8 @@ async function openSavedTabsInCurrentWindow(tabs = []) {
       url: tab.url,
       active: false,
     });
-    // Restored tabs start ASLEEP: tabs.create loads the URL immediately, which
-    // spikes CPU/memory when a session holds many tabs. Discard right after
-    // the navigation commits (early in the load) so the URL is kept and the
-    // page is never fully rendered; the tab reloads on activation. Fire-and-
-    // forget: background's duplicate-blank-tab cleanup exempts freshly-created
-    // tabs and discarded tabs, so a restore batch is never closed.
     if (createdTab?.id != null) {
-      discardRestoredTabAfterCommit(createdTab.id, tab.url);
+      backgroundTabDiscards.push({ tabId: createdTab.id, url: tab.url });
     }
     restoredTabs.push({
       id: createdTab.id,
@@ -2269,14 +2269,14 @@ async function openSavedTabsInCurrentWindow(tabs = []) {
     });
   }
 
-  return { restoredTabs, windowId: targetWindowId };
+  return { restoredTabs, windowId: targetWindowId, backgroundTabDiscards };
 }
 
 async function openSavedTabsInNewWindow(tabs = []) {
   const entries = (Array.isArray(tabs) ? tabs : []).map((tab, sourceIndex) => ({ tab, sourceIndex }));
   const [firstEntry, ...restEntries] = entries;
   const firstTab = firstEntry?.tab;
-  if (!firstTab?.url) return { restoredTabs: [], windowId: null };
+  if (!firstTab?.url) return { restoredTabs: [], windowId: null, backgroundTabDiscards: [] };
 
   const createdWindow = await chrome.windows.create({
     url: firstTab.url,
@@ -2301,6 +2301,11 @@ async function openSavedTabsInNewWindow(tabs = []) {
       });
     }
   }
+  // The first tab is active in the newly focused window, so it cannot be
+  // discarded yet. Keep it in the same queue and sleep it after focus moves.
+  const backgroundTabDiscards = firstCreatedTab?.id != null
+    ? [{ tabId: firstCreatedTab.id, url: firstTab.url }]
+    : [];
 
   for (const { tab, sourceIndex } of restEntries) {
     const createdTab = await chrome.tabs.create({
@@ -2308,14 +2313,8 @@ async function openSavedTabsInNewWindow(tabs = []) {
       url: tab.url,
       active: false,
     });
-    // Restored tabs start ASLEEP: tabs.create loads the URL immediately, which
-    // spikes CPU/memory when a session holds many tabs. Discard right after
-    // the navigation commits (early in the load) so the URL is kept and the
-    // page is never fully rendered; the tab reloads on activation. Fire-and-
-    // forget: background's duplicate-blank-tab cleanup exempts freshly-created
-    // tabs and discarded tabs, so a restore batch is never closed.
     if (createdTab?.id != null) {
-      discardRestoredTabAfterCommit(createdTab.id, tab.url);
+      backgroundTabDiscards.push({ tabId: createdTab.id, url: tab.url });
     }
     restoredTabs.push({
       id: createdTab.id,
@@ -2324,17 +2323,29 @@ async function openSavedTabsInNewWindow(tabs = []) {
     });
   }
 
-  return { restoredTabs, windowId: createdWindow?.id ?? null };
+  return { restoredTabs, windowId: createdWindow?.id ?? null, backgroundTabDiscards };
+}
+
+function scheduleRestoredSessionBackgroundDiscards(backgroundTabDiscards = []) {
+  for (const item of Array.isArray(backgroundTabDiscards) ? backgroundTabDiscards : []) {
+    if (item?.tabId != null) {
+      discardRestoredTabAfterCommit(item.tabId, item.url);
+    }
+  }
 }
 
 async function restoreSavedTabToBrowser(tabUrl) {
   if (!tabUrl) return null;
   const restoreMode = runtimeGetSavedSessionRestoreMode ? runtimeGetSavedSessionRestoreMode() : 'new-window';
   if (restoreMode === 'current-window') {
-    const { windowId } = await openSavedTabsInCurrentWindow([{ url: tabUrl }]);
+    const opened = await openSavedTabsInCurrentWindow([{ url: tabUrl }]);
+    scheduleRestoredSessionBackgroundDiscards(opened.backgroundTabDiscards);
+    const { windowId } = opened;
     return { windowId, restoreMode };
   }
-  const { windowId } = await openSavedTabsInNewWindow([{ url: tabUrl }]);
+  const opened = await openSavedTabsInNewWindow([{ url: tabUrl }]);
+  scheduleRestoredSessionBackgroundDiscards(opened.backgroundTabDiscards);
+  const { windowId } = opened;
   return { windowId, restoreMode };
 }
 
@@ -2357,7 +2368,7 @@ async function restoreSavedTabSession(sessionId) {
   // echo avoids a redundant post-restore refresh. The explicit renderDashboard
   // call is unaffected — suppression only gates the event-driven refresh path.
   return runWithSuppressedRefresh(async () => {
-    const { restoredTabs, windowId } = restoreMode === 'current-window'
+    const { restoredTabs, windowId, backgroundTabDiscards } = restoreMode === 'current-window'
       ? await openSavedTabsInCurrentWindow(session.tabs)
       : await openSavedTabsInNewWindow(session.tabs);
 
@@ -2367,11 +2378,21 @@ async function restoreSavedTabSession(sessionId) {
       restoredTabs,
       now: new Date().toISOString(),
     });
-    // Re-create native Chrome groups that were saved with the session: fresh
-    // groups with the recorded title/color, tabs in the recorded order. The
-    // result records a partial native-group restore instead of hiding a group
-    // that was created successfully but could not be named/colored.
-    const chromeGroupRestore = await restoreChromeGroupsForSession(chromeGroupPlans, windowId);
+    let chromeGroupRestore = { attempted: 0, restored: [], failures: [] };
+    try {
+      // Re-create native Chrome groups that were saved with the session:
+      // fresh groups with the recorded title/color, tabs in the recorded
+      // order. The result records a partial native-group restore instead of
+      // hiding a group that was created successfully but could not be
+      // named/colored.
+      chromeGroupRestore = await restoreChromeGroupsForSession(chromeGroupPlans, windowId);
+    } finally {
+      // Restored background tabs transition to asleep only after native Chrome
+      // grouping/metadata/order has finished. That keeps Chrome's group APIs
+      // operating on live, just-created tabs instead of racing tab discard.
+      scheduleRestoredSessionBackgroundDiscards(backgroundTabDiscards);
+    }
+
     await saveSessionGroups(nextSessionGroups);
     await renderDashboard();
 
@@ -3820,8 +3841,10 @@ async function discardTab(tabId) {
 
 // Restoring a session can create many background tabs at once. Keep one
 // event-driven queue for their post-navigation sleep operation instead of one
-// 100 ms polling loop per tab.
+// 100 ms polling loop per tab. The timeout is only the first retry deadline;
+// it must never silently abandon a tab that is still loading.
 const RESTORED_TAB_DISCARD_TIMEOUT_MS = 15000;
+const RESTORED_TAB_DISCARD_RETRY_MS = 1000;
 const restoredTabDiscardQueue = new Map();
 let restoredTabDiscardDeadlineTimer = null;
 let restoredTabDiscardListenersAttached = false;
@@ -3872,7 +3895,16 @@ function scheduleRestoredTabDiscardDeadline() {
     restoredTabDiscardDeadlineTimer = null;
     const now = Date.now();
     for (const [tabId, entry] of restoredTabDiscardQueue.entries()) {
-      if (entry.deadline <= now) restoredTabDiscardQueue.delete(tabId);
+      if (entry.deadline > now) continue;
+      // A slow navigation must not opt out of the restore-sleep contract. The
+      // normal path is tabs.onUpdated; this state check is the missed-event
+      // fallback. If the tab is still blank/active or Chrome rejects the
+      // discard, keep it queued and retry instead of leaving a fully-live
+      // restored page behind forever.
+      entry.deadline = now + RESTORED_TAB_DISCARD_RETRY_MS;
+      void chrome.tabs.get(Number(tabId))
+        .then(liveTab => tryDiscardRestoredTabAfterCommit(Number(tabId), liveTab))
+        .catch(() => removeRestoredTabDiscard(Number(tabId)));
     }
     scheduleRestoredTabDiscardDeadline();
   }, Math.max(0, nextDeadline - Date.now()));
@@ -3882,14 +3914,19 @@ async function tryDiscardRestoredTabAfterCommit(tabId, liveTab, changeInfo = {})
   const numericId = Number(tabId);
   const entry = restoredTabDiscardQueue.get(numericId);
   if (!entry) return false;
-  if (entry.deadline <= Date.now()) {
-    removeRestoredTabDiscard(numericId);
-    return false;
-  }
   if (!isRestoredTabNavigationReady(liveTab, entry.targetUrl, changeInfo)) return false;
+  // Chrome refuses to discard the active tab. Keep the request alive so a
+  // transient activation during restore does not permanently defeat sleep.
+  if (liveTab?.active === true) return false;
 
-  removeRestoredTabDiscard(numericId);
-  return discardTab(numericId);
+  const discarded = await discardTab(numericId);
+  if (discarded) {
+    removeRestoredTabDiscard(numericId);
+  } else {
+    entry.deadline = Date.now() + RESTORED_TAB_DISCARD_RETRY_MS;
+    scheduleRestoredTabDiscardDeadline();
+  }
+  return discarded;
 }
 
 function ensureRestoredTabDiscardListeners() {
@@ -3904,6 +3941,16 @@ function ensureRestoredTabDiscardListeners() {
   if (onRemoved && typeof onRemoved.addListener === 'function') {
     onRemoved.addListener(tabId => removeRestoredTabDiscard(tabId));
   }
+  const onActivated = chrome.tabs?.onActivated;
+  if (onActivated && typeof onActivated.addListener === 'function') {
+    onActivated.addListener(activeInfo => {
+      const tabId = Number(activeInfo?.tabId);
+      if (!Number.isFinite(tabId) || !restoredTabDiscardQueue.has(tabId)) return;
+      void chrome.tabs.get(tabId)
+        .then(liveTab => tryDiscardRestoredTabAfterCommit(tabId, liveTab))
+        .catch(() => removeRestoredTabDiscard(tabId));
+    });
+  }
   restoredTabDiscardListenersAttached = true;
 }
 
@@ -3916,10 +3963,10 @@ function ensureRestoredTabDiscardListeners() {
  * about:blank in Edge — the recorded URL is lost and activating the tab later
  * would reload a blank page instead of the saved page. A one-time current-tab
  * check handles an already-committed navigation; otherwise tabs.onUpdated
- * drives the work. One shared deadline timer removes slow or failed loads, so
- * those tabs simply continue loading. Fire-and-forget: the restored id list
- * is unaffected (discard keeps the tab id), and failures are swallowed by
- * discardTab.
+ * drives the work. A shared retry timer handles missed update events and
+ * transient active/discard failures; the request is removed only after a
+ * successful discard or tab removal. Fire-and-forget: the restored id list
+ * is unaffected (discard keeps the tab id), and failures are retried quietly.
  */
 function discardRestoredTabAfterCommit(tabId, targetUrl) {
   const numericId = Number(tabId);

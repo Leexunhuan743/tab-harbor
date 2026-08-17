@@ -1491,25 +1491,12 @@ test('runWithSuppressedRefresh releases the refresh gate after success and rejec
 // Behavioral: restore-created tabs start ASLEEP (discard-on-restore)
 // ---------------------------------------------------------------------------
 
-test('openSavedTabsInCurrentWindow discards every background tab but keeps the first active one loaded', async () => {
+test('openSavedTabsInCurrentWindow returns background discard requests after creating tabs', async () => {
   const fn = new Function(`
-    ${extractFn(runtimeJs, 'discardTab')}
-    const RESTORED_TAB_DISCARD_TIMEOUT_MS = 15000;
-    const restoredTabDiscardQueue = new Map();
-    let restoredTabDiscardDeadlineTimer = null;
-    let restoredTabDiscardListenersAttached = false;
-    ${extractFn(runtimeJs, 'getRestoredTabNavigationIdentity')}
-    ${extractFn(runtimeJs, 'isRestoredTabNavigationReady')}
-    ${extractFn(runtimeJs, 'removeRestoredTabDiscard')}
-    ${extractFn(runtimeJs, 'scheduleRestoredTabDiscardDeadline')}
-    ${extractFn(runtimeJs, 'tryDiscardRestoredTabAfterCommit')}
-    ${extractFn(runtimeJs, 'ensureRestoredTabDiscardListeners')}
-    ${extractFn(runtimeJs, 'discardRestoredTabAfterCommit')}
     ${extractFn(runtimeJs, 'openSavedTabsInCurrentWindow')}
     return openSavedTabsInCurrentWindow;
   `)();
 
-  const discarded = [];
   globalThis.getCurrentWindowId = async () => 501;
   globalThis.chrome = {
     windows: { getCurrent: async () => ({ id: 501 }) },
@@ -1520,15 +1507,6 @@ test('openSavedTabsInCurrentWindow discards every background tab but keeps the f
         active: !!opts.active,
         windowId: opts.windowId ?? 501,
       }),
-      // The restored tabs are already committed (url set) so the discard
-      // helper sleeps them immediately instead of polling.
-      get: async (id) => ({
-        id,
-        url: id === 1001 ? 'https://a.test' : id === 1002 ? 'https://b.test' : 'https://c.test',
-        active: false,
-      }),
-      discard: async (id) => { discarded.push(Number(id)); },
-      query: async () => [],
     },
   };
 
@@ -1538,36 +1516,26 @@ test('openSavedTabsInCurrentWindow discards every background tab but keeps the f
     { url: 'https://c.test' },
   ]);
 
-  // The first tab is created active and must NOT be discarded; the two
-  // background tabs are discarded once their navigation commits (restored
-  // tabs start asleep so a large session does not load every page at once).
-  assert.deepEqual(discarded, [1002, 1003]);
-  // The restored id list is unaffected by the discards.
+  // All restored tabs are queued. The active first tab is kept live by the
+  // discard helper until focus moves away; the two background tabs can sleep
+  // as soon as session restore finishes grouping/name/order operations.
   assert.deepEqual(result.restoredTabs.map(t => t.id), [1001, 1002, 1003]);
   assert.deepEqual(result.restoredTabs.map(t => t.sourceIndex), [0, 1, 2], 'saved tab instances retain their source order');
+  assert.deepEqual(result.backgroundTabDiscards, [
+    { tabId: 1001, url: 'https://a.test' },
+    { tabId: 1002, url: 'https://b.test' },
+    { tabId: 1003, url: 'https://c.test' },
+  ]);
   delete globalThis.getCurrentWindowId;
   delete globalThis.chrome;
 });
 
-test('openSavedTabsInNewWindow discards every background tab of the restored session', async () => {
+test('openSavedTabsInNewWindow returns background discard requests after creating tabs', async () => {
   const fn = new Function(`
-    ${extractFn(runtimeJs, 'discardTab')}
-    const RESTORED_TAB_DISCARD_TIMEOUT_MS = 15000;
-    const restoredTabDiscardQueue = new Map();
-    let restoredTabDiscardDeadlineTimer = null;
-    let restoredTabDiscardListenersAttached = false;
-    ${extractFn(runtimeJs, 'getRestoredTabNavigationIdentity')}
-    ${extractFn(runtimeJs, 'isRestoredTabNavigationReady')}
-    ${extractFn(runtimeJs, 'removeRestoredTabDiscard')}
-    ${extractFn(runtimeJs, 'scheduleRestoredTabDiscardDeadline')}
-    ${extractFn(runtimeJs, 'tryDiscardRestoredTabAfterCommit')}
-    ${extractFn(runtimeJs, 'ensureRestoredTabDiscardListeners')}
-    ${extractFn(runtimeJs, 'discardRestoredTabAfterCommit')}
     ${extractFn(runtimeJs, 'openSavedTabsInNewWindow')}
     return openSavedTabsInNewWindow;
   `)();
 
-  const discarded = [];
   globalThis.chrome = {
     windows: {
       create: async (opts) => ({ id: 502, tabs: [{ id: 2001, url: opts.url, active: true }] }),
@@ -1579,13 +1547,6 @@ test('openSavedTabsInNewWindow discards every background tab of the restored ses
         active: !!opts.active,
         windowId: opts.windowId ?? 502,
       }),
-      get: async (id) => ({
-        id,
-        url: id === 2001 ? 'https://a.test' : id === 2002 ? 'https://b.test' : 'https://c.test',
-        active: false,
-      }),
-      discard: async (id) => { discarded.push(Number(id)); },
-      query: async () => [],
     },
   };
 
@@ -1595,11 +1556,97 @@ test('openSavedTabsInNewWindow discards every background tab of the restored ses
     { url: 'https://c.test' },
   ]);
 
-  // The first tab comes from windows.create (active) and is never discarded.
-  assert.deepEqual(discarded, [2002, 2003]);
+  // The first tab comes from windows.create (active), but remains queued so it
+  // can sleep automatically after the user switches away.
   assert.deepEqual(result.restoredTabs.map(t => t.id), [2001, 2002, 2003]);
   assert.deepEqual(result.restoredTabs.map(t => t.sourceIndex), [0, 1, 2], 'saved tab instances retain their source order');
+  assert.deepEqual(result.backgroundTabDiscards, [
+    { tabId: 2001, url: 'https://a.test' },
+    { tabId: 2002, url: 'https://b.test' },
+    { tabId: 2003, url: 'https://c.test' },
+  ]);
   delete globalThis.chrome;
+});
+
+test('restoreSavedTabSession sleeps restored background tabs only after Chrome groups are restored', async () => {
+  const fn = new Function(`
+    const calls = [];
+    const runtimeGetSavedTabSessions = async () => ([{
+      id: 'session-1',
+      tabs: [
+        { url: 'https://a.test', groupKey: '__chrome_group__:saved' },
+        { url: 'https://b.test', groupKey: '__chrome_group__:saved' },
+        { url: 'https://c.test', groupKey: '__chrome_group__:saved' },
+      ],
+    }]);
+    const runtimeGetSavedSessionRestoreMode = () => 'new-window';
+    const runtimeCreateRestoredSessionGroups = ({ restoredTabs }) => {
+      calls.push('plan');
+      return {
+        state: { groups: [], assignments: {} },
+        chromeGroupPlans: [{
+          title: 'Research',
+          color: 'blue',
+          tabIds: restoredTabs.map(tab => tab.id),
+        }],
+      };
+    };
+    let sessionGroupsState = { groups: [], assignments: {} };
+    async function saveSessionGroups() { calls.push('save'); }
+    async function renderDashboard() { calls.push('render'); }
+    async function runWithSuppressedRefresh(task) { return task(); }
+    function discardRestoredTabAfterCommit(tabId) { calls.push('discard:' + tabId); }
+    function muteChromeGroupEvents() {}
+    async function reorderGroupedTabs(groupId, tabIds) { calls.push('order:' + groupId + ':' + tabIds.join(',')); }
+    ${extractFn(runtimeJs, 'openSavedTabsInNewWindow')}
+    ${extractFn(runtimeJs, 'scheduleRestoredSessionBackgroundDiscards')}
+    ${extractFn(runtimeJs, 'restoreChromeGroupsForSession')}
+    ${extractFn(runtimeJs, 'restoreSavedTabSession')}
+    return { restoreSavedTabSession, calls };
+  `)();
+
+  globalThis.chrome = {
+    windows: {
+      create: async opts => ({ id: 701, tabs: [{ id: 3001, url: opts.url, active: true, windowId: 701 }] }),
+    },
+    tabs: {
+      create: async opts => ({
+        id: opts.url === 'https://b.test' ? 3002 : 3003,
+        url: opts.url,
+        active: !!opts.active,
+        windowId: opts.windowId,
+      }),
+      group: async opts => {
+        fn.calls.push('group:' + opts.tabIds.join(','));
+        return 910;
+      },
+    },
+    tabGroups: {
+      query: async () => [],
+      update: async (groupId, metadata) => {
+        fn.calls.push('metadata:' + groupId + ':' + metadata.title + ':' + metadata.color);
+      },
+    },
+  };
+
+  try {
+    const result = await fn.restoreSavedTabSession('session-1');
+
+    assert.equal(result.restoredCount, 3);
+    assert.deepEqual(fn.calls, [
+      'plan',
+      'group:3001,3002,3003',
+      'metadata:910:Research:blue',
+      'order:910:3001,3002,3003',
+      'discard:3001',
+      'discard:3002',
+      'discard:3003',
+      'save',
+      'render',
+    ]);
+  } finally {
+    delete globalThis.chrome;
+  }
 });
 
 test('discardRestoredTabAfterCommit uses one state check then waits for a Chrome tab update', async () => {
@@ -1607,6 +1654,7 @@ test('discardRestoredTabAfterCommit uses one state check then waits for a Chrome
   const fn = new Function(`
     ${extractFn(runtimeJs, 'discardTab')}
     const RESTORED_TAB_DISCARD_TIMEOUT_MS = 15000;
+    const RESTORED_TAB_DISCARD_RETRY_MS = 1000;
     const restoredTabDiscardQueue = new Map();
     let restoredTabDiscardDeadlineTimer = null;
     let restoredTabDiscardListenersAttached = false;
@@ -1657,6 +1705,58 @@ test('discardRestoredTabAfterCommit uses one state check then waits for a Chrome
     await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(discarded, [71], 'the completed redirect is safely discarded');
     assert.equal(fn.queue.size, 0, 'completed work leaves the shared queue');
+  } finally {
+    delete globalThis.chrome;
+  }
+});
+
+test('restore discard requests survive a transient Chrome discard failure', async () => {
+  const eventListeners = [];
+  const fn = new Function(`
+    ${extractFn(runtimeJs, 'discardTab')}
+    const RESTORED_TAB_DISCARD_TIMEOUT_MS = 15000;
+    const RESTORED_TAB_DISCARD_RETRY_MS = 1000;
+    const restoredTabDiscardQueue = new Map();
+    let restoredTabDiscardDeadlineTimer = null;
+    let restoredTabDiscardListenersAttached = false;
+    ${extractFn(runtimeJs, 'getRestoredTabNavigationIdentity')}
+    ${extractFn(runtimeJs, 'isRestoredTabNavigationReady')}
+    ${extractFn(runtimeJs, 'removeRestoredTabDiscard')}
+    ${extractFn(runtimeJs, 'scheduleRestoredTabDiscardDeadline')}
+    ${extractFn(runtimeJs, 'tryDiscardRestoredTabAfterCommit')}
+    ${extractFn(runtimeJs, 'ensureRestoredTabDiscardListeners')}
+    ${extractFn(runtimeJs, 'discardRestoredTabAfterCommit')}
+    return { discardRestoredTabAfterCommit, queue: restoredTabDiscardQueue };
+  `)();
+
+  let attempts = 0;
+  globalThis.chrome = {
+    tabs: {
+      get: async () => ({ id: 72, url: 'https://saved.example/article', status: 'loading', active: false }),
+      discard: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('temporarily busy');
+      },
+      onUpdated: { addListener: listener => eventListeners.push(listener) },
+      onRemoved: { addListener: () => {} },
+    },
+  };
+
+  try {
+    fn.discardRestoredTabAfterCommit(72, 'https://saved.example/article');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(attempts, 1);
+    assert.equal(fn.queue.size, 1, 'a failed discard must remain eligible for retry');
+
+    eventListeners[0](72, { status: 'complete' }, {
+      id: 72,
+      url: 'https://saved.example/article',
+      status: 'complete',
+      active: false,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(attempts, 2);
+    assert.equal(fn.queue.size, 0, 'successful retry removes the pending request');
   } finally {
     delete globalThis.chrome;
   }

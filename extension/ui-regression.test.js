@@ -1062,8 +1062,10 @@ test('saved session restore supports both current-window and new-window modes', 
   assert.match(runtimeJs, /async function openSavedTabsInCurrentWindow\(tabs = \[\]\)/);
   assert.match(runtimeJs, /await chrome\.tabs\.create\(\{\s*windowId: currentWindowId,\s*url: firstTab\.url,\s*active: true,\s*\}\)/);
   assert.match(runtimeJs, /await chrome\.windows\.create\(\{\s*url: firstTab\.url,\s*focused: true,\s*\}\)/);
+  assert.match(runtimeJs, /function scheduleRestoredSessionBackgroundDiscards\(backgroundTabDiscards = \[\]\)/);
   assert.match(runtimeJs, /async function restoreSavedTabToBrowser\(tabUrl\)/);
-  assert.match(runtimeJs, /const \{ windowId \} = await openSavedTabsInCurrentWindow\(\[\{ url: tabUrl \}]\);/);
+  assert.match(runtimeJs, /const opened = await openSavedTabsInCurrentWindow\(\[\{ url: tabUrl \}]\);/);
+  assert.match(runtimeJs, /scheduleRestoredSessionBackgroundDiscards\(opened\.backgroundTabDiscards\);/);
   assert.match(sessionManagerJs, /runtime\.restoreSavedTabToBrowser/);
   // Saved sessions re-create native Chrome groups (fresh groups with the
   // recorded title/color, ordered tabs) after the tabs are opened.
@@ -1081,9 +1083,13 @@ test('saved session restore supports both current-window and new-window modes', 
   assert.match(runtimeJs, /reorderGroupedTabs\(groupId, planTabIds\.map\(String\), windowId\)/);
   // A group may be created but fail its metadata write. That partial success
   // reaches the session manager instead of being lost in a console warning.
-  assert.match(runtimeJs, /const chromeGroupRestore = await restoreChromeGroupsForSession\(chromeGroupPlans, windowId\);/);
+  assert.match(runtimeJs, /chromeGroupRestore = await restoreChromeGroupsForSession\(chromeGroupPlans, windowId\);/);
+  assert.match(runtimeJs, /scheduleRestoredSessionBackgroundDiscards\(backgroundTabDiscards\);/);
   assert.match(runtimeJs, /result\.failures\.push\(\{ stage: 'metadata', groupId: Number\(groupId\), title, tabIds: planTabIds \}\);/);
   assert.match(sessionManagerJs, /toastSessionRestoredWithGroupWarning/);
+  assert.match(sessionManagerJs, /toastSessionRestoredWithGroupCreateWarning/);
+  assert.match(sessionManagerJs, /toastSessionRestoredWithGroupMetadataWarning/);
+  assert.match(sessionManagerJs, /toastSessionRestoredWithGroupOrderWarning/);
 });
 
 test('saved tabs top nav supports icon and name display modes', () => {

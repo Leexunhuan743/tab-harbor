@@ -1200,14 +1200,37 @@ function detachSavedSessionTabToNewSession({
       const chromeGroupFailures = Array.isArray(result?.chromeGroupRestore?.failures)
         ? result.chromeGroupRestore.failures
         : [];
-      const failedGroupCount = new Set(chromeGroupFailures.map(failure => `${failure?.groupId ?? 'create'}:${failure?.title || ''}`)).size;
+      const getChromeGroupFailureGroupKey = (failure = {}) => {
+        const groupId = failure?.groupId;
+        if (groupId != null) return `id:${groupId}`;
+        const title = failure?.title || '';
+        const tabIds = Array.isArray(failure?.tabIds) ? failure.tabIds.join(',') : '';
+        return `create:${title}:${tabIds}`;
+      };
+      const failedGroupCount = new Set(chromeGroupFailures.map(getChromeGroupFailureGroupKey)).size;
+      const failureStages = new Set(chromeGroupFailures.map(failure => failure?.stage || 'unknown'));
+      let restoreToastKey = 'toastSessionRestored';
+      if (failedGroupCount) {
+        if (failureStages.size === 1 && failureStages.has('create')) {
+          restoreToastKey = 'toastSessionRestoredWithGroupCreateWarning';
+        } else if (failureStages.size === 1 && failureStages.has('metadata')) {
+          restoreToastKey = 'toastSessionRestoredWithGroupMetadataWarning';
+        } else if (failureStages.size === 1 && failureStages.has('order')) {
+          restoreToastKey = 'toastSessionRestoredWithGroupOrderWarning';
+        } else {
+          restoreToastKey = 'toastSessionRestoredWithGroupWarning';
+        }
+      }
       showManagerToast(managerT
         ? managerT(
-          failedGroupCount ? 'toastSessionRestoredWithGroupWarning' : 'toastSessionRestored',
-          { count: result?.restoredCount || 0, failed: failedGroupCount }
+          restoreToastKey,
+          {
+            count: result?.restoredCount || 0,
+            failed: failedGroupCount,
+          }
         )
         : failedGroupCount
-          ? `Restored ${result?.restoredCount || 0} tabs; ${failedGroupCount} Chrome group settings need attention`
+          ? `Restored ${result?.restoredCount || 0} tabs; ${failedGroupCount} Chrome groups need attention`
           : `Restored ${result?.restoredCount || 0} tabs`);
     } catch (error) {
       console.error('[tab-harbor] Failed to restore tab session:', error);
