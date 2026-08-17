@@ -37,6 +37,7 @@ const {
   normalizeSessionGroups,
   pruneSessionGroups,
   renameSessionGroup,
+  transferSessionGroupAssignment: runtimeTransferSessionGroupAssignment,
 } = globalThis.TabOutSessionGroups || {};
 
 const {
@@ -127,6 +128,16 @@ const {
 // Visible open tabs for this dashboard window — populated by fetchOpenTabs()
 let openTabs = [];
 let allOpenTabIds = [];
+// A failed Chrome query must never be interpreted as proof that every tab was
+// closed. Session-group pruning is destructive, so it requires this snapshot.
+let hasAuthoritativeOpenTabsSnapshot = false;
+// Keep the read-prune-write path ordered with explicit group saves. Without
+// this, an older load can overwrite a just-saved manual assignment.
+let sessionGroupsMutationQueue = Promise.resolve();
+let sessionGroupTabReplacementListenerAttached = false;
+const pendingSessionGroupTabReplacementMigrations = new Set();
+const pendingSleepTabReplacementFallbacks = new Map();
+let sleepTabReplacementFallbackCleanupTimer = null;
 let sessionGroupsState = normalizeSessionGroups ? normalizeSessionGroups() : { groups: [], assignments: {} };
 const MANUAL_GROUP_PREFIX = '__session_group__:';
 const CHROME_GROUP_PREFIX = '__chrome_group__:';
@@ -896,12 +907,14 @@ function warmHitokotoCacheInBackground() {
  * Harbor's own pages via isTabOut so duplicate new tabs can be detected.
  */
 async function fetchOpenTabs() {
+  await waitForSessionGroupTabReplacementMigrations();
   try {
     const newtabUrl = window.location.href;
 
     const currentWindowId = await getDashboardWindowIdForOpenTabs();
     const tabs = await chrome.tabs.query({});
     allOpenTabIds = tabs.map(tab => tab?.id).filter(tabId => tabId != null);
+    hasAuthoritativeOpenTabsSnapshot = true;
     const visibleTabs = currentWindowId == null
       ? tabs
       : tabs.filter(t => t.windowId === currentWindowId);
@@ -935,15 +948,160 @@ async function fetchOpenTabs() {
         isTabOut: rawUrl === newtabUrl || rawUrl === 'chrome://newtab/',
       };
     });
-  } catch {
-    // chrome.tabs API unavailable (shouldn't happen in an extension page)
+    return true;
+  } catch (error) {
+    // Do not let a transient API failure turn into a persisted "all tabs are
+    // gone" snapshot. The next successful refresh will safely prune stale ids.
     openTabs = [];
     allOpenTabIds = [];
+    hasAuthoritativeOpenTabsSnapshot = false;
+    console.warn('[tab-harbor] fetchOpenTabs failed; retaining session groups:', error);
+    return false;
   }
 }
 
 function getOpenTabIdsForSessionPruning() {
   return allOpenTabIds.length > 0 ? allOpenTabIds : openTabs.map(tab => tab.id);
+}
+
+function enqueueSessionGroupsMutation(operation) {
+  const result = sessionGroupsMutationQueue.then(operation, operation);
+  // Do not poison later mutations if this one fails, while returning the real
+  // result to the caller that initiated the operation.
+  sessionGroupsMutationQueue = result.catch(() => {});
+  return result;
+}
+
+function pruneExpiredSleepTabReplacementFallbacks(now = Date.now()) {
+  for (const [tabId, fallback] of pendingSleepTabReplacementFallbacks.entries()) {
+    if (!fallback || fallback.expiresAt <= now) {
+      pendingSleepTabReplacementFallbacks.delete(tabId);
+    }
+  }
+}
+
+function scheduleSleepTabReplacementFallbackCleanup() {
+  if (sleepTabReplacementFallbackCleanupTimer != null) {
+    clearTimeout(sleepTabReplacementFallbackCleanupTimer);
+    sleepTabReplacementFallbackCleanupTimer = null;
+  }
+
+  let nextExpiry = Infinity;
+  for (const fallback of pendingSleepTabReplacementFallbacks.values()) {
+    if (Number.isFinite(fallback?.expiresAt)) {
+      nextExpiry = Math.min(nextExpiry, fallback.expiresAt);
+    }
+  }
+  if (!Number.isFinite(nextExpiry)) return;
+
+  const cleanupTimer = setTimeout(() => {
+    sleepTabReplacementFallbackCleanupTimer = null;
+    pruneExpiredSleepTabReplacementFallbacks();
+    scheduleSleepTabReplacementFallbackCleanup();
+  }, Math.max(0, nextExpiry - Date.now()));
+  // Browsers return a numeric timer id; Node returns a Timeout object. The
+  // latter must not keep standalone regression tests alive for 15 seconds.
+  if (typeof cleanupTimer?.unref === 'function') cleanupTimer.unref();
+  sleepTabReplacementFallbackCleanupTimer = cleanupTimer;
+}
+
+function rememberSleepTabReplacementFallback(tabId) {
+  pruneExpiredSleepTabReplacementFallbacks();
+  const numericTabId = Number(tabId);
+  if (!Number.isFinite(numericTabId) || numericTabId < 0) return;
+  const groupId = sessionGroupsState?.assignments?.[String(numericTabId)];
+  if (!groupId) return;
+  const group = sessionGroupsState.groups.find(entry => entry.id === groupId);
+  if (!group) return;
+
+  pendingSleepTabReplacementFallbacks.set(String(numericTabId), {
+    groupId,
+    group: { ...group },
+    expiresAt: Date.now() + 15000,
+  });
+  scheduleSleepTabReplacementFallbackCleanup();
+}
+
+function getSleepTabReplacementFallback(tabId) {
+  const key = String(Number(tabId));
+  const fallback = pendingSleepTabReplacementFallbacks.get(key);
+  if (!fallback) return null;
+  if (fallback.expiresAt <= Date.now()) {
+    pendingSleepTabReplacementFallbacks.delete(key);
+    scheduleSleepTabReplacementFallbackCleanup();
+    return null;
+  }
+  return fallback;
+}
+
+function clearSleepTabReplacementFallback(tabId) {
+  pendingSleepTabReplacementFallbacks.delete(String(Number(tabId)));
+  scheduleSleepTabReplacementFallbackCleanup();
+}
+
+async function migrateSessionGroupAssignmentForTabReplacement(addedTabId, removedTabId) {
+  const targetId = Number(addedTabId);
+  const sourceId = Number(removedTabId);
+  if (typeof runtimeTransferSessionGroupAssignment !== 'function'
+    || !Number.isFinite(targetId) || targetId < 0
+    || !Number.isFinite(sourceId) || sourceId < 0
+    || targetId === sourceId) {
+    return false;
+  }
+  const fallback = getSleepTabReplacementFallback(sourceId);
+
+  return enqueueSessionGroupsMutation(async () => {
+    const stored = await chrome.storage.local.get(SESSION_GROUPS_KEY);
+    let currentState = normalizeSessionGroups(stored[SESSION_GROUPS_KEY]);
+    // A successful sleep can race a browser replacement event. If an earlier
+    // refresh already pruned the old id, restore only the just-captured manual
+    // membership before applying Chrome's authoritative replacement relation.
+    if (!currentState.assignments[String(sourceId)] && fallback) {
+      const hasGroup = currentState.groups.some(group => group.id === fallback.groupId);
+      currentState = {
+        ...currentState,
+        groups: hasGroup ? currentState.groups : [...currentState.groups, fallback.group],
+        assignments: { ...currentState.assignments, [String(sourceId)]: fallback.groupId },
+      };
+    }
+
+    const nextState = runtimeTransferSessionGroupAssignment(currentState, sourceId, targetId);
+    const moved = Boolean(currentState.assignments[String(sourceId)])
+      && !nextState.assignments[String(sourceId)]
+      && Boolean(nextState.assignments[String(targetId)]);
+    if (!moved) return false;
+
+    sessionGroupsState = nextState;
+    await chrome.storage.local.set({ [SESSION_GROUPS_KEY]: nextState });
+    clearSleepTabReplacementFallback(sourceId);
+    return true;
+  });
+}
+
+function queueSessionGroupTabReplacementMigration(addedTabId, removedTabId) {
+  const task = migrateSessionGroupAssignmentForTabReplacement(addedTabId, removedTabId)
+    .catch(error => {
+      console.warn('[tab-harbor] Could not preserve manual group across tab replacement:', error);
+      return false;
+    });
+  pendingSessionGroupTabReplacementMigrations.add(task);
+  task.finally(() => pendingSessionGroupTabReplacementMigrations.delete(task));
+  return task;
+}
+
+async function waitForSessionGroupTabReplacementMigrations() {
+  const pending = [...pendingSessionGroupTabReplacementMigrations];
+  if (pending.length > 0) await Promise.allSettled(pending);
+}
+
+function ensureSessionGroupTabReplacementSubscription() {
+  if (sessionGroupTabReplacementListenerAttached) return;
+  const onReplaced = globalThis.chrome?.tabs?.onReplaced;
+  if (!onReplaced || typeof onReplaced.addListener !== 'function') return;
+  onReplaced.addListener((addedTabId, removedTabId) => {
+    void queueSessionGroupTabReplacementMigration(addedTabId, removedTabId);
+  });
+  sessionGroupTabReplacementListenerAttached = true;
 }
 
 async function queryTabsForDashboardWindow() {
@@ -958,18 +1116,35 @@ async function queryTabsForDashboardWindow() {
 }
 
 async function loadSessionGroups(openTabIds = []) {
-  const stored = await chrome.storage.local.get(SESSION_GROUPS_KEY);
-  const nextState = normalizeSessionGroups(stored[SESSION_GROUPS_KEY]);
-  const prunedState = pruneSessionGroups(nextState, openTabIds);
-  sessionGroupsState = prunedState;
-  await chrome.storage.local.set({ [SESSION_GROUPS_KEY]: prunedState });
-  return prunedState;
+  // Capture this at request time: a later failed/successful refresh must not
+  // change whether this particular id list is safe to use for pruning.
+  const mayPrune = hasAuthoritativeOpenTabsSnapshot;
+  const snapshotTabIds = Array.isArray(openTabIds) ? openTabIds.slice() : [];
+
+  return enqueueSessionGroupsMutation(async () => {
+    const stored = await chrome.storage.local.get(SESSION_GROUPS_KEY);
+    const nextState = normalizeSessionGroups(stored[SESSION_GROUPS_KEY]);
+    const resolvedState = mayPrune
+      ? pruneSessionGroups(nextState, snapshotTabIds)
+      : nextState;
+    sessionGroupsState = resolvedState;
+
+    // A load with an untrusted snapshot is read-only. This preserves manual
+    // groups across transient query failures during a sleep/discard action.
+    if (mayPrune) {
+      await chrome.storage.local.set({ [SESSION_GROUPS_KEY]: resolvedState });
+    }
+    return resolvedState;
+  });
 }
 
 async function saveSessionGroups(nextState) {
-  sessionGroupsState = normalizeSessionGroups(nextState);
-  await chrome.storage.local.set({ [SESSION_GROUPS_KEY]: sessionGroupsState });
-  return sessionGroupsState;
+  const normalizedState = normalizeSessionGroups(nextState);
+  return enqueueSessionGroupsMutation(async () => {
+    sessionGroupsState = normalizedState;
+    await chrome.storage.local.set({ [SESSION_GROUPS_KEY]: sessionGroupsState });
+    return sessionGroupsState;
+  });
 }
 
 async function loadImportedChromeGroupMeta() {
@@ -1561,6 +1736,23 @@ async function closeDuplicatesInSelection(tabIds, { playSound = true } = {}) {
   return closeTabsSafely(toClose, { playSound });
 }
 
+// Saving a session persists first and then closes its source tabs. Preserve
+// that durable snapshot even if the best-effort close phase cannot obtain a
+// fresh tab snapshot, and expose only the ids Chrome actually closed.
+async function closeSavedSessionSourceTabs(tabIds = []) {
+  try {
+    const result = await closeTabsSafely(tabIds, { playSound: false });
+    return {
+      closedCount: result?.closedCount || 0,
+      closedTabIds: result?.closedTabIds || new Set(),
+      closeError: false,
+    };
+  } catch (error) {
+    console.warn('[tab-harbor] Saved-session source tabs could not be closed:', error);
+    return { closedCount: 0, closedTabIds: new Set(), closeError: true };
+  }
+}
+
 async function mergeTabsIntoChromeGroup(tabIds, { title, color }) {
   // The write is muted so the dashboard's own group event cannot echo.
   if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
@@ -1597,6 +1789,9 @@ async function sleepTabsByIds(tabIds, { skipActive = true } = {}) {
     try { liveTab = await chrome.tabs.get(tabId); } catch { liveTab = null; }
     if (!liveTab) return { tabId, status: 'stale' };
     if (skipActive && liveTab?.active) return { tabId, status: 'skipped-active' };
+    // Keep the exact manual membership briefly in case Chrome replaces this
+    // tab while the discard event is being delivered.
+    rememberSleepTabReplacementFallback(tabId);
     const ok = await discardTab(tabId);
     return { tabId, status: ok ? 'discarded' : 'failed' };
   });
@@ -1671,16 +1866,16 @@ async function saveTabsAsSession(tabs, selectedTabIds, source = 'manual', name =
     .map(tab => getTabIdValue(tab?.id))
     .filter(Number.isFinite);
 
-  if (tabIdsToClose.length > 0) {
-    await chrome.tabs.remove(tabIdsToClose);
-  }
+  const closeResult = await closeSavedSessionSourceTabs(tabIdsToClose);
 
   await renderDashboard();
 
   return {
     session: snapshot,
     sessions: savedSessions,
-    closedTabIds: tabIdsToClose,
+    closedCount: closeResult.closedCount,
+    closedTabIds: [...closeResult.closedTabIds],
+    closeError: closeResult.closeError,
   };
 }
 
@@ -1727,14 +1922,14 @@ async function appendTabsToExistingSavedSession(sessionId, tabIds = []) {
     .map(tab => getTabIdValue(tab?.id))
     .filter(Number.isFinite);
 
-  if (tabIdsToClose.length > 0) {
-    await chrome.tabs.remove(tabIdsToClose);
-  }
+  const closeResult = await closeSavedSessionSourceTabs(tabIdsToClose);
 
   return {
     ...result,
     selectedCount: snapshot.tabs.length,
-    closedTabIds: tabIdsToClose,
+    closedCount: closeResult.closedCount,
+    closedTabIds: [...closeResult.closedTabIds],
+    closeError: closeResult.closeError,
   };
 }
 
@@ -2000,9 +2195,10 @@ async function submitTabSessionPicker() {
       };
       await renderDashboard();
       const skipped = result?.skippedDuplicateCount || 0;
+      const closedCount = result?.closedCount || 0;
       showToast(runtimeT
-        ? runtimeT('toastSessionTabsAdded', { count: result?.appendedCount || 0, skipped })
-        : `Added ${result?.appendedCount || 0} tabs${skipped ? `, skipped ${skipped} duplicates` : ''}`);
+        ? runtimeT('toastSessionTabsAdded', { count: result?.appendedCount || 0, closedCount, skipped })
+        : `Added ${result?.appendedCount || 0} tabs; closed ${closedCount} originals${skipped ? `, skipped ${skipped} duplicates` : ''}`);
       return;
     }
 
@@ -2018,8 +2214,11 @@ async function submitTabSessionPicker() {
       newSessionName
     );
     showToast(runtimeT
-      ? runtimeT('toastSessionSaved', { count: result?.session?.tabs?.length || 0 })
-      : `Saved ${result?.session?.tabs?.length || 0} tabs and closed the originals`);
+      ? runtimeT('toastSessionSaved', {
+        count: result?.session?.tabs?.length || 0,
+        closedCount: result?.closedCount || 0,
+      })
+      : `Saved ${result?.session?.tabs?.length || 0} tabs; closed ${result?.closedCount || 0} originals`);
   } catch (err) {
     console.error('[tab-harbor] Failed to save selected tabs:', err);
     showToast(runtimeT ? runtimeT('toastSessionActionFailed') : 'Could not update saved tabs');
@@ -2027,7 +2226,9 @@ async function submitTabSessionPicker() {
 }
 
 async function openSavedTabsInCurrentWindow(tabs = []) {
-  const [firstTab, ...restTabs] = Array.isArray(tabs) ? tabs : [];
+  const entries = (Array.isArray(tabs) ? tabs : []).map((tab, sourceIndex) => ({ tab, sourceIndex }));
+  const [firstEntry, ...restEntries] = entries;
+  const firstTab = firstEntry?.tab;
   if (!firstTab?.url) return { restoredTabs: [], windowId: null };
 
   const currentWindowId = await getCurrentWindowId();
@@ -2043,10 +2244,10 @@ async function openSavedTabsInCurrentWindow(tabs = []) {
     });
   const targetWindowId = firstCreatedTab?.windowId ?? currentWindowId ?? null;
   const restoredTabs = firstCreatedTab?.id != null
-    ? [{ id: firstCreatedTab.id, url: firstTab.url }]
+    ? [{ id: firstCreatedTab.id, url: firstTab.url, sourceIndex: firstEntry.sourceIndex }]
     : [];
 
-  for (const tab of restTabs) {
+  for (const { tab, sourceIndex } of restEntries) {
     const createdTab = await chrome.tabs.create({
       windowId: targetWindowId,
       url: tab.url,
@@ -2064,6 +2265,7 @@ async function openSavedTabsInCurrentWindow(tabs = []) {
     restoredTabs.push({
       id: createdTab.id,
       url: tab.url,
+      sourceIndex,
     });
   }
 
@@ -2071,7 +2273,9 @@ async function openSavedTabsInCurrentWindow(tabs = []) {
 }
 
 async function openSavedTabsInNewWindow(tabs = []) {
-  const [firstTab, ...restTabs] = Array.isArray(tabs) ? tabs : [];
+  const entries = (Array.isArray(tabs) ? tabs : []).map((tab, sourceIndex) => ({ tab, sourceIndex }));
+  const [firstEntry, ...restEntries] = entries;
+  const firstTab = firstEntry?.tab;
   if (!firstTab?.url) return { restoredTabs: [], windowId: null };
 
   const createdWindow = await chrome.windows.create({
@@ -2084,6 +2288,7 @@ async function openSavedTabsInNewWindow(tabs = []) {
     restoredTabs.push({
       id: firstCreatedTab.id,
       url: firstTab.url,
+      sourceIndex: firstEntry.sourceIndex,
     });
   } else if (createdWindow?.id != null) {
     const createdWindowTabs = await chrome.tabs.query({ windowId: createdWindow.id });
@@ -2092,11 +2297,12 @@ async function openSavedTabsInNewWindow(tabs = []) {
       restoredTabs.push({
         id: queriedFirstTab.id,
         url: firstTab.url,
+        sourceIndex: firstEntry.sourceIndex,
       });
     }
   }
 
-  for (const tab of restTabs) {
+  for (const { tab, sourceIndex } of restEntries) {
     const createdTab = await chrome.tabs.create({
       windowId: createdWindow.id,
       url: tab.url,
@@ -2114,6 +2320,7 @@ async function openSavedTabsInNewWindow(tabs = []) {
     restoredTabs.push({
       id: createdTab.id,
       url: tab.url,
+      sourceIndex,
     });
   }
 
@@ -2161,14 +2368,17 @@ async function restoreSavedTabSession(sessionId) {
       now: new Date().toISOString(),
     });
     // Re-create native Chrome groups that were saved with the session: fresh
-    // groups with the recorded title/color, tabs in the recorded order.
-    await restoreChromeGroupsForSession(chromeGroupPlans, windowId);
+    // groups with the recorded title/color, tabs in the recorded order. The
+    // result records a partial native-group restore instead of hiding a group
+    // that was created successfully but could not be named/colored.
+    const chromeGroupRestore = await restoreChromeGroupsForSession(chromeGroupPlans, windowId);
     await saveSessionGroups(nextSessionGroups);
     await renderDashboard();
 
     return {
       restoredCount: restoredTabs.length,
       windowId,
+      chromeGroupRestore,
     };
   });
 }
@@ -2184,7 +2394,8 @@ async function restoreSavedTabSession(sessionId) {
  * the dashboard's own group events cannot echo.
  */
 async function restoreChromeGroupsForSession(plans, windowId) {
-  if (!Array.isArray(plans) || !plans.length) return;
+  const result = { attempted: 0, restored: [], failures: [] };
+  if (!Array.isArray(plans) || !plans.length) return result;
   let existingTitles = new Set();
   try {
     // Same-title conflict check is scoped to the restore target window; let
@@ -2202,6 +2413,7 @@ async function restoreChromeGroupsForSession(plans, windowId) {
       .map(Number)
       .filter(Number.isFinite);
     if (!planTabIds.length) continue;
+    result.attempted += 1;
 
     let title = String(plan?.title || '').trim();
     // Same-title group already in the window → independent group with a
@@ -2217,6 +2429,7 @@ async function restoreChromeGroupsForSession(plans, windowId) {
     }
     if (title) existingTitles.add(title);
 
+    let groupId = null;
     if (typeof muteChromeGroupEvents === 'function') muteChromeGroupEvents();
     try {
       // Chrome creates the new group in the CALLER's window by default, which
@@ -2229,21 +2442,56 @@ async function restoreChromeGroupsForSession(plans, windowId) {
       const groupOptions = windowId != null
         ? { tabIds: planTabIds, createProperties: { windowId: Number(windowId) } }
         : { tabIds: planTabIds };
-      const groupId = await chrome.tabs.group(groupOptions);
-      if (groupId == null) continue;
+      groupId = await chrome.tabs.group(groupOptions);
+      if (groupId == null) {
+        result.failures.push({ stage: 'create', title, tabIds: planTabIds });
+        console.warn('[tab-harbor] restoreChromeGroupsForSession: Chrome returned no group id');
+        continue;
+      }
+    } catch (err) {
+      result.failures.push({ stage: 'create', title, tabIds: planTabIds });
+      console.warn('[tab-harbor] restoreChromeGroupsForSession: group creation failed:', err);
+      continue;
+    }
+
+    const restored = {
+      groupId: Number(groupId),
+      title,
+      tabIds: planTabIds,
+      metadataApplied: false,
+      orderApplied: false,
+    };
+    result.restored.push(restored);
+    try {
       await chrome.tabGroups.update(groupId, {
         title,
         color: String(plan?.color || 'grey'),
       });
-      // The tabs were created in recorded order; reorder the native group to
-      // match the saved in-group order exactly.
-      if (typeof reorderGroupedTabs === 'function') {
-        await reorderGroupedTabs(groupId, planTabIds.map(String), windowId);
-      }
+      restored.metadataApplied = true;
     } catch (err) {
-      console.warn('[tab-harbor] restoreChromeGroupsForSession failed:', err);
+      // The native group and its membership now exist, so report that exact
+      // half-success to the caller rather than swallowing it as a generic
+      // console warning.
+      result.failures.push({ stage: 'metadata', groupId: Number(groupId), title, tabIds: planTabIds });
+      console.warn('[tab-harbor] restoreChromeGroupsForSession: group metadata update failed:', err);
+    }
+
+    // The tabs were created in recorded order; reorder the native group to
+    // match the saved in-group order exactly. Ordering is independent of the
+    // cosmetic metadata write, so still attempt it after a metadata failure.
+    if (typeof reorderGroupedTabs === 'function') {
+      try {
+        await reorderGroupedTabs(groupId, planTabIds.map(String), windowId);
+        restored.orderApplied = true;
+      } catch (err) {
+        result.failures.push({ stage: 'order', groupId: Number(groupId), title, tabIds: planTabIds });
+        console.warn('[tab-harbor] restoreChromeGroupsForSession: group ordering failed:', err);
+      }
+    } else {
+      restored.orderApplied = true;
     }
   }
+  return result;
 }
 
 async function removeOpenTabByIdOrUrl(tabId, tabUrl) {
@@ -3558,12 +3806,105 @@ async function closeTabOutDupes() {
 async function discardTab(tabId) {
   if (!tabId) return false;
   try {
-    await chrome.tabs.discard(Number(tabId));
+    const discardedTab = await chrome.tabs.discard(Number(tabId));
+    const returnedTabId = Number(discardedTab?.id);
+    if (Number.isFinite(returnedTabId) && returnedTabId >= 0 && returnedTabId !== Number(tabId)) {
+      await queueSessionGroupTabReplacementMigration(returnedTabId, Number(tabId));
+    }
     return true;
   } catch (err) {
     console.error('Failed to discard tab:', err);
     return false;
   }
+}
+
+// Restoring a session can create many background tabs at once. Keep one
+// event-driven queue for their post-navigation sleep operation instead of one
+// 100 ms polling loop per tab.
+const RESTORED_TAB_DISCARD_TIMEOUT_MS = 15000;
+const restoredTabDiscardQueue = new Map();
+let restoredTabDiscardDeadlineTimer = null;
+let restoredTabDiscardListenersAttached = false;
+
+function getRestoredTabNavigationIdentity(url) {
+  const raw = String(url || '').trim();
+  if (!raw) return '';
+  if (typeof runtimeGetCanonicalTabUrl === 'function') {
+    try {
+      return String(runtimeGetCanonicalTabUrl(raw) || raw);
+    } catch {}
+  }
+  try {
+    return new URL(raw).href;
+  } catch {
+    return raw;
+  }
+}
+
+function isRestoredTabNavigationReady(liveTab, targetUrl, changeInfo = {}) {
+  const liveUrl = String(changeInfo?.url || liveTab?.url || '').trim();
+  if (!liveUrl || liveUrl === 'about:blank' || liveUrl === 'chrome://newtab/') return false;
+
+  // The normal case should match the saved URL. A completed redirect is also
+  // safe to sleep: the tab has a committed destination, while a loading
+  // redirect is left alone until Chrome reports the completed state.
+  if (getRestoredTabNavigationIdentity(liveUrl) === getRestoredTabNavigationIdentity(targetUrl)) return true;
+  return changeInfo?.status === 'complete' || liveTab?.status === 'complete';
+}
+
+function removeRestoredTabDiscard(tabId) {
+  restoredTabDiscardQueue.delete(Number(tabId));
+  scheduleRestoredTabDiscardDeadline();
+}
+
+function scheduleRestoredTabDiscardDeadline() {
+  if (restoredTabDiscardDeadlineTimer != null) {
+    clearTimeout(restoredTabDiscardDeadlineTimer);
+    restoredTabDiscardDeadlineTimer = null;
+  }
+  let nextDeadline = Infinity;
+  for (const entry of restoredTabDiscardQueue.values()) {
+    nextDeadline = Math.min(nextDeadline, entry.deadline);
+  }
+  if (!Number.isFinite(nextDeadline)) return;
+
+  restoredTabDiscardDeadlineTimer = setTimeout(() => {
+    restoredTabDiscardDeadlineTimer = null;
+    const now = Date.now();
+    for (const [tabId, entry] of restoredTabDiscardQueue.entries()) {
+      if (entry.deadline <= now) restoredTabDiscardQueue.delete(tabId);
+    }
+    scheduleRestoredTabDiscardDeadline();
+  }, Math.max(0, nextDeadline - Date.now()));
+}
+
+async function tryDiscardRestoredTabAfterCommit(tabId, liveTab, changeInfo = {}) {
+  const numericId = Number(tabId);
+  const entry = restoredTabDiscardQueue.get(numericId);
+  if (!entry) return false;
+  if (entry.deadline <= Date.now()) {
+    removeRestoredTabDiscard(numericId);
+    return false;
+  }
+  if (!isRestoredTabNavigationReady(liveTab, entry.targetUrl, changeInfo)) return false;
+
+  removeRestoredTabDiscard(numericId);
+  return discardTab(numericId);
+}
+
+function ensureRestoredTabDiscardListeners() {
+  if (restoredTabDiscardListenersAttached || typeof chrome === 'undefined') return;
+  const onUpdated = chrome.tabs?.onUpdated;
+  const onRemoved = chrome.tabs?.onRemoved;
+  if (!onUpdated || typeof onUpdated.addListener !== 'function') return;
+
+  onUpdated.addListener((tabId, changeInfo, tab) => {
+    void tryDiscardRestoredTabAfterCommit(tabId, tab, changeInfo);
+  });
+  if (onRemoved && typeof onRemoved.addListener === 'function') {
+    onRemoved.addListener(tabId => removeRestoredTabDiscard(tabId));
+  }
+  restoredTabDiscardListenersAttached = true;
 }
 
 /**
@@ -3573,31 +3914,29 @@ async function discardTab(tabId) {
  * (the tab's url is no longer blank/about:blank). Discarding a tab while its
  * navigation is still pending cancels the navigation and resets the tab to
  * about:blank in Edge — the recorded URL is lost and activating the tab later
- * would reload a blank page instead of the saved page. Polling stops as soon
- * as the url is committed, which happens early in the load (first bytes), so
- * the page is never fully rendered; a timeout degrades to a normally-loading
- * tab on slow networks. Fire-and-forget: the restored id list is unaffected
- * (discard keeps the tab id), and failures are swallowed by discardTab.
+ * would reload a blank page instead of the saved page. A one-time current-tab
+ * check handles an already-committed navigation; otherwise tabs.onUpdated
+ * drives the work. One shared deadline timer removes slow or failed loads, so
+ * those tabs simply continue loading. Fire-and-forget: the restored id list
+ * is unaffected (discard keeps the tab id), and failures are swallowed by
+ * discardTab.
  */
-async function discardRestoredTabAfterCommit(tabId, targetUrl) {
+function discardRestoredTabAfterCommit(tabId, targetUrl) {
   const numericId = Number(tabId);
   if (!Number.isFinite(numericId)) return;
-  const deadline = Date.now() + 15000;
-  while (Date.now() < deadline) {
-    let live = null;
-    try {
-      live = await chrome.tabs.get(numericId);
-    } catch {
-      return; // tab already gone — nothing to sleep
-    }
-    const url = String(live?.url || '');
-    if (url && url !== 'about:blank' && url !== 'chrome://newtab/') {
-      await discardTab(numericId);
-      return;
-    }
-    await new Promise(resolve => setTimeout(resolve, 100));
-  }
-  // Timeout: leave the tab loading normally.
+  restoredTabDiscardQueue.set(numericId, {
+    targetUrl: String(targetUrl || ''),
+    deadline: Date.now() + RESTORED_TAB_DISCARD_TIMEOUT_MS,
+  });
+  ensureRestoredTabDiscardListeners();
+  scheduleRestoredTabDiscardDeadline();
+
+  // The navigation may have committed before tabs.create resolved, in which
+  // case Chrome will not emit another update for us. Check exactly once; do
+  // not turn that race into a per-tab polling loop.
+  void chrome.tabs.get(numericId)
+    .then(liveTab => tryDiscardRestoredTabAfterCommit(numericId, liveTab))
+    .catch(() => removeRestoredTabDiscard(numericId));
 }
 
 
@@ -5375,7 +5714,7 @@ document.addEventListener('click', async (e) => {
       await renderDashboard();
       window.__suppressAutoRefreshUntil = 0;
 
-      const closedCount = group.isChromeGroup ? closeResult.closedCount : urls.length;
+      const closedCount = closeResult.closedCount;
       const groupLabel = group.domain === '__landing-pages__'
         ? (runtimeT ? runtimeT('homepagesLabel') : 'Homepages')
         : (group.label || friendlyDomain(group.domain));
@@ -5390,6 +5729,9 @@ document.addEventListener('click', async (e) => {
       if (statTabs) statTabs.textContent = openTabs.length;
       return;
     } finally {
+      // A rejected close/query/render must not strand the event-driven tab
+      // refresh behind a stale suppression deadline.
+      window.__suppressAutoRefreshUntil = 0;
       cardActionInFlight = false;
     }
   }
@@ -5602,12 +5944,12 @@ document.addEventListener('click', async (e) => {
       // Suppress auto-refresh to prevent animation spam
       window.__suppressAutoRefreshUntil = Date.now() + 2000;
 
-      if (chromeGroup) {
-        await closeDuplicatesInSelection(chromeTabIds, { playSound: false });
-      } else {
-        await closeDuplicatesByUrls(urls, { keepOne: true, playSound: false });
+      const closeResult = chromeGroup
+        ? await closeDuplicatesInSelection(chromeTabIds, { playSound: false })
+        : await closeDuplicatesByUrls(urls, { keepOne: true, playSound: false });
+      if (closeResult.closedCount > 0) {
+        playCloseSound();
       }
-      playCloseSound();
 
       // Rebuild the open-tabs area right away so the kept copy shows
       // immediately. The suppression above deliberately drops the event-driven
@@ -5616,35 +5958,56 @@ document.addEventListener('click', async (e) => {
       await renderDashboard();
       window.__suppressAutoRefreshUntil = 0;
 
-      showToast(runtimeT ? runtimeT('toastClosedDuplicatesKeptOne') : 'Closed duplicates, kept one copy each');
+      showToast(closeResult.closedCount > 0
+        ? (runtimeT ? runtimeT('toastClosedDuplicatesKeptOne') : 'Closed duplicates, kept one copy each')
+        : (runtimeT ? runtimeT('toastNoDuplicatesClosed') : 'No duplicate tabs were closed'));
       return;
     } finally {
+      // The close operation or the immediate re-render can reject. Always
+      // release refresh suppression before allowing another card action.
+      window.__suppressAutoRefreshUntil = 0;
       cardActionInFlight = false;
     }
   }
 
   // ---- Close ALL open tabs ----
   if (action === 'close-all-open-tabs') {
-    // Suppress auto-refresh to prevent animation spam
-    window.__suppressAutoRefreshUntil = Date.now() + 2000;
-    
-    const allUrls = openTabs
-      .filter(t => t.url && !t.url.startsWith('chrome') && !t.url.startsWith('about:'))
-      .map(t => t.url);
-    await closeTabsByUrlsSafely(allUrls, { playSound: false });
-    await refreshTabData();
-    playCloseSound();
+    if (cardActionInFlight) return;
+    cardActionInFlight = true;
+    try {
+      await runWithSuppressedRefresh(async () => {
+        const allUrls = openTabs
+          .filter(t => t.url && !t.url.startsWith('chrome') && !t.url.startsWith('about:'))
+          .map(t => t.url);
+        const closeResult = await closeTabsByUrlsSafely(allUrls, { playSound: false });
+        await refreshTabData();
+        const remainingCount = getRealTabs().length;
+        if (closeResult.closedCount > 0) playCloseSound();
 
-    document.querySelectorAll('#openTabsMissions .mission-card').forEach(c => {
-      shootConfetti(
-        c.getBoundingClientRect().left + c.offsetWidth / 2,
-        c.getBoundingClientRect().top  + c.offsetHeight / 2
-      );
-      animateCardOut(c);
-    });
-    window.__suppressAutoRefreshUntil = 0;
+        if (remainingCount === 0) {
+          document.querySelectorAll('#openTabsMissions .mission-card').forEach(c => {
+            shootConfetti(
+              c.getBoundingClientRect().left + c.offsetWidth / 2,
+              c.getBoundingClientRect().top  + c.offsetHeight / 2
+            );
+            animateCardOut(c);
+          });
+        } else {
+          await renderDashboard();
+        }
 
-    showToast(runtimeT ? runtimeT('toastAllTabsClosed') : 'All tabs closed. Fresh start.');
+        showToast(remainingCount === 0
+          ? (runtimeT ? runtimeT('toastAllTabsClosed') : 'All tabs closed. Fresh start.')
+          : (runtimeT
+            ? runtimeT('toastTabsClosedWithRemaining', { closedCount: closeResult.closedCount, remainingCount })
+            : `Closed ${closeResult.closedCount} tabs; ${remainingCount} remain open`));
+      });
+    } catch (error) {
+      console.warn('[tab-harbor] Could not close all tabs:', error);
+      showToast(runtimeT ? runtimeT('toastTabsCloseFailed') : 'Could not close tabs');
+    } finally {
+      cardActionInFlight = false;
+    }
     return;
   }
 });
@@ -6647,6 +7010,7 @@ async function initializeDashboardRuntime() {
     chromeTabGroupsEnabled = await loadChromeTabGroupsSetting();
   }
   await loadImportedChromeGroupMeta();
+  ensureSessionGroupTabReplacementSubscription();
   if (chromeTabGroupsEnabled) {
     await fetchOpenTabs();
     const realTabs = getRealTabs();
@@ -6701,6 +7065,9 @@ function setupTabChangeListener() {
     if (DEBUG) console.log('[tab-harbor] Received message:', message);
 
     if (message.action === 'tabs-changed') {
+      if (message.source === 'tabs.onReplaced') {
+        void queueSessionGroupTabReplacementMigration(message.triggerTabId, message.replacedTabId);
+      }
       if (shouldSkipStartupTabChange(message)) {
         return;
       }

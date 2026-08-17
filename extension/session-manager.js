@@ -1180,8 +1180,11 @@ function detachSavedSessionTabToNewSession({
       const result = await runtime.saveCurrentWindowTabSession();
       if (sessionManagerPage === 'saved-tabs') await renderSavedTabsPage();
       showManagerToast(managerT
-        ? managerT('toastSessionSaved', { count: result?.session?.tabs?.length || 0 })
-        : `Saved ${result?.session?.tabs?.length || 0} tabs and closed the originals`);
+        ? managerT('toastSessionSaved', {
+          count: result?.session?.tabs?.length || 0,
+          closedCount: result?.closedCount || 0,
+        })
+        : `Saved ${result?.session?.tabs?.length || 0} tabs; closed ${result?.closedCount || 0} originals`);
     } catch (error) {
       console.error('[tab-harbor] Failed to save current window session:', error);
       showManagerToast(getErrorToast());
@@ -1194,9 +1197,18 @@ function detachSavedSessionTabToNewSession({
     try {
       const result = await runtime.restoreSavedTabSession(sessionId);
       await renderSavedTabsPage();
+      const chromeGroupFailures = Array.isArray(result?.chromeGroupRestore?.failures)
+        ? result.chromeGroupRestore.failures
+        : [];
+      const failedGroupCount = new Set(chromeGroupFailures.map(failure => `${failure?.groupId ?? 'create'}:${failure?.title || ''}`)).size;
       showManagerToast(managerT
-        ? managerT('toastSessionRestored', { count: result?.restoredCount || 0 })
-        : `Restored ${result?.restoredCount || 0} tabs`);
+        ? managerT(
+          failedGroupCount ? 'toastSessionRestoredWithGroupWarning' : 'toastSessionRestored',
+          { count: result?.restoredCount || 0, failed: failedGroupCount }
+        )
+        : failedGroupCount
+          ? `Restored ${result?.restoredCount || 0} tabs; ${failedGroupCount} Chrome group settings need attention`
+          : `Restored ${result?.restoredCount || 0} tabs`);
     } catch (error) {
       console.error('[tab-harbor] Failed to restore tab session:', error);
       showManagerToast(getErrorToast());

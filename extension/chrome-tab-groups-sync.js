@@ -3,7 +3,15 @@
 (function attachChromeTabGroups(globalScope) {
 
   const STORAGE_KEY = 'chromeTabGroupsEnabled';
-  const META_PERSIST_KEY = 'chromeTabGroupsMeta';
+  // Chrome window and tab-group ids are unique only for the current browser
+  // session. Keep the live mapping in session storage so a dashboard reload
+  // can reuse it, but never let it survive a browser restart or config import.
+  const SESSION_MAP_KEY = 'chromeTabGroupsSessionMap';
+  // Kept only so upgraded installations can discard the old local cache. It
+  // must not participate in ownership recovery: its window ids are stale
+  // after a browser restart and title/color alone cannot safely claim a user
+  // native group.
+  const LEGACY_META_PERSIST_KEY = 'chromeTabGroupsMeta';
 
   let cachedEnabled = false;
   let chromeGroupMap = {};
@@ -11,6 +19,7 @@
   let chromeEventMuteUntil = 0;
   let chromeListenersAttached = false;
   let chromeGroupsLastError = '';
+  let legacyMetaCleared = false;
   const chromeGroupSubscribers = new Set();
 
   const GROUP_COLORS = ['grey', 'red', 'green', 'pink', 'purple', 'cyan', 'orange'];
@@ -86,8 +95,8 @@
 
   // Session groups and the landing-pages card keep dedicated colors (blue /
   // yellow); regular domain mirrors cycle through the shared palette. The
-  // assigned color is part of a mirror's title+color identity fingerprint
-  // (see loadPersistedChromeGroupMap), so the palette order must stay stable.
+  // assigned color stays stable so domain mirrors remain visually predictable
+  // and do not needlessly mimic an identically named user-created group.
   function assignGroupColor(groupKey, index) {
     if (groupKey.startsWith('__session_group__:')) return 'blue';
     if (groupKey === '__landing-pages__') return 'yellow';
@@ -95,39 +104,12 @@
   }
 
   /**
-   * currentMappingCandidates(groupKey, windowIdKey, matches)
-   *
-   * Returns the in-session mappings that are still among the ambiguous
-   * candidates (each as { windowId, id }). For per-window meta keys only that
-   * window's mapping counts; for legacy flat meta ('any' key) the in-session
-   * map is keyed by the real window id, so every window mapping of this group
-   * key is considered — the session may legitimately hold mirrors for the same
-   * group key in several windows (C4 follow-up).
-   */
-  function currentMappingCandidates(groupKey, windowIdKey, matches) {
-    const windowMap = chromeGroupMap?.[groupKey];
-    if (!windowMap) return [];
-    if (windowIdKey !== 'any') {
-      const currentId = windowMap[windowIdKey];
-      const match = currentId != null ? matches.find(g => Number(g.id) === Number(currentId)) : null;
-      return match ? [{ windowId: match.windowId, id: match.id }] : [];
-    }
-    const kept = [];
-    for (const [windowIdStr, chromeGroupId] of Object.entries(windowMap)) {
-      if (chromeGroupId != null && matches.some(g => Number(g.id) === Number(chromeGroupId))) {
-        kept.push({ windowId: windowIdStr, id: chromeGroupId });
-      }
-    }
-    return kept;
-  }
-
-  /**
    * isGroupIdentityFree(title, color, windowId, currentGroups)
    *
    * A mirror's identity is its window + title + color fingerprint. Returns
    * true when no group in the given window already carries that fingerprint.
-   * Used before creating a new mirror so its identity can never stay
-   * ambiguous for loadPersistedChromeGroupMap (C4 follow-up).
+   * Used before creating a new mirror so its appearance cannot be confused
+   * with an identically named user-created group in the same window.
    */
   function isGroupIdentityFree(title, color, windowId, currentGroups) {
     if (!Array.isArray(currentGroups)) return true;
@@ -170,81 +152,72 @@
     return cachedEnabled;
   }
 
-  async function persistChromeGroupMap() {
+  function getSessionStorageArea() {
+    const area = typeof chrome !== 'undefined' ? chrome?.storage?.session : null;
+    return area && typeof area.get === 'function' && typeof area.set === 'function'
+      ? area
+      : null;
+  }
+
+  async function discardLegacyLocalMeta() {
+    if (legacyMetaCleared) return;
+    legacyMetaCleared = true;
     try {
-      // Save group metadata (title, color) per window instead of raw groupIds,
-      // since Chrome tab group IDs are only stable within a session. Keeping
-      // the window id in the key lets reload match within the SAME window, so a
-      // user-created group that happens to share title+color in another window
-      // is never misclassified as a dashboard mirror.
-      const meta = {};
-      for (const [groupKey, windowMap] of Object.entries(chromeGroupMap)) {
-        for (const [windowIdStr, chromeGroupId] of Object.entries(windowMap)) {
-          try {
-            const group = await chrome.tabGroups.get(chromeGroupId);
-            if (group) {
-              if (!meta[groupKey]) meta[groupKey] = {};
-              meta[groupKey][windowIdStr] = { title: group.title, color: group.color };
-            }
-          } catch {}
-        }
+      await chrome.storage?.local?.remove?.(LEGACY_META_PERSIST_KEY);
+    } catch {}
+  }
+
+  function normalizeSessionGroupMap(input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+    const normalized = {};
+    for (const [groupKey, windowMap] of Object.entries(input)) {
+      if (!windowMap || typeof windowMap !== 'object' || Array.isArray(windowMap)) continue;
+      for (const [windowIdStr, groupId] of Object.entries(windowMap)) {
+        const windowId = Number(windowIdStr);
+        const chromeGroupId = Number(groupId);
+        if (!Number.isFinite(windowId) || !Number.isFinite(chromeGroupId)) continue;
+        if (!normalized[groupKey]) normalized[groupKey] = {};
+        normalized[groupKey][windowId] = chromeGroupId;
       }
-      await chrome.storage.local.set({ [META_PERSIST_KEY]: meta });
+    }
+    return normalized;
+  }
+
+  async function persistChromeGroupMap() {
+    const sessionStorage = getSessionStorageArea();
+    if (!sessionStorage) return;
+    try {
+      await sessionStorage.set({ [SESSION_MAP_KEY]: normalizeSessionGroupMap(chromeGroupMap) });
     } catch {}
   }
 
   async function loadPersistedChromeGroupMap() {
-    try {
-      const result = await chrome.storage.local.get(META_PERSIST_KEY);
-      const meta = result[META_PERSIST_KEY];
-      if (!meta || Object.keys(meta).length === 0) return;
+    await discardLegacyLocalMeta();
+    const sessionStorage = getSessionStorageArea();
+    if (!sessionStorage) {
+      chromeGroupMap = {};
+      return;
+    }
 
+    try {
+      const result = await sessionStorage.get(SESSION_MAP_KEY);
+      const storedMap = normalizeSessionGroupMap(result?.[SESSION_MAP_KEY]);
       const currentGroups = await chrome.tabGroups.query({});
+      const liveById = new Map(currentGroups.map(group => [Number(group.id), group]));
       const reconciled = {};
 
-      for (const [groupKey, stored] of Object.entries(meta)) {
-        // Stored shape is { windowId: { title, color } }. Older snapshots may
-        // be flat { title, color } — fall back to matching any window for them.
-        const perWindow = stored && typeof stored === 'object' && !('title' in stored) && !('color' in stored)
-          ? stored
-          : { any: stored };
-        for (const [windowIdKey, info] of Object.entries(perWindow)) {
-          if (!info || typeof info !== 'object') continue;
-          // Match by window + title + color — the values we control. After
-          // restart Chrome assigns new groupIds, but our groups retain their
-          // title/color within the same window.
-          const matches = currentGroups.filter(g =>
-            (windowIdKey === 'any' || Number(g.windowId) === Number(windowIdKey)) &&
-            g.title === info.title && g.color === info.color
-          );
-          // If more than one group has the same title+color (legacy flat
-          // snapshots across windows, or same-window duplicates after the
-          // per-window migration), auto-binding would be a coin toss that can
-          // mark a user group as a mirror. Prefer the mapping THIS session
-          // already established when it is still among the candidates — that
-          // group is the mirror we created/managed, so reusing it is not a
-          // guess. Otherwise skip and let the next persist (or a toggle off/on)
-          // rebuild a correct mapping (C4).
-          if (matches.length > 1) {
-            const currentMatches = currentMappingCandidates(groupKey, windowIdKey, matches);
-            if (currentMatches.length > 0) {
-              for (const cm of currentMatches) {
-                if (!reconciled[groupKey]) reconciled[groupKey] = {};
-                reconciled[groupKey][cm.windowId] = cm.id;
-              }
-              continue;
-            }
-            console.warn(`[tab-harbor] ambiguous chromeTabGroupsMeta for ${groupKey}; skipping auto-bind`);
-            continue;
-          }
-          const match = matches[0];
-          if (match) {
-            if (!reconciled[groupKey]) reconciled[groupKey] = {};
-            reconciled[groupKey][match.windowId] = match.id;
-          }
+      // Exact ids are safe only while session storage is alive. Validate both
+      // the live group id and its current window before reusing the mapping;
+      // after a browser restart session storage is empty, so no native group
+      // is silently claimed as an extension-managed mirror.
+      for (const [groupKey, windowMap] of Object.entries(storedMap)) {
+        for (const [windowIdStr, chromeGroupId] of Object.entries(windowMap)) {
+          const group = liveById.get(Number(chromeGroupId));
+          if (!group || Number(group.windowId) !== Number(windowIdStr)) continue;
+          if (!reconciled[groupKey]) reconciled[groupKey] = {};
+          reconciled[groupKey][Number(windowIdStr)] = Number(chromeGroupId);
         }
       }
-
       chromeGroupMap = reconciled;
     } catch {}
   }
@@ -591,8 +564,12 @@
     cachedEnabled = false;
     importMode = false;
     chromeEventMuteUntil = 0;
+    legacyMetaCleared = false;
     try {
-      await chrome.storage.local.remove(META_PERSIST_KEY);
+      await chrome.storage?.session?.remove?.(SESSION_MAP_KEY);
+    } catch {}
+    try {
+      await chrome.storage?.local?.remove?.(LEGACY_META_PERSIST_KEY);
     } catch {}
   }
 
@@ -721,12 +698,12 @@
     subscribeToChromeTabGroupChanges,
     loadPersistedChromeGroupMap,
     persistChromeGroupMap,
+    SESSION_MAP_KEY,
     STORAGE_KEY,
     assignGroupColor,
     getGroupTitle,
     isGroupIdentityFree,
     pickUncollidingGroupColor,
-    currentMappingCandidates,
   };
 
   if (typeof module !== 'undefined' && module.exports) {

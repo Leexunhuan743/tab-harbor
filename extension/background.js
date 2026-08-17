@@ -77,13 +77,26 @@ async function closeDuplicateNewTabs() {
 
     if (blankTabs.length <= 1) return;
 
-    // Keep the active tab; if none is active, keep the one with the largest id (newest)
-    const activeTab = blankTabs.find((tab) => tab.active);
-    const toKeep =
-      activeTab || blankTabs.reduce((a, b) => (a.id > b.id ? a : b));
-    const toClose = blankTabs
-      .filter((tab) => tab.id !== toKeep.id)
-      .map((tab) => tab.id);
+    // Duplicate-new-tab cleanup is window-local. Keeping only one blank tab
+    // for the entire browser can remove another window's final tab and close
+    // that window. Keep the active (or newest) blank tab in every window.
+    const blankTabsByWindow = new Map();
+    for (const tab of blankTabs) {
+      const windowKey = tab?.windowId ?? '__unknown_window__';
+      if (!blankTabsByWindow.has(windowKey)) blankTabsByWindow.set(windowKey, []);
+      blankTabsByWindow.get(windowKey).push(tab);
+    }
+
+    const toClose = [];
+    for (const tabsInWindow of blankTabsByWindow.values()) {
+      if (tabsInWindow.length <= 1) continue;
+      const activeTab = tabsInWindow.find((tab) => tab.active);
+      const toKeep = activeTab
+        || tabsInWindow.reduce((a, b) => (a.id > b.id ? a : b));
+      for (const tab of tabsInWindow) {
+        if (tab.id !== toKeep.id) toClose.push(tab.id);
+      }
+    }
 
     if (toClose.length > 0) await chrome.tabs.remove(toClose);
   } catch (err) {
@@ -108,6 +121,9 @@ async function notifyTabHarborPages(eventMeta = {}) {
     source: eventMeta.source || "tabs.changed",
     triggerTabId: eventMeta.triggerTabId ?? null,
   };
+  if (eventMeta.replacedTabId != null) {
+    message.replacedTabId = eventMeta.replacedTabId;
+  }
 
   try {
     await chrome.runtime.sendMessage(message);
@@ -141,6 +157,7 @@ chrome.tabs.onCreated.addListener((tab) => {
 
 // Update badge and notify Tab Harbor pages whenever a tab is closed
 chrome.tabs.onRemoved.addListener((tabId) => {
+  createdRecentlyAt.delete(tabId);
   updateBadge();
   notifyTabHarborPages({ source: "tabs.onRemoved", triggerTabId: tabId });
 });
@@ -154,9 +171,14 @@ chrome.tabs.onUpdated.addListener((tabId) => {
 // A tab can be replaced with a different tab id (OAuth/redirect flows,
 // prerendering). Without this, pages keep chips for tab ids that no longer
 // exist, and actions on those stale chips corrupt grouping state.
-chrome.tabs.onReplaced.addListener((addedTabId) => {
+chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+  createdRecentlyAt.delete(removedTabId);
   updateBadge();
-  notifyTabHarborPages({ source: "tabs.onReplaced", triggerTabId: addedTabId });
+  notifyTabHarborPages({
+    source: "tabs.onReplaced",
+    triggerTabId: addedTabId,
+    replacedTabId: removedTabId,
+  });
 });
 
 // ─── Initial run ─────────────────────────────────────────────────────────────

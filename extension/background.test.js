@@ -34,9 +34,9 @@ globalThis.chrome = {
     query: async () => [],
     remove: async ids => { removedTabIds = removedTabIds.concat(ids); },
     onCreated: { addListener: (fn) => { globalThis.__tabHarborOnCreated = fn; } },
-    onRemoved: { addListener: () => {} },
+    onRemoved: { addListener: (fn) => { globalThis.__tabHarborOnRemoved = fn; } },
     onUpdated: { addListener: () => {} },
-    onReplaced: { addListener: () => {} },
+    onReplaced: { addListener: (fn) => { globalThis.__tabHarborOnReplaced = fn; } },
   },
   action: {
     setBadgeText: async () => {},
@@ -250,4 +250,31 @@ test('closeDuplicateNewTabs exempts freshly-created tabs within the grace period
   // navigation); only the genuine blank tab 1 remains and it is the active
   // one, so nothing is closed.
   assert.deepEqual(removedTabIds, []);
+});
+
+test('recently-created tab state is released when a tab is removed or replaced', () => {
+  const urls = [EXT_URL, ROOT_MANIFEST_EXT_URL];
+  globalThis.__tabHarborOnCreated({ id: 44, url: '' });
+  assert.equal(isNewTabBlank({ id: 44, url: '' }, urls), false, 'a live freshly-created tab stays in the grace period');
+  globalThis.__tabHarborOnRemoved(44, { windowId: 1, isWindowClosing: false });
+  assert.equal(isNewTabBlank({ id: 44, url: '' }, urls), true, 'a removed tab no longer owns a grace record');
+
+  globalThis.__tabHarborOnCreated({ id: 45, url: '' });
+  assert.equal(isNewTabBlank({ id: 45, url: '' }, urls), false);
+  globalThis.__tabHarborOnReplaced(46, 45);
+  assert.equal(isNewTabBlank({ id: 45, url: '' }, urls), true, 'the removed side of onReplaced is released');
+});
+
+test('closeDuplicateNewTabs keeps one blank tab in every window', async () => {
+  storageData = { themePreferences: { closeDuplicateNewTabsEnabled: true } };
+  removedTabIds = [];
+  globalThis.chrome.tabs.query = async () => [
+    { id: 10, windowId: 1, url: 'chrome://newtab/', active: true },
+    { id: 11, windowId: 1, url: 'chrome://newtab/', active: false },
+    { id: 20, windowId: 2, url: 'chrome://newtab/', active: true },
+  ];
+
+  await closeDuplicateNewTabs();
+
+  assert.deepEqual(removedTabIds, [11], 'the second window keeps its only blank tab instead of being closed');
 });

@@ -23,6 +23,7 @@ function createEventEmitter() {
 
 // Mock chrome APIs before loading the module
 const mockStorage = {};
+const mockSessionStorage = {};
 globalThis.chrome = {
   storage: {
     local: {
@@ -36,6 +37,17 @@ globalThis.chrome = {
       remove: async (keys) => {
         for (const key of [].concat(keys)) {
           delete mockStorage[key];
+        }
+      },
+    },
+    session: {
+      get: async (key) => ({ [key]: mockSessionStorage[key] }),
+      set: async (items) => {
+        Object.assign(mockSessionStorage, items);
+      },
+      remove: async (keys) => {
+        for (const key of [].concat(keys)) {
+          delete mockSessionStorage[key];
         }
       },
     },
@@ -88,7 +100,7 @@ const {
   getGroupTitle,
   isGroupIdentityFree,
   pickUncollidingGroupColor,
-  currentMappingCandidates,
+  SESSION_MAP_KEY,
 } = globalThis.TabOutChromeTabGroups;
 
 // Stub chrome.tabGroups.query with REAL semantics: when queryInfo.windowId is
@@ -259,11 +271,11 @@ test('syncChromeTabGroups skips unmanaged user-group tabs but keeps managed mirr
     return 900 + groupCalls.length;
   };
   globalThis.chrome.tabGroups.update = async () => {};
-  globalThis.chrome.tabGroups.query = async () => [{ id: 101, title: 'GitHub', color: 'grey' }];
+  globalThis.chrome.tabGroups.query = async () => [{ id: 101, windowId: 1, title: 'GitHub', color: 'grey' }];
   globalThis.chrome.tabs.query = async (opts) => [];
 
   await saveChromeTabGroupsSetting(true);
-  populateChromeGroupMap([
+  await populateChromeGroupMap([
     { virtualGroupKey: 'github.com', windowId: 1, chromeGroupId: 101 },
   ]);
 
@@ -404,12 +416,11 @@ test('reorderGroupedTabs only moves tabs that are actually in the group (C15 sup
   ]);
 });
 
-test('loadPersistedChromeGroupMap keeps the current mapping among ambiguous candidates (C4)', async () => {
+test('loadPersistedChromeGroupMap keeps an exact session mapping despite a title-and-color collision (C4)', async () => {
   resetChromeGroupState();
   await saveChromeTabGroupsSetting(true);
-  // The mirror mapping established this session points at 901 — the NON-first
-  // candidate. A blind first-match bind would pick 900 (the user's group); the
-  // ambiguous-binding preference must keep 901.
+  // The mirror mapping established this session points at 901 — the non-first
+  // candidate. The exact session id must keep it separate from user group 900.
   await populateChromeGroupMap([{ virtualGroupKey: 'github.com', windowId: 1, chromeGroupId: 901 }]);
   // Seed persisted meta as if an earlier sync stored the mirror fingerprint.
   await chrome.storage.local.set({
@@ -491,43 +502,18 @@ test('pickUncollidingGroupColor returns the preferred color when free, else rota
   assert.equal(pickUncollidingGroupColor('GitHub', 'grey', 5, allTaken), 'grey');
 });
 
-test('currentMappingCandidates prefers the in-session mapping per window key (C4)', async () => {
+test('legacy local metadata cannot change an exact in-session mapping (C4)', async () => {
   resetChromeGroupState();
-  await populateChromeGroupMap([
-    { virtualGroupKey: 'github.com', windowId: 1, chromeGroupId: 501 },
-    { virtualGroupKey: 'github.com', windowId: 2, chromeGroupId: 502 },
-  ]);
-  const matches = [
-    { id: 500, windowId: 1, title: 'Github', color: 'grey' },
-    { id: 501, windowId: 1, title: 'Github', color: 'grey' },
-    { id: 502, windowId: 2, title: 'Github', color: 'grey' },
-  ];
-  // Per-window key: only that window's mapping counts.
-  assert.deepEqual(currentMappingCandidates('github.com', '1', matches), [{ windowId: 1, id: 501 }]);
-  // Legacy 'any' key: every in-session window mapping among the candidates.
-  // Note: per-window returns the live group's numeric windowId, while 'any'
-  // returns the map's string window key — both are valid reconciled keys.
-  assert.deepEqual(
-    currentMappingCandidates('github.com', 'any', matches).sort((a, b) => a.windowId - b.windowId),
-    [{ windowId: '1', id: 501 }, { windowId: '2', id: 502 }]
-  );
-  // No in-session mapping → nothing kept.
-  assert.deepEqual(currentMappingCandidates('other.com', 'any', matches), []);
-  assert.deepEqual(currentMappingCandidates('other.com', '1', matches), []);
-});
-
-test('legacy flat meta keeps the in-session mapping among ambiguous candidates (C4)', async () => {
-  resetChromeGroupState();
-  // A session mapping in window 1; the legacy flat snapshot (no window id)
-  // is seeded AFTER the mapping's persist so it cannot be clobbered.
+  // A session mapping in window 1; a flat snapshot from the old local cache
+  // must be ignored and deleted rather than participating in reconciliation.
   await populateChromeGroupMap([
     { virtualGroupKey: 'github.com', windowId: 1, chromeGroupId: 501 },
   ]);
   await chrome.storage.local.set({
     chromeTabGroupsMeta: { 'github.com': { title: 'Github', color: 'grey' } },
   });
-  // Two windows share the fingerprint — ambiguous for the flat key. The
-  // in-session window-1 mapping (501) must still be retained, not skipped.
+  // Two windows share the old fingerprint; only the exact session mapping is
+  // eligible for management.
   globalThis.chrome.tabGroups.query = async () => [
     { id: 501, windowId: 1, title: 'Github', color: 'grey' },
     { id: 502, windowId: 2, title: 'Github', color: 'grey' },
@@ -536,8 +522,9 @@ test('legacy flat meta keeps the in-session mapping among ambiguous candidates (
   await loadPersistedChromeGroupMap();
 
   const managed = getManagedChromeGroupIds();
-  assert.ok(managed.has(501), 'the in-session mapping is kept for legacy flat meta');
+  assert.ok(managed.has(501), 'the in-session mapping is kept');
   assert.ok(!managed.has(502), 'the other window group is not hijacked');
+  assert.equal(mockStorage.chromeTabGroupsMeta, undefined, 'the obsolete local cache is removed');
   delete globalThis.chrome.tabGroups.query;
 });
 
@@ -733,13 +720,13 @@ test('syncChromeTabGroups reuses chromeGroupMap populated by populateChromeGroup
     return 500;
   };
   globalThis.chrome.tabGroups.update = async () => {};
-  globalThis.chrome.tabGroups.query = async () => [{ id: 500, title: 'GitHub', color: 'grey' }];
+  globalThis.chrome.tabGroups.query = async () => [{ id: 500, windowId: 1, title: 'GitHub', color: 'grey' }];
   globalThis.chrome.tabs.query = async (opts) => [];
 
   await saveChromeTabGroupsSetting(true);
 
   // Pre-populate the mapping (simulating "pull from Chrome groups" scenario)
-  populateChromeGroupMap([
+  await populateChromeGroupMap([
     { virtualGroupKey: 'github.com', windowId: 1, chromeGroupId: 500 },
   ]);
 
@@ -868,8 +855,8 @@ test('stale manual-group mirror is ungrouped when its window appears in the sync
   assert.equal(getChromeGroupCount(), 1); // only the github.com mirror remains
 });
 
-test('persisted group meta reloads per window, so a same-title same-color user group is never mistaken for a mirror', async () => {
-  resetChromeGroupState();
+test('session group map reloads an exact live mapping without claiming a same-title user group in another window', async () => {
+  await resetChromeGroupState();
 
   // Mirror for github.com lives in window 1; a USER group with identical
   // title+color exists in window 2. Reload must only re-bind the window-1
@@ -887,19 +874,8 @@ test('persisted group meta reloads per window, so a same-title same-color user g
     color: id === 501 ? 'grey' : 'grey',
   });
 
-  await saveChromeTabGroupsSetting(true);
-  populateChromeGroupMap([
-    { virtualGroupKey: 'github.com', windowId: 1, chromeGroupId: 501 },
-  ]);
-  await persistChromeGroupMap();
-
-  // Simulate restart: fresh map, same live groups. In real Chrome the
-  // persisted meta survives a restart; resetChromeGroupState clears storage,
-  // so re-seed the same meta the persist step wrote above.
-  resetChromeGroupState();
-  await loadChromeTabGroupsSetting();
-  await chrome.storage.local.set({
-    chromeTabGroupsMeta: { 'github.com': { '1': { title: 'GitHub', color: 'grey' } } },
+  await chrome.storage.session.set({
+    [SESSION_MAP_KEY]: { 'github.com': { '1': 501 } },
   });
   await loadPersistedChromeGroupMap();
 
@@ -908,49 +884,23 @@ test('persisted group meta reloads per window, so a same-title same-color user g
   assert.ok(!managed.has(502));
 });
 
-test('persisted group meta falls back to any-window match for legacy flat snapshots', async () => {
-  resetChromeGroupState();
+test('browser restart never claims a title-and-color match from obsolete local metadata', async () => {
+  await resetChromeGroupState();
 
+  // Window and tab-group ids changed after browser restart. The old local
+  // record is deliberately ignored, even though its title/color match the
+  // live native group: taking it over would corrupt user-group ownership.
   globalThis.chrome.tabGroups.query = async () => [
-    { id: 501, title: 'GitHub', color: 'grey', windowId: 1 },
+    { id: 701, title: 'GitHub', color: 'grey', windowId: 17 },
   ];
-  globalThis.chrome.tabGroups.get = async () => ({ id: 501, title: 'GitHub', color: 'grey' });
-
-  // Old flat shape { title, color } — must still reconcile.
-  globalThis.chrome.storage.local.set({
-    chromeTabGroupsMeta: { 'github.com': { title: 'GitHub', color: 'grey' } },
+  await chrome.storage.local.set({
+    chromeTabGroupsMeta: { 'github.com': { '1': { title: 'GitHub', color: 'grey' } } },
   });
 
-  await saveChromeTabGroupsSetting(true);
-  await loadChromeTabGroupsSetting();
   await loadPersistedChromeGroupMap();
 
-  const managed = getManagedChromeGroupIds();
-  assert.ok(managed.has(501));
-});
-
-test('legacy flat meta skips auto-bind when multiple windows share title+color', async () => {
-  resetChromeGroupState();
-
-  // Two windows contain a same-title+color group. The legacy flat snapshot has
-  // no window id, so auto-binding would be a coin toss that can mark the wrong
-  // (user) group as a dashboard mirror — skip it instead.
-  globalThis.chrome.tabGroups.query = async () => [
-    { id: 501, title: 'GitHub', color: 'grey', windowId: 1 },
-    { id: 502, title: 'GitHub', color: 'grey', windowId: 2 },
-  ];
-  globalThis.chrome.tabGroups.get = async (id) => ({ id, title: 'GitHub', color: 'grey' });
-
-  globalThis.chrome.storage.local.set({
-    chromeTabGroupsMeta: { 'github.com': { title: 'GitHub', color: 'grey' } },
-  });
-
-  await saveChromeTabGroupsSetting(true);
-  await loadChromeTabGroupsSetting();
-  await loadPersistedChromeGroupMap();
-
-  const managed = getManagedChromeGroupIds();
-  assert.equal(managed.size, 0);
+  assert.equal(getManagedChromeGroupIds().size, 0);
+  assert.equal(mockStorage.chromeTabGroupsMeta, undefined);
 });
 
 test('subscribeToChromeTabGroupChanges notifies on external Chrome group changes', async () => {

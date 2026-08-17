@@ -27,6 +27,9 @@ function createMockStorage(initial = {}) {
           set: async (payload) => {
             Object.assign(store, payload);
           },
+          remove: async (keys) => {
+            for (const key of [].concat(keys)) delete store[key];
+          },
         },
       },
     },
@@ -62,7 +65,6 @@ test('exportConfig returns the complete versioned configuration with custom icon
     savedTabSessionOrder: ['session-1'],
     savedTabSessionCollapsedState: { 'session-1': true },
     chromeTabGroupsEnabled: true,
-    chromeTabGroupsMeta: { entries: [] },
     importedChromeSessionGroups: { entries: [] },
     deferredTriggerPosition: { top: 120 },
   };
@@ -78,6 +80,26 @@ test('exportConfig returns the complete versioned configuration with custom icon
     assert.deepEqual(parsed.savedTabSessions, initial.savedTabSessions);
     for (const key of STORAGE_KEYS) assert.ok(key in parsed, `missing ${key}`);
     assert.deepEqual(parsed, { ...parsed, ...initial });
+  });
+});
+
+test('exportConfig excludes Chrome mirror runtime identity and import removes an old local cache', async () => {
+  const initial = {
+    themePreferences: { mode: 'light' },
+    chromeTabGroupsMeta: { 'github.com': { '1': { title: 'GitHub', color: 'grey' } } },
+  };
+
+  await withMockStorage(initial, async (store) => {
+    const exported = JSON.parse(await exportConfig());
+    assert.ok(!('chromeTabGroupsMeta' in exported));
+
+    await importConfig(JSON.stringify({
+      version: CONFIG_VERSION,
+      themePreferences: { mode: 'dark' },
+      chromeTabGroupsMeta: { stale: true },
+    }));
+    assert.equal(store.chromeTabGroupsMeta, undefined);
+    assert.deepEqual(store.themePreferences, { mode: 'dark' });
   });
 });
 
@@ -152,7 +174,6 @@ test('importConfig writes the complete configuration to storage', async () => {
     savedTabSessionOrder: [],
     savedTabSessionCollapsedState: {},
     chromeTabGroupsEnabled: false,
-    chromeTabGroupsMeta: null,
     importedChromeSessionGroups: { entries: [] },
     deferredTriggerPosition: { top: null },
     popupView: 'tabs',
