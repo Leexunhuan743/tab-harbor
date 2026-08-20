@@ -1,7 +1,8 @@
 /* ============================================================
-   Tab Mission Control — Dashboard Styles
-   Extracted directly from mockup.html — do not modify unless
-   also updating the mockup. This is the approved design.
+   Tab Harbor — Dashboard Styles
+   Living stylesheet for the new-tab dashboard. Theme palettes
+   and their variables live in theme-controls.js (THEME_FAMILIES);
+   this sheet consumes them via var().
    ============================================================ */
 
 :root {
@@ -66,6 +67,8 @@
     --quick-shortcut-icon-wrap-size: 40px;
     --quick-shortcut-icon-size: 22px;
     --quick-shortcut-label-size: 11px;
+    /* User surface/border/badge intensity inputs (0-100) feed the derived
+       floating/panel opacity values below via clamp(). */
     --floating-surface-opacity: clamp(
         82%,
         calc(var(--custom-surface-opacity) + 54%),
@@ -385,6 +388,20 @@ body.theme-tone-dark::before {
     align-items: flex-start;
     gap: 12px 10px;
     width: 100%;
+}
+
+/* Manual column count for landscape layouts — portrait (<=960px) keeps auto-fill */
+@media (min-width: 961px) {
+    .quick-tabs-grid.is-fixed-cols-4 {
+        grid-template-columns: repeat(4, 1fr);
+    }
+    .quick-tabs-grid.is-fixed-cols-5 {
+        grid-template-columns: repeat(5, 1fr);
+    }
+    .quick-tabs-grid.is-fixed-cols-4 .quick-shortcut-card,
+    .quick-tabs-grid.is-fixed-cols-5 .quick-shortcut-card {
+        width: 100%;
+    }
 }
 
 .quick-shortcut-card {
@@ -1478,7 +1495,16 @@ body.theme-tone-dark .deferred-shell {
     flex: 0 0 13ch;
 }
 
-#openTabsSection .section-count,
+/* The open-tabs count now hosts up to five 30px icon buttons; it must size to
+   its content instead of the old 96px text-count column, or the buttons get
+   compressed. The saved-sessions count keeps its fixed column. */
+#openTabsSection .section-count {
+    width: auto;
+    flex: 0 0 auto;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
 .saved-sessions-section .section-count {
     width: 96px;
     flex: 0 0 96px;
@@ -1528,7 +1554,10 @@ body.theme-tone-dark .deferred-shell {
     flex-wrap: nowrap;
     flex: 1;
     min-width: 0;
-    min-height: 40px;
+    /* Top headroom so the hover lift (translateY(-1px)) never clips the
+       button's top edge against overflow-y: hidden. */
+    min-height: 42px;
+    padding-top: 2px;
     overflow-x: auto;
     overflow-y: hidden;
     scrollbar-width: none;
@@ -1558,6 +1587,7 @@ body.theme-tone-dark .deferred-shell {
 .group-nav-button {
     width: 40px;
     height: 40px;
+    flex-shrink: 0;
     border-radius: 999px;
     border: 1px solid
         color-mix(
@@ -1687,7 +1717,7 @@ body.group-dragging .group-nav-button {
             var(--workspace-accent-border) 26%
         );
     border-radius: 16px;
-    padding: 14px 16px;
+    padding: 16px 16px 15px;
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -1704,7 +1734,9 @@ body.group-dragging .group-nav-button {
         color-mix(in srgb, var(--workspace-accent) 6%, transparent);
 }
 
-/* Colored top border instead of side bar for grid cards */
+/* Colored top border instead of side bar for grid cards. The base ::before
+   rule is currently disabled (see the commented block below), so the
+   has-*-bar state rules are inert until the base rule is restored. */
 /*.mission-card::before {*/
 /*  content: '';*/
 /*  position: absolute;*/
@@ -1723,6 +1755,39 @@ body.group-dragging .group-nav-button {
 }
 .mission-card.has-neutral-bar::before {
     background: var(--warm-gray);
+}
+
+/* User-created Chrome group cards wear their native group color on the card
+   name and the tab rows' drag handles — a quiet accent that follows the
+   group's real Chrome color without adding a separate bar. The NAME uses
+   the pure native group color so it visually matches the group chip in the
+   browser tab strip (light palettes may show lower contrast for very light
+   group colors — accepted tradeoff for visual consistency). Hover/focus
+   feedback uses an underline instead of a color shift so keyboard focus
+   stays visible without relying on contrast. The drag handles keep the
+   pure group color too. */
+.mission-card.chrome-group-card .mission-name {
+    color: var(--chrome-group-color, var(--ink));
+}
+
+.mission-card.chrome-group-card .mission-rename-trigger:hover .mission-name,
+.mission-card.chrome-group-card .mission-rename-trigger:focus-visible .mission-name {
+    color: var(--chrome-group-color, var(--ink));
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    text-decoration-thickness: 1.5px;
+}
+
+.mission-card.chrome-group-card .chip-reorder-handle {
+    color: var(--chrome-group-color, color-mix(in srgb, var(--ink) 84%, var(--muted) 16%));
+}
+
+.mission-card.chrome-group-card .chip-reorder-handle:hover,
+.mission-card.chrome-group-card .chip-reorder-handle:focus-visible {
+    /* Hover/focus must be visibly different from the resting pure group
+       color; mix toward the ink so the feedback stays readable in light
+       themes too (C29). */
+    color: color-mix(in srgb, var(--chrome-group-color, var(--ink)) 55%, var(--ink));
 }
 
 .mission-card:hover {
@@ -1944,16 +2009,102 @@ body.group-dragging .group-nav-button {
     line-height: 1.4;
 }
 
+/* Handle-click selection: selected rows reorder together when dragged. */
+.page-chip.is-selected {
+    background: color-mix(in srgb, var(--workspace-chip-bg) 82%, var(--workspace-accent-border) 18%);
+    box-shadow: inset 2px 0 0 var(--workspace-accent-border);
+}
+
+/* During a drag the rest of the selection dims so the moving set is obvious. */
+body.page-chip-list-dragging .page-chip.is-selected:not(.is-dragging) {
+    opacity: 0.55;
+}
+
+/* Batch drag count badge (shown when more than one row is moving). */
+.page-chip-drag-badge {
+    position: fixed;
+    z-index: 9999;
+    transform: translate(-50%, -100%);
+    background: var(--workspace-chip-bg-strong);
+    border: 1px solid var(--workspace-chip-border);
+    color: var(--workspace-chip-text);
+    font-size: var(--ui-font-12);
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 999px;
+    pointer-events: none;
+    box-shadow: 0 2px 8px rgba(26, 22, 19, 0.18);
+}
+
+/* Batch actions replace the section header's icon actions while a
+   multi-selection exists — same row, same height, same quiet style. */
+.page-chip-batch-bar {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+}
+
+.page-chip-batch-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    flex-shrink: 0;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: color-mix(in srgb, var(--muted) 82%, var(--ink) 18%);
+    cursor: pointer;
+    transition:
+        color 0.15s ease,
+        opacity 0.15s ease;
+    position: relative;
+}
+
+.page-chip-batch-action svg {
+    width: 14px;
+    height: 14px;
+}
+
+.page-chip-batch-action:hover {
+    color: var(--ink);
+}
+
+.page-chip-batch-action[data-action="batch-close-tabs"]:hover {
+    color: var(--status-abandoned);
+}
+
+.page-chip-batch-action:focus-visible {
+    outline: 2px solid var(--workspace-accent-border);
+    outline-offset: 1px;
+}
+
+/* The selection count replaces the section title; let it size to its own
+   content instead of the fixed 13ch column. */
+#openTabsSection.has-chip-selection .section-header h2 {
+    width: auto;
+    flex: 0 0 auto;
+}
+
+/* The grip is a pure drag surface: no scrolling/selection gestures on touch. */
+.chip-reorder-handle {
+    touch-action: none;
+}
+
 .page-chip > .chip-reorder-handle {
     flex-shrink: 0;
     margin-left: 1px;
     width: 30px;
-    height: 30px;
+    /* Generous grab target (>=32px) without inflating the row height. */
+    height: 36px;
 }
 
-.page-chip:last-child,
-.page-chip-overflow {
-    border-bottom: none;
+/* Overflow rows ("+N more" expansion) stay out of the list until expanded.
+   They are direct list children so drag/selection still see them. */
+.page-chip--collapsed {
+    display: none;
 }
 
 /* Favicon */
@@ -1994,7 +2145,7 @@ body.group-dragging .group-nav-button {
     margin-right: 4px;
 }
 
-/* Title text — wraps naturally, no truncation */
+/* Title text — wraps up to 2 lines, then ellipsis */
 .chip-text {
     flex: 1;
     min-width: 0;
@@ -2003,12 +2154,6 @@ body.group-dragging .group-nav-button {
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
-}
-
-/* Duplicate badge */
-.chip-dupe-badge {
-    color: var(--accent-amber);
-    font-weight: 600;
 }
 
 /* Duplicate border highlight */
@@ -2152,8 +2297,6 @@ body.group-dragging .group-nav-button {
     padding: 4px 2px;
 }
 
-/* mission-meta hidden — see above */
-
 .mission-time {
     font-size: 12px;
     font-size: var(--ui-font-12);
@@ -2179,19 +2322,13 @@ body.group-dragging .group-nav-button {
 }
 
 /* ---- Actions row ---- */
-.actions {
-    display: flex;
-    gap: 8px;
-    margin-top: 8px;
-    flex-wrap: wrap;
-}
-
 .section-icon-action {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     width: 30px;
     height: 30px;
+    flex-shrink: 0;
     padding: 0;
     border: none;
     background: transparent;
@@ -2219,6 +2356,7 @@ body.group-dragging .group-nav-button {
 .chip-action[data-tooltip]::after,
 .group-action-icon[data-tooltip]::after,
 .section-icon-action[data-tooltip]::after,
+.page-chip-batch-action[data-tooltip]::after,
 .todo-action-btn[data-tooltip]::after {
     content: attr(data-tooltip);
     position: absolute;
@@ -2250,6 +2388,8 @@ body.group-dragging .group-nav-button {
 .group-action-icon[data-tooltip]:focus-visible::after,
 .section-icon-action[data-tooltip]:hover::after,
 .section-icon-action[data-tooltip]:focus-visible::after,
+.page-chip-batch-action[data-tooltip]:hover::after,
+.page-chip-batch-action[data-tooltip]:focus-visible::after,
 .todo-action-btn[data-tooltip]:hover::after,
 .todo-action-btn[data-tooltip]:focus-visible::after {
     opacity: 1;
@@ -2354,7 +2494,7 @@ body.group-dragging .group-nav-button {
 }
 
 .workspace-page-switch-btn {
-    min-height: 24px;
+    min-height: 28px;
     padding: 0;
     border: none;
     border-radius: 0;
@@ -2362,7 +2502,7 @@ body.group-dragging .group-nav-button {
     color: color-mix(in srgb, var(--muted) 82%, var(--ink) 18%);
     cursor: pointer;
     font-family: "Public Sans", sans-serif;
-    font-size: var(--ui-font-12);
+    font-size: var(--ui-font-14);
     font-weight: 600;
     transition:
         color 0.15s ease,
@@ -2835,6 +2975,40 @@ body.group-dragging .group-nav-button {
     outline: 2px solid var(--focus-ring);
     outline-offset: 2px;
     box-shadow: var(--focus-ring-shadow);
+}
+
+.theme-menu-text-input {
+    width: 100%;
+    min-height: 34px;
+    border: 1px solid
+        color-mix(
+            in srgb,
+            var(--workspace-accent-border) 28%,
+            var(--warm-gray) 72%
+        );
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--card-bg) 92%, transparent);
+    color: var(--ink);
+    padding: 0 10px;
+    font-family: "Public Sans", sans-serif;
+    font-size: var(--ui-font-12);
+    outline: none;
+}
+
+.theme-menu-text-input:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
+    box-shadow: var(--focus-ring-shadow);
+}
+
+.theme-menu-text-input::placeholder {
+    color: var(--muted);
+}
+
+.theme-menu-hint {
+    font-size: var(--ui-font-10);
+    color: var(--muted);
+    line-height: 1.45;
 }
 
 .saved-session-nav-button.is-name-mode {
@@ -3599,7 +3773,10 @@ footer {
 @keyframes fadeUp {
     from {
         opacity: 0;
-        transform: translateY(12px);
+        /* Rise offset stays below the 12px card/deferred-item rhythm so a
+           rising element never overlaps the one below it (no "blocked by the
+           card above" flash during entrance). */
+        transform: translateY(8px);
     }
     to {
         opacity: 1;
@@ -3630,7 +3807,7 @@ body.entry-animations-enabled .deferred-column .section-header {
 }
 
 /* ================================================================
-   STATIC DEFAULT VIEW — new elements added for "AI on demand"
+   MISSIONS CARDS — DEFAULT VIEW
    ================================================================ */
 
 /* ---- Neutral status bar (domain-grouped cards, no AI color) ---- */
@@ -3651,9 +3828,8 @@ body.entry-animations-enabled .deferred-column .section-header {
    ================================================================ */
 
 .missions-empty-state {
-    /* Takes the full width — spans all columns */
-    column-span: all;
-
+    /* Full-width strip (column-span is inert without a multi-column
+       container; the missions area is a grid) */
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -3666,7 +3842,7 @@ body.entry-animations-enabled .deferred-column .section-header {
     animation: fadeUp 0.5s ease both;
 }
 
-/* CSS-drawn checkmark in a glowing circle */
+/* Icon in a CSS-drawn glowing circle */
 .empty-checkmark {
     width: 56px;
     height: 56px;

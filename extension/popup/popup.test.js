@@ -23,6 +23,15 @@ globalThis.flushRaf = () => {
   snapshot.forEach(({ fn }) => fn());
 };
 
+// popup.js resolves the remembered view synchronously from localStorage at
+// module load — mock it so the require-time read is safe and predictable.
+globalThis.localStorage = {
+  _store: {},
+  getItem: key => (key in globalThis.localStorage._store ? globalThis.localStorage._store[key] : null),
+  setItem: (key, value) => { globalThis.localStorage._store[key] = String(value); },
+  removeItem: key => { delete globalThis.localStorage._store[key]; },
+};
+
 globalThis.document = {
   addEventListener: () => {},
   querySelector: () => null,
@@ -98,6 +107,169 @@ function resetPopupTestState(opts = {}) {
     globalThis._resetPopupState();
   }
 }
+
+// ---- popup view persistence ----
+
+test('loadPopupView restores the saved tabs view', async () => {
+  resetPopupTestState();
+  const originalGet = globalThis.chrome.storage.local.get;
+  globalThis.chrome.storage.local.get = async key => (key === 'popupView' ? { popupView: 'tabs' } : {});
+  try {
+    const view = await loadPopupView();
+    assert.equal(view, 'tabs');
+    assert.equal(popupState.view, 'tabs');
+  } finally {
+    globalThis.chrome.storage.local.get = originalGet;
+  }
+});
+
+test('loadPopupView falls back to shortcuts for missing or invalid values', async () => {
+  resetPopupTestState();
+  const originalGet = globalThis.chrome.storage.local.get;
+  globalThis.chrome.storage.local.get = async () => ({});
+  try {
+    assert.equal(await loadPopupView(), 'shortcuts');
+  } finally {
+    globalThis.chrome.storage.local.get = originalGet;
+  }
+  globalThis.chrome.storage.local.get = async key => (key === 'popupView' ? { popupView: 'garbage' } : {});
+  try {
+    assert.equal(await loadPopupView(), 'shortcuts');
+    assert.equal(popupState.view, 'shortcuts');
+  } finally {
+    globalThis.chrome.storage.local.get = originalGet;
+  }
+});
+
+test('refreshing popup state preserves the live view instead of resetting it', async () => {
+  resetPopupTestState();
+  popupState.view = 'tabs';
+  const originalGet = globalThis.chrome.storage.local.get;
+  globalThis.chrome.storage.local.get = async () => ({ popupView: 'shortcuts' });
+  try {
+    await loadPopupState();
+    assert.equal(popupState.view, 'tabs');
+  } finally {
+    globalThis.chrome.storage.local.get = originalGet;
+  }
+});
+
+test('loadPopupState unwraps suspended tabs to their original URL', async () => {
+  resetPopupTestState();
+  const originalGet = globalThis.chrome.storage.local.get;
+  const originalUtils = globalThis.TabHarborTabUrlUtils;
+  globalThis.chrome.storage.local.get = async () => ({});
+  globalThis.TabHarborTabUrlUtils = {
+    parseSuspendedTabUrl: url => {
+      const raw = String(url || '');
+      const uri = raw.includes('#uri=') ? decodeURIComponent(raw.split('#uri=')[1].split('&')[0]) : '';
+      return raw.includes('/suspended.html') && uri ? { isSuspended: true, originalUrl: uri, title: 'Suspended title' } : { isSuspended: false, originalUrl: '', title: '' };
+    },
+    getCanonicalTabUrl: url => {
+      const raw = String(url || '');
+      const uri = raw.includes('#uri=') ? decodeURIComponent(raw.split('#uri=')[1].split('&')[0]) : '';
+      return raw.includes('/suspended.html') && uri ? uri : raw;
+    },
+  };
+  try {
+    globalThis.chrome.tabs.query = async () => [
+      { id: 1, url: 'chrome-extension://suspender/suspended.html#uri=https%3A%2F%2Fgithub.com%2Fissue%2F42', title: 'Suspended tab', windowId: 1, active: false },
+      { id: 2, url: '', title: 'Loading', windowId: 1, active: false },
+    ];
+    await loadPopupState();
+    const urls = popupState.openTabs.map(t => t.url);
+    assert.ok(urls.includes('https://github.com/issue/42'), 'suspended tab unwraps to its original URL');
+    assert.equal(popupState.openTabs.find(t => t.id === 1).title, 'Suspended title', 'suspended title is used');
+    assert.ok(urls.includes(''), 'mid-load tab with empty URL stays visible');
+  } finally {
+    globalThis.chrome.tabs.query = async () => [];
+    globalThis.chrome.storage.local.get = originalGet;
+    globalThis.TabHarborTabUrlUtils = originalUtils;
+  }
+});
+
+// ---- popup shortcuts column setting ----
+
+test('renderPopupShortcuts applies the dashboard column setting to the grid', async () => {
+  resetPopupTestState();
+  const originalGetById = globalThis.document.getElementById;
+  const originalGetCols = globalThis.TabOutThemeControls.getQuickShortcutCols;
+  const toggles = {};
+  const listEl = {
+    classList: { add: () => {}, remove: () => {}, toggle: (cls, on) => { toggles[cls] = on; } },
+    innerHTML: '',
+    querySelectorAll: () => [],
+  };
+  const emptyEl = { hidden: true };
+  globalThis.document.getElementById = id => (id === 'popupShortcutsList' ? listEl : id === 'popupShortcutsEmpty' ? emptyEl : null);
+  try {
+    globalThis.TabOutThemeControls.getQuickShortcutCols = () => '4';
+    popupState.quickShortcuts = [{ id: 'a', url: 'https://a.com', label: 'A' }];
+    renderPopupShortcuts();
+    assert.equal(toggles['is-fixed-cols-4'], true);
+    assert.equal(toggles['is-fixed-cols-5'], false);
+
+    globalThis.TabOutThemeControls.getQuickShortcutCols = () => '5';
+    renderPopupShortcuts();
+    assert.equal(toggles['is-fixed-cols-4'], false);
+    assert.equal(toggles['is-fixed-cols-5'], true);
+  } finally {
+    globalThis.document.getElementById = originalGetById;
+    globalThis.TabOutThemeControls.getQuickShortcutCols = originalGetCols;
+  }
+});
+
+test('renderPopupShortcuts falls back to auto when the setting getter is missing', async () => {
+  resetPopupTestState();
+  const originalGetById = globalThis.document.getElementById;
+  const toggles = {};
+  const listEl = {
+    classList: { add: () => {}, remove: () => {}, toggle: (cls, on) => { toggles[cls] = on; } },
+    innerHTML: '',
+    querySelectorAll: () => [],
+  };
+  globalThis.document.getElementById = id => (id === 'popupShortcutsList' ? listEl : id === 'popupShortcutsEmpty' ? { hidden: true } : null);
+  try {
+    delete globalThis.TabOutThemeControls.getQuickShortcutCols;
+    popupState.quickShortcuts = [];
+    renderPopupShortcuts();
+    assert.equal(toggles['is-fixed-cols-4'], false);
+    assert.equal(toggles['is-fixed-cols-5'], false);
+  } finally {
+    globalThis.document.getElementById = originalGetById;
+  }
+});
+
+test('renderPopupShortcuts skips re-render when shortcuts and columns are unchanged', async () => {
+  resetPopupTestState();
+  const originalGetById = globalThis.document.getElementById;
+  const originalGetCols = globalThis.TabOutThemeControls.getQuickShortcutCols;
+  const listEl = {
+    classList: { add: () => {}, remove: () => {}, toggle: () => {} },
+    innerHTML: '',
+    querySelectorAll: () => [],
+  };
+  globalThis.document.getElementById = id => (id === 'popupShortcutsList' ? listEl : id === 'popupShortcutsEmpty' ? { hidden: true } : null);
+  globalThis.TabOutThemeControls.getQuickShortcutCols = () => 'auto';
+  try {
+    popupState.quickShortcuts = [{ id: 'a', url: 'https://a.com', label: 'A' }];
+    renderPopupShortcuts();
+    listEl.innerHTML = 'DIRTY';
+    // Unchanged data + columns -> the render is skipped, DOM is preserved.
+    renderPopupShortcuts();
+    assert.equal(listEl.innerHTML, 'DIRTY');
+    // Changed shortcuts -> the render runs again.
+    popupState.quickShortcuts = [
+      { id: 'a', url: 'https://a.com', label: 'A' },
+      { id: 'b', url: 'https://b.com', label: 'B' },
+    ];
+    renderPopupShortcuts();
+    assert.notEqual(listEl.innerHTML, 'DIRTY');
+  } finally {
+    globalThis.document.getElementById = originalGetById;
+    globalThis.TabOutThemeControls.getQuickShortcutCols = originalGetCols;
+  }
+});
 
 // ---- escapeAttr ----
 
@@ -285,7 +457,6 @@ test('buildPopupTabGroups groups session-assigned tabs', () => {
   globalThis.popupState.openTabs = [
     { id: 1, url: 'https://github.com', title: 'GitHub', windowId: 1, active: false, groupId: null },
   ];
-  globalThis.popupState.tabGroups = [];
   globalThis.popupState.sessionGroups = {
     groups: [{ id: 's1', name: 'Work' }],
     assignments: { '1': 's1' },
@@ -298,6 +469,29 @@ test('buildPopupTabGroups groups session-assigned tabs', () => {
   assert.equal(sessionGroup.tabs[0].id, 1);
 });
 
+test('buildPopupTabGroups orders session groups by createdAt like the dashboard', () => {
+  resetPopupTestState({ landingPatterns: [] });
+  globalThis.popupState.openTabs = [
+    { id: 1, url: 'https://a.com', title: 'A', windowId: 1, active: false, groupId: null },
+    { id: 2, url: 'https://b.com', title: 'B', windowId: 1, active: false, groupId: null },
+  ];
+  globalThis.popupState.sessionGroups = {
+    // Listed newest-first on purpose: only the createdAt sort (not insertion
+    // order) can produce the expected [older, newer] output.
+    groups: [
+      { id: 'newer', name: 'Newer', createdAt: '2026-02-01T00:00:00.000Z' },
+      { id: 'older', name: 'Older', createdAt: '2026-01-01T00:00:00.000Z' },
+    ],
+    assignments: { '1': 'newer', '2': 'older' },
+  };
+
+  const groups = globalThis.buildPopupTabGroups();
+  const sessionGroupsOrdered = groups.filter(g => g.kind === 'session');
+  assert.equal(sessionGroupsOrdered.length, 2, 'both session groups present');
+  assert.equal(sessionGroupsOrdered[0].manualGroupId, 'older', 'oldest session group comes first');
+  assert.equal(sessionGroupsOrdered[1].manualGroupId, 'newer', 'newest session group comes second');
+});
+
 test('buildPopupTabGroups groups domain tabs', () => {
   resetPopupTestState();
 
@@ -306,7 +500,6 @@ test('buildPopupTabGroups groups domain tabs', () => {
     { id: 2, url: 'https://github.com/org/team', title: 'Team', windowId: 1, active: false, groupId: null },
     { id: 3, url: 'https://google.com/search', title: 'Search', windowId: 1, active: false, groupId: null },
   ];
-  globalThis.popupState.tabGroups = [];
 
   const groups = globalThis.buildPopupTabGroups();
   const ghGroup = groups.find(g => g.domain === 'github.com');
@@ -324,7 +517,6 @@ test('buildPopupTabGroups places landing pages group at top', () => {
     { id: 1, url: 'https://github.com/', title: 'GitHub', windowId: 1, active: false, groupId: null },
     { id: 2, url: 'https://www.youtube.com/', title: 'YouTube', windowId: 1, active: false, groupId: null },
   ];
-  globalThis.popupState.tabGroups = [];
 
   const groups = globalThis.buildPopupTabGroups();
   assert.equal(groups[0].kind, 'landing', 'landing group should be first');
@@ -337,7 +529,6 @@ test('buildPopupTabGroups groups file:// URLs under local-files domain', () => {
   globalThis.popupState.openTabs = [
     { id: 1, url: 'file:///path/to/file', title: 'Local File', windowId: 1, active: false, groupId: null },
   ];
-  globalThis.popupState.tabGroups = [];
 
   const groups = globalThis.buildPopupTabGroups();
   const localGroup = groups.find(g => g.domain === 'local-files');
@@ -346,20 +537,157 @@ test('buildPopupTabGroups groups file:// URLs under local-files domain', () => {
   assert.equal(localGroup.tabs[0].id, 1);
 });
 
-test('buildPopupTabGroups skips tabs with unparseable URLs', () => {
+test('buildPopupTabGroups keeps tabs with unparseable URLs in an ungrouped bucket', () => {
   globalThis._skipLoadPopupState = true;
   resetPopupTestState();
 
-  // Tabs with empty URLs can't be parsed — they are skipped entirely
+  // Tabs with empty URLs can't be parsed — they stay visible in an ungrouped bucket.
   const tabA = { id: 1, url: '', title: 'Tab A', windowId: 1, active: false, groupId: 10 };
   const tabB = { id: 2, url: '', title: 'Tab B', windowId: 1, active: false, groupId: 10 };
   globalThis.popupState.openTabs = [tabA, tabB];
-  globalThis.popupState.tabGroups = [
-    { id: 10, title: 'Research', color: 'blue', collapsed: false, tabs: [tabA, tabB] },
-  ];
 
   const groups = globalThis.buildPopupTabGroups();
-  assert.equal(groups.length, 0, 'tabs with unparseable URLs produce no groups');
+  assert.equal(groups.length, 1, 'unparseable tabs form a single ungrouped bucket');
+  assert.equal(groups[0].kind, 'ungrouped');
+  assert.equal(groups[0].tabs.length, 2);
+});
+
+test('buildPopupTabGroups groups by primary domain so www and bare variants merge', () => {
+  globalThis._skipLoadPopupState = true;
+  resetPopupTestState();
+
+  const originalPrimaryDomain = globalThis.TabOutIconUtils.getPrimaryDomain;
+  globalThis.TabOutIconUtils.getPrimaryDomain = hostname => String(hostname || '').replace(/^www\./, '').toLowerCase();
+  try {
+    globalThis.popupState.openTabs = [
+      { id: 1, url: 'https://www.github.com/a', title: 'A', windowId: 1, active: false },
+      { id: 2, url: 'https://github.com/b', title: 'B', windowId: 1, active: false },
+    ];
+
+    const groups = globalThis.buildPopupTabGroups();
+    assert.equal(groups.length, 1, 'www and bare variants share one group');
+    assert.equal(groups[0].domain, 'github.com');
+    assert.equal(groups[0].tabs.length, 2);
+  } finally {
+    globalThis.TabOutIconUtils.getPrimaryDomain = originalPrimaryDomain;
+  }
+});
+
+test('getGroupDisplayLabel honors persisted group label overrides', () => {
+  globalThis._skipLoadPopupState = true;
+  resetPopupTestState();
+
+  globalThis.popupState.groupLabelOverrides = { 'github.com': '工作代码', '__landing-pages__': '主页' };
+  const domainGroup = { domain: 'github.com', label: '', tabs: [], kind: 'domain' };
+  const landingGroup = { domain: '__landing-pages__', label: '__landing-pages__', tabs: [], kind: 'landing' };
+  assert.equal(globalThis.getGroupDisplayLabel(domainGroup), '工作代码');
+  assert.equal(globalThis.getGroupDisplayLabel(landingGroup), '主页');
+});
+
+test('getGroupDisplayLabel prefers the custom group label over the derived domain', () => {
+  globalThis._skipLoadPopupState = true;
+  resetPopupTestState();
+
+  const group = { domain: 'gh-org', label: 'GitHub Orgs', tabs: [], kind: 'custom' };
+  assert.equal(globalThis.getGroupDisplayLabel(group), 'GitHub Orgs');
+});
+
+test('renderPopupTabs updates content without replaying the entry animation', () => {
+  globalThis._skipLoadPopupState = true;
+  resetPopupTestState();
+
+  const classes = { nav: new Set(), list: new Set() };
+  const makeEl = (name) => ({
+    innerHTML: '',
+    classList: {
+      add: cls => classes[name].add(cls),
+      remove: cls => classes[name].delete(cls),
+      contains: cls => classes[name].has(cls),
+    },
+  });
+  const originalGet = globalThis.document.getElementById;
+  const originalBody = globalThis.document.body;
+  globalThis.document.body = { classList: { add: () => {} } };
+  globalThis.document.getElementById = id => {
+    if (id === 'popupTabsList') return makeEl('list');
+    if (id === 'popupGroupNav') return makeEl('nav');
+    if (id === 'popupTabsEmpty') return { hidden: false };
+    return null;
+  };
+  try {
+    // Drain any double-rAF callbacks queued by earlier tests.
+    flushRaf(); flushRaf(); flushRaf(); flushRaf();
+    globalThis.popupState.openTabs = [
+      { id: 1, url: 'https://example.com/', title: 'Example', windowId: 1, active: false },
+    ];
+    globalThis.renderPopupTabs();
+    // Background refreshes must not hide the list: is-entering is only added
+    // by syncPopupView on an actual view switch.
+    assert.ok(!classes.list.has('is-entering'), 'content refresh must not add is-entering');
+    assert.ok(!classes.nav.has('is-entering'), 'nav refresh must not add is-entering');
+    flushRaf();
+    flushRaf();
+    assert.ok(classes.list.has('is-ready'), 'is-ready applied');
+  } finally {
+    globalThis.document.getElementById = originalGet;
+    globalThis.document.body = originalBody;
+  }
+});
+
+test('syncPopupView adds is-entering to the incoming panel only on view switch', () => {
+  globalThis._skipLoadPopupState = true;
+  resetPopupTestState();
+
+  const classes = { shortcuts: new Set(), tabs: new Set(), nav: new Set() };
+  const makeEl = (name) => ({
+    innerHTML: '',
+    hidden: false,
+    classList: {
+      add: cls => classes[name].add(cls),
+      remove: cls => classes[name].delete(cls),
+      toggle: (cls, on) => { classes[name][on ? 'add' : 'delete'](cls); },
+      contains: cls => classes[name].has(cls),
+    },
+    setAttribute: () => {},
+  });
+  const originalGet = globalThis.document.getElementById;
+  const originalBody = globalThis.document.body;
+  globalThis.document.body = { classList: { add: () => {} } };
+  globalThis.document.getElementById = id => {
+    const map = {
+      popupShortcutsTab: 'shortcuts',
+      popupTabsTab: 'tabs',
+      popupShortcutsPanel: 'shortcuts',
+      popupTabsPanel: 'tabs',
+      popupShortcutsList: 'shortcuts',
+      popupTabsList: 'tabs',
+      popupGroupNav: 'nav',
+    };
+    return map[id] ? makeEl(map[id]) : null;
+  };
+  try {
+    flushRaf(); flushRaf(); flushRaf(); flushRaf();
+    globalThis.popupState.view = 'tabs';
+    globalThis.syncPopupView();
+    assert.ok(classes.tabs.has('is-entering'), 'incoming tabs panel is hidden until its animation starts');
+    assert.ok(classes.nav.has('is-entering'), 'incoming nav is hidden until its animation starts');
+    assert.ok(!classes.shortcuts.has('is-entering'), 'outgoing shortcuts panel is not hidden');
+    flushRaf();
+    flushRaf();
+    assert.ok(classes.tabs.has('is-entering'), 'is-entering stays while the entrance animation plays');
+    assert.ok(classes.tabs.has('is-ready'), 'is-ready applied to the tabs panel');
+
+    // Same-view sync (background refresh) clears is-entering so replaced
+    // content never replays the entrance animation.
+    globalThis.syncPopupView();
+    assert.ok(!classes.tabs.has('is-entering'), 'same-view sync clears is-entering');
+    assert.ok(!classes.nav.has('is-entering'), 'same-view sync clears nav is-entering');
+    assert.ok(classes.tabs.has('is-ready'), 'is-ready is preserved across refreshes');
+  } finally {
+    globalThis.document.getElementById = originalGet;
+    globalThis.document.body = originalBody;
+    resetPopupTestState();
+  }
 });
 
 // ---- renderShortcutCard ----
@@ -635,7 +963,6 @@ test('buildPopupTabGroups groups tabs by custom group rules', () => {
     { id: 2, url: 'https://gitlab.com/project', title: 'GitLab', windowId: 1, active: false, groupId: null },
     { id: 3, url: 'https://other.com/page', title: 'Other', windowId: 1, active: false, groupId: null },
   ];
-  globalThis.popupState.tabGroups = [];
 
   const groups = globalThis.buildPopupTabGroups();
   const gh = groups.find(g => g.kind === 'custom' && g.domain === 'github');
@@ -656,7 +983,6 @@ test('buildPopupTabGroups places landing pages before domain groups', () => {
     { id: 1, url: 'https://github.com/', title: 'GitHub Home', windowId: 1, active: false, groupId: null },
     { id: 2, url: 'https://other.com/page', title: 'Other', windowId: 1, active: false, groupId: null },
   ];
-  globalThis.popupState.tabGroups = [];
 
   const groups = globalThis.buildPopupTabGroups();
   assert.equal(groups[0].kind, 'landing', 'landing group should be first');
@@ -674,7 +1000,6 @@ test('buildPopupTabGroups handles custom landing page patterns', () => {
   globalThis.popupState.openTabs = [
     { id: 1, url: 'https://news.ycombinator.com/news', title: 'HN', windowId: 1, active: false, groupId: null },
   ];
-  globalThis.popupState.tabGroups = [];
 
   const groups = globalThis.buildPopupTabGroups();
   const landing = groups.find(g => g.kind === 'landing');
@@ -708,7 +1033,7 @@ test('renderTabGroup reorders tabs by stored groupTabOrder', () => {
   assert.ok(idxB < idxC, 'B should appear before C');
 });
 
-test('renderTabGroup deduplicates tabs by URL', () => {
+test('renderTabGroup shows duplicate URLs as separate rows', () => {
   resetPopupTestState({ landingPatterns: [] });
 
   const group = {
@@ -723,10 +1048,19 @@ test('renderTabGroup deduplicates tabs by URL', () => {
   const html = renderTabGroup(group, 0);
   // Each tab row has data-tab-id in both the row <div> and the close <button>
   const rowCount = (html.match(/popup-tab-row/g) || []).length;
-  assert.equal(rowCount, 1, 'duplicate URL tab should be removed, leaving 1 row');
+  assert.equal(rowCount, 2, 'duplicate URL tabs stay visible as separate rows');
 });
 
 // ---- isLandingPage: additional edge cases ----
+
+test('isLandingPage treats bare Gmail inbox and sent hashes as content tabs', () => {
+  resetPopupTestState({ landingPatterns: [] });
+  assert.equal(isLandingPage('https://mail.google.com/mail/u/0/#inbox'), false, 'bare #inbox is a content tab');
+  assert.equal(isLandingPage('https://mail.google.com/mail/u/0/#inbox/12345'), false, 'open conversation is a content tab');
+  assert.equal(isLandingPage('https://mail.google.com/mail/u/0/#sent'), false, 'bare #sent is a content tab');
+  assert.equal(isLandingPage('https://mail.google.com/mail/u/0/'), true, 'Gmail front page without a view is a landing');
+  assert.equal(isLandingPage('https://mail.google.com/mail/u/0/#label/work'), true, 'label views stay landing');
+});
 
 test('isLandingPage matches custom landing patterns', () => {
   resetPopupTestState({

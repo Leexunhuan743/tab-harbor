@@ -9,19 +9,36 @@ const popupI18n = globalThis.TabHarborI18n || {};
 const SESSION_GROUPS_KEY = 'sessionGroups';
 const GROUP_ORDER_KEY = 'groupOrder';
 const GROUP_TAB_ORDER_KEY = 'groupTabOrder';
+const GROUP_LABEL_OVERRIDES_KEY = 'groupLabelOverrides';
+const POPUP_VIEW_KEY = 'popupView';
 
 const popupState = {
   view: 'shortcuts',
   openTabs: [],
   quickShortcuts: [],
-  tabGroups: [],
   sessionGroups: { groups: [], assignments: {} },
   groupOrder: { sessionOrder: [], pinnedOrder: [], pinEnabled: false },
   groupTabOrder: {},
+  groupLabelOverrides: {},
 };
+
+// Resolve the remembered view synchronously (localStorage is sync) so the
+// very first paint shows the correct panel. chrome.storage is async and only
+// reconciles later; without this the popup flashes the default shortcuts
+// view for the first frame(s) when the remembered view is tabs.
+try {
+  popupState.view = localStorage.getItem(POPUP_VIEW_KEY) === 'tabs' ? 'tabs' : 'shortcuts';
+} catch {
+  popupState.view = 'shortcuts';
+}
 
 // Test exposure
 globalThis.popupState = popupState;
+globalThis.loadPopupView = loadPopupView;
+globalThis.loadPopupState = loadPopupState;
+globalThis.renderPopupShortcuts = renderPopupShortcuts;
+globalThis.renderPopupTabs = renderPopupTabs;
+globalThis.syncPopupView = syncPopupView;
 globalThis.buildPopupTabGroups = buildPopupTabGroups;
 globalThis.getGroupDisplayLabel = getGroupDisplayLabel;
 globalThis.escapeAttr = escapeAttr;
@@ -32,11 +49,12 @@ globalThis.renderShortcutCard = renderShortcutCard;
 globalThis.renderTabGroup = renderTabGroup;
 globalThis.renderGroupNav = renderGroupNav;
 globalThis._resetPopupState = () => {
+  popupState.view = 'shortcuts';
   popupState.openTabs = [];
-  popupState.tabGroups = [];
   popupState.sessionGroups = { groups: [], assignments: {} };
   popupState.groupOrder = { sessionOrder: [], pinnedOrder: [], pinEnabled: false };
   popupState.groupTabOrder = {};
+  popupState.groupLabelOverrides = {};
   popupState.quickShortcuts = [];
 };
 globalThis._skipLoadPopupState = false;
@@ -47,6 +65,7 @@ const POPUP_REFRESH_KEYS = new Set([
   'sessionGroups',
   'groupOrder',
   'groupTabOrder',
+  'groupLabelOverrides',
   'themePreferences',
   'languagePreference',
 ]);
@@ -94,8 +113,10 @@ const filterTabs = popupTheme.filterRealTabs || (tabs => Array.isArray(tabs) ? t
 
 function getLandingPatterns() {
   const base = [
+    // Gmail inbox/sent/search views are content tabs; other Gmail views
+    // (label views, bare front page) stay in the landing group.
     { hostname: 'mail.google.com', test: (_p, h) =>
-        !h.includes('#inbox/') && !h.includes('#sent/') && !h.includes('#search/') },
+        !h.includes('#inbox') && !h.includes('#sent') && !h.includes('#search/') },
     { hostname: 'x.com',               pathExact: ['/home'] },
     { hostname: 'www.linkedin.com',    pathExact: ['/'] },
     { hostname: 'github.com',          pathExact: ['/'] },
@@ -181,53 +202,80 @@ function reorderGroupTabsByStoredUrls(tabs, groupKey) {
 
 function getOrderedUniqueTabsForGroup(group) {
   const tabs = Array.isArray(group?.tabs) ? group.tabs : [];
-  const orderedTabs = reorderGroupTabsByStoredUrls(tabs, group?.domain);
-  const seenUrls = new Set();
-  return orderedTabs.filter(tab => {
-    const url = String(tab?.url || '').trim();
-    if (!url) return true;
-    if (seenUrls.has(url)) return false;
-    seenUrls.add(url);
-    return true;
-  });
+  // Reorder by the stored per-group order; every tab stays visible so
+  // duplicate URLs can be seen and closed, matching the dashboard.
+  return reorderGroupTabsByStoredUrls(tabs, group?.domain);
+}
+
+async function loadPopupView() {
+  try {
+    const stored = await chrome.storage.local.get(POPUP_VIEW_KEY);
+    popupState.view = stored[POPUP_VIEW_KEY] === 'tabs' ? 'tabs' : 'shortcuts';
+    // Keep the synchronous first-frame mirror in sync: chrome.storage is the
+    // source of truth (config import/export round-trips through it), so when
+    // it differs from the localStorage mirror, persist the resolved view back
+    // instead of letting the two diverge permanently (which would flash the
+    // stale first frame on every popup open).
+    try {
+      localStorage.setItem(POPUP_VIEW_KEY, popupState.view);
+    } catch { /* storage may be unavailable; chrome.storage remains authoritative */ }
+  } catch {
+    popupState.view = 'shortcuts';
+  }
+  return popupState.view;
+}
+
+function normalizeGroupLabelOverrides(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+  return Object.fromEntries(
+    Object.entries(input)
+      .filter(([, label]) => typeof label === 'string' && label.trim())
+      .map(([key, label]) => [String(key), label.trim()])
+  );
 }
 
 async function loadPopupState() {
   if (globalThis._skipLoadPopupState) return;
   const shortcutsGetter = popupTheme.getQuickShortcuts;
-  if (typeof shortcutsGetter === 'function') {
-    popupState.quickShortcuts = await shortcutsGetter();
-  }
+  const popupUrlUtils = globalThis.TabHarborTabUrlUtils || {};
+  const parseSuspendedUrl = popupUrlUtils.parseSuspendedTabUrl || (() => ({ isSuspended: false, originalUrl: '', title: '' }));
+  const canonicalizeUrl = popupUrlUtils.getCanonicalTabUrl || (url => String(url || ''));
 
-  const [tabs, tabGroups, sgResult, goResult, groupTabOrderResult] = await Promise.all([
+  const [quickShortcuts, tabs, sgResult, goResult, groupTabOrderResult, labelOverridesResult] = await Promise.all([
+    typeof shortcutsGetter === 'function' ? shortcutsGetter() : Promise.resolve([]),
     chrome.tabs.query({}),
-    chrome.tabGroups.query({}),
     chrome.storage.local.get(SESSION_GROUPS_KEY),
     chrome.storage.local.get(GROUP_ORDER_KEY),
     chrome.storage.local.get(GROUP_TAB_ORDER_KEY),
+    chrome.storage.local.get(GROUP_LABEL_OVERRIDES_KEY),
   ]);
 
-  popupState.openTabs = filterTabs(tabs).map(tab => ({
-    id: tab.id,
-    url: tab.url || '',
-    title: tab.title || '',
-    favIconUrl: tab.favIconUrl || '',
-    windowId: tab.windowId,
-    active: Boolean(tab.active),
-    groupId: tab.groupId,
-  }));
+  popupState.quickShortcuts = Array.isArray(quickShortcuts) ? quickShortcuts : [];
+  // Suspended tabs (chrome-extension://…/suspended.html#uri=…) stay visible
+  // and group under their original URL, matching the dashboard — but only
+  // when the original URL exists. Uri-less suspended pages fall through to
+  // the normal filter and are dropped like other internal pages.
+  popupState.openTabs = tabs.filter(tab => {
+    const rawUrl = String(tab.url || '').trim();
+    if (!rawUrl) return true;
+    const suspended = parseSuspendedUrl(rawUrl);
+    if (suspended.isSuspended && suspended.originalUrl) return true;
+    return filterTabs([tab]).length > 0;
+  }).map(tab => {
+    const rawUrl = String(tab.url || '').trim();
+    const suspended = parseSuspendedUrl(rawUrl);
+    return {
+      id: tab.id,
+      url: canonicalizeUrl(rawUrl),
+      title: suspended.title || tab.title || '',
+      favIconUrl: tab.favIconUrl || '',
+      windowId: tab.windowId,
+      active: Boolean(tab.active),
+      groupId: tab.groupId,
+    };
+  });
 
-  popupState.tabGroups = Array.isArray(tabGroups)
-    ? tabGroups
-        .map(group => ({
-          id: group.id,
-          title: group.title || '',
-          color: group.color || '',
-          collapsed: Boolean(group.collapsed),
-          tabs: popupState.openTabs.filter(tab => tab.groupId === group.id),
-        }))
-        .filter(group => group.tabs.length > 0)
-    : [];
+  popupState.groupLabelOverrides = normalizeGroupLabelOverrides(labelOverridesResult[GROUP_LABEL_OVERRIDES_KEY]);
 
   const normalizeFn = popupSessionGroups.normalizeSessionGroups;
   popupState.sessionGroups = normalizeFn ? normalizeFn(sgResult[SESSION_GROUPS_KEY]) : { groups: [], assignments: {} };
@@ -243,12 +291,13 @@ function buildPopupTabGroups() {
   const sessionGroupMap = Object.fromEntries(
     sessionGroups.groups.map(group => [
       group.id,
-      { domain: `__session_group__:${group.id}`, label: group.name, tabs: [], kind: 'session', manualGroupId: group.id },
+      { domain: `__session_group__:${group.id}`, label: group.name, tabs: [], kind: 'session', manualGroupId: group.id, createdAt: group.createdAt },
     ])
   );
 
   const groupMap = {};
   const landingTabs = [];
+  const ungroupedTabs = [];
 
   for (const tab of openTabs) {
     const assignedGroupId = sessionGroups.assignments[String(tab.id)];
@@ -274,16 +323,25 @@ function buildPopupTabGroups() {
     try {
       hostname = tab.url.startsWith('file://') ? 'local-files' : new URL(tab.url).hostname;
     } catch {
+      ungroupedTabs.push(tab);
       continue;
     }
-    if (!hostname) continue;
+    if (!hostname) {
+      ungroupedTabs.push(tab);
+      continue;
+    }
 
-    if (!groupMap[hostname]) groupMap[hostname] = { domain: hostname, label: hostname, tabs: [], kind: 'domain' };
-    groupMap[hostname].tabs.push(tab);
+    const primaryDomain = popupIcons.getPrimaryDomain ? popupIcons.getPrimaryDomain(hostname) : hostname;
+    if (!groupMap[primaryDomain]) groupMap[primaryDomain] = { domain: primaryDomain, label: '', tabs: [], kind: 'domain' };
+    groupMap[primaryDomain].tabs.push(tab);
   }
 
   if (landingTabs.length > 0) {
     groupMap['__landing-pages__'] = { domain: '__landing-pages__', label: '__landing-pages__', tabs: landingTabs, kind: 'landing' };
+  }
+
+  if (ungroupedTabs.length > 0) {
+    groupMap['__ungrouped__'] = { domain: '__ungrouped__', label: '__ungrouped__', tabs: ungroupedTabs, kind: 'ungrouped' };
   }
 
   const landingHostnames = new Set(getLandingPatterns().map(p => p.hostname).filter(Boolean));
@@ -293,7 +351,10 @@ function buildPopupTabGroups() {
     return landingSuffixes.some(s => domain.endsWith(s));
   }
 
-  const sessionGroupsList = Object.values(sessionGroupMap).filter(g => g.tabs.length > 0);
+  // Same ordering as the dashboard: oldest session group first, then automatic groups.
+  const sessionGroupsList = Object.values(sessionGroupMap)
+    .filter(g => g.tabs.length > 0)
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
   const automaticGroups = Object.values(groupMap);
 
   const sortedAutomatic = automaticGroups.sort((a, b) => {
@@ -307,24 +368,35 @@ function buildPopupTabGroups() {
   });
 
   const applyOrderFn = popupGroupOrder.applyGroupOrder;
-  const orderedManual = applyOrderFn ? applyOrderFn(sessionGroupsList, groupOrder) : sessionGroupsList;
-  const orderedAuto = applyOrderFn ? applyOrderFn(sortedAutomatic, groupOrder) : sortedAutomatic;
-
-  return [...orderedManual, ...orderedAuto];
+  const mergedGroups = [...sessionGroupsList, ...sortedAutomatic];
+  return applyOrderFn ? applyOrderFn(mergedGroups, groupOrder) : mergedGroups;
 }
+
+let popupShortcutsRenderKey = '';
 
 function renderPopupShortcuts() {
   const listEl = document.getElementById('popupShortcutsList');
   const emptyEl = document.getElementById('popupShortcutsEmpty');
   if (!listEl || !emptyEl) return;
 
-  listEl.classList.add('is-entering');
+  // Skip re-rendering when neither the shortcuts nor the column setting
+  // changed — background tab refreshes must not reset the grid.
+  const cols = popupTheme.getQuickShortcutCols ? popupTheme.getQuickShortcutCols() : 'auto';
+  const renderKey = `${JSON.stringify(popupState.quickShortcuts)}|${cols}`;
+  if (renderKey === popupShortcutsRenderKey) return;
+  popupShortcutsRenderKey = renderKey;
+
+  // The dashboard "quick links per row" setting controls the popup grid too.
+  listEl.classList.toggle('is-fixed-cols-4', cols === '4');
+  listEl.classList.toggle('is-fixed-cols-5', cols === '5');
   listEl.innerHTML = popupState.quickShortcuts.length
     ? popupState.quickShortcuts.map((s, i) => renderShortcutCard(s, i)).join('')
     : '';
   emptyEl.hidden = popupState.quickShortcuts.length > 0;
 
-  requestAnimationFrame(() => requestAnimationFrame(() => listEl.classList.add('is-ready')));
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    listEl.classList.add('is-ready');
+  }));
 }
 
 function renderShortcutCard(shortcut, index) {
@@ -365,12 +437,16 @@ function renderShortcutCard(shortcut, index) {
 function getGroupDisplayLabel(group) {
   const i18n = globalThis.TabHarborI18n || {};
   const t = i18n.t ? (key => i18n.t(key)) : (key => key);
+  if (!group) return 'Group';
+  if (popupState.groupLabelOverrides[group.domain]) {
+    return popupState.groupLabelOverrides[group.domain];
+  }
   switch (group.kind) {
     case 'landing':   return t('homepagesLabel');
     case 'session':   return group.label;
     case 'chrome-group': return group.label;
     case 'ungrouped': return t('ungroupedLabel');
-    default:          return friendlyDomain(group.domain) || group.domain;
+    default:          return group.label || (friendlyDomain(group.domain) || group.domain);
   }
 }
 
@@ -440,11 +516,9 @@ function renderPopupTabs() {
 
   if (navEl.innerHTML !== newNavHtml) {
     navEl.innerHTML = newNavHtml;
-    navEl.classList.add('is-entering');
   }
   if (listEl.innerHTML !== newListHtml) {
     listEl.innerHTML = newListHtml;
-    listEl.classList.add('is-entering');
   }
   if (emptyEl.hidden !== true) {
     emptyEl.hidden = true;
@@ -455,6 +529,8 @@ function renderPopupTabs() {
     listEl.classList.add('is-ready');
   }));
 }
+
+let lastSyncedPopupView = '';
 
 function syncPopupView() {
   const shortcutsTab = document.getElementById('popupShortcutsTab');
@@ -471,10 +547,23 @@ function syncPopupView() {
   tabsTab?.classList.toggle('is-active', isTabs);
   tabsTab?.setAttribute('aria-selected', String(isTabs));
 
-  // Strip animation classes so they replay on re-enter
-  [shortcutsList, tabsList, navEl].forEach(el => {
-    el?.classList.remove('is-ready', 'is-entering');
-  });
+  // Strip animation classes only when the view actually switched, so
+  // background refreshes do not replay the entry animation.
+  const viewChanged = lastSyncedPopupView !== popupState.view;
+  lastSyncedPopupView = popupState.view;
+  if (viewChanged) {
+    [shortcutsList, tabsList, navEl].forEach(el => {
+      el?.classList.remove('is-ready', 'is-entering');
+    });
+    // Hide the incoming panel until its entry animation starts (re-triggered
+    // below), so content painted after a view switch never flashes unstyled.
+    if (!isTabs) {
+      shortcutsList?.classList.add('is-entering');
+    } else {
+      tabsList?.classList.add('is-entering');
+      navEl?.classList.add('is-entering');
+    }
+  }
 
   if (shortcutsPanel) {
     shortcutsPanel.hidden = isTabs;
@@ -485,17 +574,35 @@ function syncPopupView() {
     tabsPanel.classList.toggle('is-active', isTabs);
   }
 
-  // Re-trigger animation for the incoming active panel
-  if (!isTabs && shortcutsList) {
-    requestAnimationFrame(() => requestAnimationFrame(() => shortcutsList.classList.add('is-ready')));
+  // Re-trigger animation for the incoming active panel (skip when the
+  // class is already present so background refreshes cause no mutations).
+  // is-entering (set above on view switch) stays on while the entrance
+  // animation plays; only the same-view sync below clears it.
+  if (!isTabs && shortcutsList && !shortcutsList.classList.contains('is-ready')) {
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      shortcutsList.classList.add('is-ready');
+    }));
   } else if (isTabs && tabsList && navEl) {
     requestAnimationFrame(() => requestAnimationFrame(() => {
-      tabsList.classList.add('is-ready');
-      navEl.classList.add('is-ready');
+      if (!tabsList.classList.contains('is-ready')) tabsList.classList.add('is-ready');
+      if (!navEl.classList.contains('is-ready')) navEl.classList.add('is-ready');
     }));
+  }
+
+  // Background refreshes must not replay the entrance animation: the child
+  // animations are bound to .is-entering.is-ready, so clearing is-entering
+  // here (and on every later same-view sync) keeps replaced content visible.
+  if (!viewChanged) {
+    [shortcutsList, tabsList, navEl].forEach(el => {
+      el?.classList.remove('is-entering');
+    });
   }
 }
 
+// Popup quick links always open a new active tab, regardless of the
+// dashboard "open in current tab" setting: navigating the current tab here
+// would replace the real page behind the popup, which is destructive. The
+// open-mode toggle (and Ctrl/Shift modifiers) apply to the new-tab page only.
 async function openPopupUrl(url) {
   if (!url) return;
   await chrome.tabs.create({ url, active: true });
@@ -528,59 +635,33 @@ async function openPopupTab(tabId, fallbackUrl = '') {
   }
 
   if (currentWindow?.id && targetTab.windowId && targetTab.windowId !== currentWindow.id) {
-    const targetUrl = targetTab.url || fallbackUrl;
-    if (!targetUrl) return;
-    await chrome.tabs.create({
-      windowId: currentWindow.id,
-      url: targetUrl,
-      active: true,
-    });
+    // Activate the existing tab in its own window instead of duplicating it
+    // here — the tabs view exists to avoid opening duplicates. Mirrors the
+    // dashboard focus-tab behavior (tabs.update + windows.update).
+    try {
+      await chrome.tabs.update(targetTab.id, { active: true });
+    } catch {
+      // The tab closed meanwhile — fall back to opening its URL here.
+      const targetUrl = targetTab.url || fallbackUrl;
+      if (targetUrl) {
+        await chrome.tabs.create({
+          windowId: currentWindow.id,
+          url: targetUrl,
+          active: true,
+        });
+      }
+      window.close();
+      return;
+    }
+    // Activating the tab is the essential step; focusing its window is
+    // best-effort — if it fails the tab is already active where it lives.
+    await chrome.windows.update(targetTab.windowId, { focused: true }).catch(() => {});
     window.close();
     return;
   }
 
   await chrome.tabs.update(targetTab.id, { active: true });
   window.close();
-}
-
-function handlePopupGroupNavImageError(event) {
-  const target = event.target;
-  if (!(target instanceof HTMLImageElement)) return;
-  if (!target.classList.contains('group-nav-icon')) return;
-
-  const fallbackQueue = [];
-  const primaryFallback = String(target.dataset.fallbackSrc || '').trim();
-  if (primaryFallback) fallbackQueue.push(primaryFallback);
-  const serializedQueue = String(target.dataset.fallbackSrcset || '').trim();
-  if (serializedQueue) {
-    try {
-      const parsed = JSON.parse(serializedQueue);
-      if (Array.isArray(parsed)) {
-        fallbackQueue.push(...parsed.map(url => String(url || '').trim()).filter(Boolean));
-      }
-    } catch {}
-  }
-
-  const currentSrc = String(target.currentSrc || target.src || '').trim();
-  const nextFallback = fallbackQueue.find(url => url && url !== currentSrc && url !== String(target.dataset.fallbackApplied || '').trim());
-  if (nextFallback) {
-    const remaining = fallbackQueue.filter(url => url && url !== nextFallback);
-    target.dataset.fallbackApplied = nextFallback;
-    target.dataset.fallbackSrc = nextFallback;
-    if (remaining.length) {
-      target.dataset.fallbackSrcset = JSON.stringify(remaining);
-    } else {
-      delete target.dataset.fallbackSrcset;
-    }
-    target.src = nextFallback;
-    return;
-  }
-
-  target.style.display = 'none';
-  const sibling = target.nextElementSibling;
-  if (sibling?.classList.contains('group-nav-fallback')) {
-    sibling.style.display = '';
-  }
 }
 
 async function refreshPopup() {
@@ -618,6 +699,9 @@ async function refreshPopupSafely() {
   popupRefreshInFlight = (async () => {
     try {
       await refreshPopup();
+    } catch (err) {
+      // A failed refresh keeps the previous snapshot; surface for debugging.
+      console.warn('[tab-harbor popup] refresh failed:', err?.message || err);
     } finally {
       popupRefreshInFlight = null;
       if (popupRefreshQueued) {
@@ -659,8 +743,22 @@ function registerPopupAutoRefresh() {
 }
 
 function initializePopup() {
-  document.addEventListener('error', handlePopupGroupNavImageError, true);
   registerPopupAutoRefresh();
+
+  const groupNavWrap = document.getElementById('popupGroupNav');
+  if (groupNavWrap) {
+    // The nav scrollbar is hidden; let the vertical wheel scroll it
+    // horizontally — but only when it can actually scroll, so a wheel over
+    // a short nav (no overflow) passes through untouched.
+    groupNavWrap.addEventListener('wheel', (e) => {
+      const list = e.target.closest('.group-nav-list') || groupNavWrap;
+      if (list.scrollWidth <= list.clientWidth) return;
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+        e.preventDefault();
+        list.scrollLeft += e.deltaY;
+      }
+    }, { passive: false });
+  }
 
   document.addEventListener('click', async e => {
     const actionEl = e.target.closest('[data-action]');
@@ -670,11 +768,13 @@ function initializePopup() {
     if (action === 'switch-popup-view') {
       popupState.view = actionEl.dataset.view === 'tabs' ? 'tabs' : 'shortcuts';
       syncPopupView();
+      void chrome.storage.local.set({ [POPUP_VIEW_KEY]: popupState.view });
+      try { localStorage.setItem(POPUP_VIEW_KEY, popupState.view); } catch { /* storage unavailable */ }
       return;
     }
 
     if (action === 'refresh-popup') {
-      await refreshPopup();
+      await refreshPopupSafely();
       return;
     }
 
@@ -695,7 +795,8 @@ function initializePopup() {
         if (popupRefreshInFlight) {
           try { await popupRefreshInFlight; } catch { /* swallow */ }
         }
-        await refreshPopup();
+        // The safe pipeline keeps the previous snapshot if this refresh fails.
+        await refreshPopupSafely();
         // tabs.onActivated (from switching to a new active tab) may have
         // rescheduled a refresh during our await — suppress it
         if (popupRefreshTimer) {
@@ -711,6 +812,11 @@ function initializePopup() {
 
     if (action === 'open-popup-url') {
       e.preventDefault();
+      // A close in flight makes the close button unclickable (pointer-events:
+      // none), so a fast second click lands on the row itself — ignore it or
+      // the user's "close" intent would re-open the tab.
+      const rowEl = actionEl.closest('.popup-tab-row');
+      if (rowEl?.querySelector('.popup-tab-close-btn.is-loading')) return;
       const tabId = Number(actionEl.dataset.tabId);
       if (tabId) {
         await openPopupTab(tabId, actionEl.dataset.url || '');
@@ -727,7 +833,17 @@ function initializePopup() {
     }
   });
 
-  refreshPopupSafely()
+  // Apply the remembered view before the first paint (scripts run during
+  // parse, ahead of any frame) so opening on the tabs view never flashes
+  // the default shortcuts panel. loadPopupView below reconciles with
+  // chrome.storage for imports/exports.
+  syncPopupView();
+
+  loadPopupView()
+    .then(() => {
+      syncPopupView();
+      return refreshPopupSafely();
+    })
     .then(() => requestAnimationFrame(() => document.body.classList.add('is-ready')))
     .catch(() => {
       renderPopupShortcuts();

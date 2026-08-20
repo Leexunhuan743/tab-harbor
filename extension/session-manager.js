@@ -1181,7 +1181,7 @@ function detachSavedSessionTabToNewSession({
       if (sessionManagerPage === 'saved-tabs') await renderSavedTabsPage();
       showManagerToast(managerT
         ? managerT('toastSessionSaved', { count: result?.session?.tabs?.length || 0 })
-        : 'Session saved');
+        : `Saved ${result?.session?.tabs?.length || 0} tabs and closed the originals`);
     } catch (error) {
       console.error('[tab-harbor] Failed to save current window session:', error);
       showManagerToast(getErrorToast());
@@ -1196,7 +1196,7 @@ function detachSavedSessionTabToNewSession({
       await renderSavedTabsPage();
       showManagerToast(managerT
         ? managerT('toastSessionRestored', { count: result?.restoredCount || 0 })
-        : 'Session restored');
+        : `Restored ${result?.restoredCount || 0} tabs`);
     } catch (error) {
       console.error('[tab-harbor] Failed to restore tab session:', error);
       showManagerToast(getErrorToast());

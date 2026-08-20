@@ -13,6 +13,7 @@
 
   const SAVED_TAB_SESSIONS_KEY = 'savedTabSessions';
   const MANUAL_GROUP_PREFIX = '__session_group__:';
+  const CHROME_GROUP_PREFIX = '__chrome_group__:';
 
   function createSessionId(now = new Date()) {
     return `tab-session-${now.getTime()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -105,6 +106,7 @@
       groupKey: normalizeString(input.groupKey),
       groupLabel: normalizeString(input.groupLabel),
       manualGroupId: normalizeString(input.manualGroupId),
+      chromeGroupColor: normalizeString(input.chromeGroupColor),
     };
   }
 
@@ -122,6 +124,7 @@
       key,
       label: normalizeString(input.label) || 'Group',
       manualGroupId: normalizeString(input.manualGroupId),
+      chromeGroupColor: normalizeString(input.chromeGroupColor),
       tabUrls: [...new Set(tabUrls)],
     };
   }
@@ -164,6 +167,7 @@
           key,
           label: normalizeString(tab?.groupLabel) || 'Group',
           manualGroupId: normalizeString(tab?.manualGroupId),
+          chromeGroupColor: normalizeString(tab?.chromeGroupColor),
           tabUrls: [],
         });
       }
@@ -243,6 +247,7 @@
       key,
       label: normalizeString(entry.label) || 'Group',
       manualGroupId: normalizeString(entry.manualGroupId),
+      chromeGroupColor: normalizeString(entry.chromeGroupColor),
     };
   }
 
@@ -279,6 +284,7 @@
         groupKey: lookupEntry?.key || '',
         groupLabel: lookupEntry?.label || '',
         manualGroupId: lookupEntry?.manualGroupId || '',
+        chromeGroupColor: lookupEntry?.chromeGroupColor || '',
       };
 
       savedTabs.push(savedTab);
@@ -289,6 +295,7 @@
             key: lookupEntry.key,
             label: lookupEntry.label,
             manualGroupId: lookupEntry.manualGroupId,
+            chromeGroupColor: lookupEntry.chromeGroupColor,
             tabUrls: [],
           });
         }
@@ -335,10 +342,14 @@
       restoredByUrl.get(canonicalUrl).push(String(tab.id));
     }
 
+    // Native Chrome groups cannot be re-created here (no chrome.* access in
+    // this module) — return ordered plans for the caller to execute.
+    const chromeGroupPlans = [];
+
     const sessionGroups = Array.isArray(session?.groups) ? session.groups : [];
-    sessionGroups
-      .filter(group => normalizeString(group?.key).startsWith(MANUAL_GROUP_PREFIX))
-      .forEach((group, index) => {
+    sessionGroups.forEach((group, index) => {
+      const groupKey = normalizeString(group?.key);
+      if (groupKey.startsWith(MANUAL_GROUP_PREFIX)) {
         const groupName = normalizeString(group.label) || 'Restored group';
         const groupId = `restored-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`;
         normalizedState.groups.push({
@@ -352,9 +363,31 @@
           const tabId = tabIds.shift();
           if (tabId) normalizedState.assignments[tabId] = groupId;
         }
-      });
+      } else if (groupKey.startsWith(CHROME_GROUP_PREFIX)) {
+        // Restore as a fresh native Chrome group: title + color + the tab
+        // order recorded in tabUrls (the native group id is session-local and
+        // cannot be reused). Every restored tab matching a recorded url joins —
+        // a url appears once in tabUrls but may map to several restored tabs.
+        const planTabIds = [];
+        for (const url of Array.isArray(group.tabUrls) ? group.tabUrls : []) {
+          const tabIds = restoredByUrl.get(url) || [];
+          if (tabIds.length) {
+            planTabIds.push(...tabIds);
+            restoredByUrl.set(url, []);
+          }
+        }
+        if (planTabIds.length > 0) {
+          chromeGroupPlans.push({
+            title: normalizeString(group.label) || 'Restored group',
+            color: normalizeString(group.chromeGroupColor) || 'grey',
+            tabIds: planTabIds,
+          });
+        }
+      }
+      // Domain keys (plain hostnames) are derived automatically on restore.
+    });
 
-    return normalizedState;
+    return { state: normalizedState, chromeGroupPlans };
   }
 
   async function getSavedTabSessions() {

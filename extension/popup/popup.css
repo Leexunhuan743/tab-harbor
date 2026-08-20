@@ -4,10 +4,17 @@
    ============================================================ */
 
 html, body {
-  width: 100%;
+  width: 400px;
   min-width: 380px;
   max-width: 420px;
   height: fit-content;
+  /* Override style.css body { min-height: 100vh } so the window fits its
+     content up to max-height instead of always filling the viewport. */
+  min-height: 0;
+  max-height: 520px;
+  /* The inner panels (.popup-tabs-list, .popup-shortcuts-grid) own the
+     vertical scroll; never let the popup document scroll too. */
+  overflow: hidden;
   margin: 0;
   padding: 0;
   /* subtle paper grain */
@@ -31,7 +38,8 @@ body.popup-shell {
 /* ── App Container ─────────────────────────────────────────── */
 .popup-app {
   width: 100%;
-  height: 100%;
+  height: fit-content;
+  max-height: 520px;
   display: flex;
   flex-direction: column;
   padding: 14px 16px;
@@ -167,6 +175,22 @@ body.popup-shell {
   align-content: start;
 }
 
+/* Fixed column counts follow the dashboard "quick links per row" setting. */
+.popup-shortcuts-grid.is-fixed-cols-4 {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+}
+
+.popup-shortcuts-grid.is-fixed-cols-5 {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+}
+
+.popup-shortcuts-grid.is-fixed-cols-4 .popup-shortcut-card,
+.popup-shortcuts-grid.is-fixed-cols-5 .popup-shortcut-card {
+  width: 100%;
+}
+
 /* Shortcut card — matches dashboard quick-shortcut-card */
 .popup-shortcut-card {
   position: relative;
@@ -266,24 +290,33 @@ body.popup-shell {
 /* ── Group Navigation ─────────────────────────────────────────── */
 .popup-group-nav-wrap {
   display: flex;
+  flex-wrap: nowrap;
+  flex: 0 0 auto;
+  align-items: center;
   overflow-x: auto;
+  overflow-y: hidden;
   gap: 6px;
-  padding-bottom: 6px;
-  scrollbar-width: thin;
+  /* This element also carries the shared .group-nav class (style.css), which
+     would add margin-bottom: 14px below the icon row — override it so the
+     row's spacing is controlled here, not by the dashboard nav rules. */
+  margin: 0;
+  /* Top headroom so the shared style.css hover lift (translateY(-1px)) never
+     clips the button's top edge against overflow-y: hidden. */
+  padding-top: 2px;
+  padding-bottom: 2px;
+  /* Keep horizontal scrolling, but never show the nav scrollbar. */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
 
 .popup-group-nav-wrap::-webkit-scrollbar {
-  height: 3px;
-}
-
-.popup-group-nav-wrap::-webkit-scrollbar-thumb {
-  background: var(--warm-gray);
-  border-radius: 999px;
+  display: none;
 }
 
 .group-nav-button {
   width: 40px;
   height: 40px;
+  flex: 0 0 40px;
   border-radius: 999px;
   border: 1px solid color-mix(in srgb, var(--warm-gray) 70%, var(--workspace-accent-border) 30%);
   background: color-mix(in srgb, var(--card-bg) calc(var(--custom-surface-opacity) + 64%), transparent);
@@ -331,7 +364,6 @@ body.popup-shell {
   flex-direction: column;
   gap: 8px;
   padding-right: 2px;
-  scrollbar-width: thin;
 }
 
 .popup-tab-group {
@@ -425,12 +457,12 @@ body.popup-shell {
 }
 
 .popup-tab-close-btn {
-  width: 22px;
-  height: 22px;
+  width: 34px;
+  height: 34px;
   border: none;
   background: transparent;
   color: var(--muted);
-  border-radius: 4px;
+  border-radius: 6px;
   padding: 0;
   display: inline-flex;
   align-items: center;
@@ -442,8 +474,8 @@ body.popup-shell {
 }
 
 .popup-tab-close-btn svg {
-  width: 13px;
-  height: 13px;
+  width: 19px;
+  height: 19px;
 }
 
 .popup-tab-close-btn:hover {
@@ -463,15 +495,18 @@ body.popup-shell {
 }
 
 /* ── Scrollbars ──────────────────────────────────────────────── */
-.popup-shortcuts-grid::-webkit-scrollbar,
-.popup-tabs-list::-webkit-scrollbar {
-  width: 4px;
+/* Scrollbars are hidden everywhere (like the group nav): the panels still
+   scroll with the wheel and keyboard, and transient overflow (e.g. during
+   the entry animation) can never flash a visible scrollbar. */
+.popup-shortcuts-grid,
+.popup-tabs-list {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
 
-.popup-shortcuts-grid::-webkit-scrollbar-thumb,
-.popup-tabs-list::-webkit-scrollbar-thumb {
-  background: var(--warm-gray);
-  border-radius: 999px;
+.popup-shortcuts-grid::-webkit-scrollbar,
+.popup-tabs-list::-webkit-scrollbar {
+  display: none;
 }
 
 /* ── Empty State ─────────────────────────────────────────────── */
@@ -514,7 +549,8 @@ body.popup-shell {
 @keyframes tab-rise {
   from {
     opacity: 0;
-    transform: translateY(5px);
+    /* Below the 4px row gap so a rising row never covers the row beneath it. */
+    transform: translateY(3px);
   }
   to {
     opacity: 1;
@@ -533,8 +569,9 @@ body.popup-shell {
   }
 }
 
-/* Animation base classes — start invisible */
-.is-entering,
+/* Animation base classes — children start invisible; the container itself
+   stays visible so a lingering .is-entering (cleared on the next same-view
+   sync) can never blank the whole panel. */
 .is-entering .group-nav-button,
 .is-entering .popup-tab-group,
 .is-entering .popup-tab-row,
@@ -547,22 +584,25 @@ body.popup-shell.is-ready {
   animation: popup-rise 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
+/* Entrance animations run only during an actual view switch: the
+   .is-entering class exists only then (added by syncPopupView), so content
+   replaced by a background refresh never replays them from opacity 0. */
 /* Shortcuts */
-.popup-shortcuts-grid.is-ready .popup-shortcut-card {
+.popup-shortcuts-grid.is-entering.is-ready .popup-shortcut-card {
   animation: shortcut-rise 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 /* Tabs — nav buttons stagger */
-.popup-group-nav-wrap.is-ready .group-nav-button {
+.popup-group-nav-wrap.is-entering.is-ready .group-nav-button {
   animation: nav-rise 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 /* Tabs — groups stagger, rows cascade after */
-.popup-tabs-list.is-ready .popup-tab-group {
+.popup-tabs-list.is-entering.is-ready .popup-tab-group {
   animation: popup-rise 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
-.popup-tabs-list.is-ready .popup-tab-row {
+.popup-tabs-list.is-entering.is-ready .popup-tab-row {
   animation: tab-rise 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
@@ -576,16 +616,15 @@ body.popup-shell.is-ready {
     transition: none !important;
     transform: none !important;
   }
-  .is-entering,
   .is-entering .group-nav-button,
   .is-entering .popup-tab-group,
   .is-entering .popup-tab-row,
   .is-entering .popup-shortcut-card,
   body.popup-shell.is-ready,
-  .popup-shortcuts-grid.is-ready .popup-shortcut-card,
-  .popup-group-nav-wrap.is-ready .group-nav-button,
-  .popup-tabs-list.is-ready .popup-tab-group,
-  .popup-tabs-list.is-ready .popup-tab-row {
+  .popup-shortcuts-grid.is-entering.is-ready .popup-shortcut-card,
+  .popup-group-nav-wrap.is-entering.is-ready .group-nav-button,
+  .popup-tabs-list.is-entering.is-ready .popup-tab-group,
+  .popup-tabs-list.is-entering.is-ready .popup-tab-row {
     opacity: 1 !important;
     animation: none !important;
     transform: none !important;

@@ -12,6 +12,7 @@ const runtimeJs = fs.readFileSync(path.join(__dirname, 'dashboard-runtime.js'), 
 const themeJs = fs.readFileSync(path.join(__dirname, 'theme-controls.js'), 'utf8');
 const drawerJs = fs.readFileSync(path.join(__dirname, 'drawer-manager.js'), 'utf8');
 const helperJs = fs.readFileSync(path.join(__dirname, 'ui-helpers.js'), 'utf8');
+const i18nJs = fs.readFileSync(path.join(__dirname, 'i18n.js'), 'utf8');
 const tabSessionsJs = fs.existsSync(path.join(__dirname, 'tab-sessions.js'))
   ? fs.readFileSync(path.join(__dirname, 'tab-sessions.js'), 'utf8')
   : '';
@@ -19,6 +20,7 @@ const sessionManagerJs = fs.existsSync(path.join(__dirname, 'session-manager.js'
   ? fs.readFileSync(path.join(__dirname, 'session-manager.js'), 'utf8')
   : '';
 const popupJs = fs.readFileSync(path.join(__dirname, 'popup', 'popup.js'), 'utf8');
+const popupCss = fs.readFileSync(path.join(__dirname, 'popup', 'popup.css'), 'utf8');
 const popupHtml = fs.readFileSync(path.join(__dirname, 'popup', 'popup.html'), 'utf8');
 const configJs = fs.readFileSync(path.join(__dirname, 'config.js'), 'utf8');
 const configLoaderJs = fs.readFileSync(path.join(__dirname, 'config-loader.js'), 'utf8');
@@ -92,8 +94,8 @@ test('saved-session picker scopes visible tabs to the selected entry point', () 
   assert.match(runtimeJs, /const newSessionName = String\(tabSessionPickerState\.newSessionName \|\| ''\)\.trim\(\);/);
   assert.match(runtimeJs, /saveSelectedTabSession\(\s*selectedIds,\s*tabSessionPickerState\.source \|\| 'selected',\s*newSessionName\s*\)/);
   assert.match(runtimeJs, /if \(action === 'save-current-window-session'\) \{[\s\S]{0,280}openTabSessionPicker\(\{ source: 'current-window' \}\)/);
-  assert.match(runtimeJs, /if \(action === 'save-single-tab-session'\) \{[\s\S]{0,360}openTabSessionPicker\(\{\s*source: 'single-tab',\s*initialTabIds: \[tabId\],\s*scopeTabIds: \[tabId\],\s*\}\)/);
-  assert.match(runtimeJs, /if \(action === 'save-domain-session'\) \{[\s\S]{0,720}openTabSessionPicker\(\{\s*source: 'group',\s*initialTabIds: tabIds,\s*scopeTabIds: tabIds,\s*\}\)/);
+  assert.match(runtimeJs, /if \(action === 'save-single-tab-session'\) \{[\s\S]{0,360}openSessionPickerForTabs\(\[tabId\], 'single-tab'\);/);
+  assert.match(runtimeJs, /if \(action === 'save-domain-session'\) \{[\s\S]{0,720}openSessionPickerForTabs\(tabIds, 'group'\);/);
   assert.doesNotMatch(runtimeJs, /saveSelectedTabSession\(\[tabId\], 'single-tab'\)/);
   assert.doesNotMatch(runtimeJs, /saveSelectedTabSession\(tabIds, 'group'\)/);
 });
@@ -102,7 +104,11 @@ test('home and saved section headers share a fixed title column and top nav stay
   const css = fs.readFileSync(path.join(__dirname, 'style.css'), 'utf8');
 
   assert.match(css, /#openTabsSection \.section-header h2,\s*\.saved-sessions-section \.section-header h2 \{[\s\S]*width:\s*13ch;/);
-  assert.match(css, /#openTabsSection \.section-count,\s*\.saved-sessions-section \.section-count \{[\s\S]*width:\s*96px;/);
+  // The open-tabs count hosts up to five icon buttons: it sizes to content and
+  // keeps a comfortable gap; only the saved-sessions count stays a fixed column.
+  assert.match(css, /#openTabsSection \.section-count \{[\s\S]*width:\s*auto;[\s\S]*flex:\s*0 0 auto;[\s\S]*gap:\s*8px;/);
+  assert.match(css, /\.saved-sessions-section \.section-count \{[\s\S]*width:\s*96px;/);
+  assert.match(css, /\.section-icon-action \{[\s\S]*width:\s*30px;[\s\S]*height:\s*30px;[\s\S]*flex-shrink:\s*0;/);
   assert.match(css, /\.group-nav-wide \{[\s\S]*min-height:\s*40px;[\s\S]*flex-wrap:\s*nowrap;[\s\S]*align-items:\s*center;/);
   assert.match(css, /\.group-nav-list \{[\s\S]*flex-wrap:\s*nowrap;/);
   assert.match(css, /\.group-nav-list \{[\s\S]*min-height:\s*40px;/);
@@ -133,8 +139,8 @@ test('desk settings separates appearance and feature controls', () => {
 });
 
 test('manual sleep control places per-tab moon action first', () => {
-  assert.match(runtimeJs, /function buildOverflowChips[\s\S]*<div class="chip-actions">\s*\$\{sleepControlEnabled && !tab\.active \? `\s*<button class="chip-action chip-discard"[\s\S]*<button class="chip-action chip-session-save"/);
-  assert.match(runtimeJs, /function renderDomainCard[\s\S]*<div class="chip-actions">\s*\$\{sleepControlEnabled && !tab\.active \? `<button class="chip-action chip-discard"[\s\S]*<button class="chip-action chip-session-save"/);
+  assert.match(runtimeJs, /function buildPageChipHtml\(tab, group, urlCounts = \{\}, collapsed = false\) \{[\s\S]*<div class="chip-actions">\s*\$\{sleepControlEnabled && !tab\.active && !tab\.discarded && !isPlaceholder \? `<button class="chip-action chip-discard"[\s\S]*<button class="chip-action chip-session-save"/);
+  assert.match(runtimeJs, /const pageChips = orderedTabs\.map\(\(tab, index\) => buildPageChipHtml\(tab, group, urlCounts, index >= 8 && !isOverflowExpanded\)\)\.join\(''\)[\s\S]*buildOverflowChips\(extraCount\)/);
 });
 
 test('icon-only actions use themed tooltips instead of native title hovers', () => {
@@ -201,9 +207,15 @@ test('new tab dashboard scopes visible open tabs to its own browser window', () 
   assert.match(runtimeJs, /async function queryTabsForDashboardWindow\(\) \{[\s\S]*chrome\.tabs\.query\(\{\s*windowId: currentWindowId\s*\}\)/);
   assert.doesNotMatch(runtimeJs, /if \(currentDashboardWindowId != null\) return currentDashboardWindowId;/);
   assert.match(runtimeJs, /await loadSessionGroups\(getOpenTabIdsForSessionPruning\(\)\)/);
-  assert.match(runtimeJs, /async function closeTabsByUrls\(urls\) \{[\s\S]*const allTabs = await queryTabsForDashboardWindow\(\);/);
-  assert.match(runtimeJs, /async function closeTabsExact\(urls\) \{[\s\S]*const allTabs = await queryTabsForDashboardWindow\(\);/);
-  assert.match(runtimeJs, /async function closeDuplicateTabs\(urls, keepOne = true\) \{[\s\S]*const allTabs = await queryTabsForDashboardWindow\(\);/);
+  assert.match(runtimeJs, /async function closeTabsByUrlsSafely\(urls,\s*\{ exact = false, playSound = true \} = \{\}\) \{[\s\S]*const allTabs = await queryTabsForDashboardWindow\(\);/);
+  assert.match(runtimeJs, /async function closeDuplicatesByUrls\(urls,\s*\{ keepOne = true, playSound = true \} = \{\}\) \{[\s\S]*const allTabs = await queryTabsForDashboardWindow\(\);/);
+  // Closing tabs must never remove a window's last tab: that would close
+  // the window and, for the last window, exit the browser.
+  assert.match(runtimeJs, /function ensureWindowsKeepLastTab\(allTabs, toCloseIds\) \{[\s\S]*winTabs\.every\(t => toCloseSet\.has\(t\.id\)\)[\s\S]*const keep = winTabs\.find\(t => t\.active\) \|\| winTabs\[0\];[\s\S]*toCloseSet\.delete\(keep\.id\);/);
+  assert.match(runtimeJs, /const safeToClose = ensureWindowsKeepLastTab\(allTabs, tabIds\);/);
+  // Closing a domain group starts the card exit immediately (instant visual
+  // feedback), closes the tabs in the background, then rebuilds the area.
+  assert.match(runtimeJs, /if \(action === 'close-domain-tabs'\) \{[\s\S]*animateCardOut\(card\);[\s\S]*if \(idx !== -1\) domainGroups\.splice\(idx, 1\);[\s\S]*await closeTabsByUrlsSafely\(urls, \{ exact: useExact, playSound: false \}\);[\s\S]*await renderDashboard\(\);/);
   assert.doesNotMatch(runtimeJs, /await loadSessionGroups\(openTabs\.map\(tab => tab\.id\)\)/);
   assert.doesNotMatch(runtimeJs, /await loadSessionGroups\(realTabs\.map\(tab => tab\.id\)\)/);
 });
@@ -258,10 +270,15 @@ test('toast helper tolerates missing optional action button node', () => {
   assert.match(helperJs, /\} else if \(toastAction\) \{/);
 });
 
-test('popup group nav keeps visible fallback labels and popup-local image fallback handling', () => {
+test('popup group nav fallback is consumed by the shared image fallback pipeline only', () => {
   assert.match(popupJs, /class="group-nav-fallback"/);
   assert.match(popupJs, /data-fallback-src=/);
-  assert.match(popupJs, /document\.addEventListener\('error', handlePopupGroupNavImageError, true\)/);
+  // The popup must NOT register its own document-level error handler: ui-helpers
+  // already owns a capture listener for the same data-fallback-* queue, and two
+  // consumers would skip fallback levels (double consumption).
+  assert.doesNotMatch(popupJs, /handlePopupGroupNavImageError/);
+  assert.match(helperJs, /__tabHarborImageFallbackBound/);
+  assert.match(popupHtml, /<script src="\.\.\/ui-helpers\.js"><\/script>/);
 });
 
 test('popup auto-refreshes when tabs and local storage change', () => {
@@ -272,9 +289,12 @@ test('popup auto-refreshes when tabs and local storage change', () => {
   assert.match(popupJs, /const POPUP_REFRESH_KEYS = new Set/);
 });
 
-test('popup opens tabs from other windows in the current window instead of focusing the old window', () => {
+test('popup activates a cross-window tab in its own window instead of duplicating it', () => {
   assert.match(popupJs, /targetTab\.windowId !== currentWindow\.id/);
-  assert.match(popupJs, /await chrome\.tabs\.create\(\{\s*windowId: currentWindow\.id,/);
+  // Mirrors the dashboard focus-tab behavior: activate the existing tab and
+  // focus its window, never copy the URL into the current window.
+  assert.match(popupJs, /await chrome\.tabs\.update\(targetTab\.id, \{ active: true \}\)/);
+  assert.match(popupJs, /await chrome\.windows\.update\(targetTab\.windowId, \{ focused: true \}\)/);
   assert.match(popupJs, /await openPopupTab\(tabId, actionEl\.dataset\.url \|\| ''\)/);
 });
 
@@ -347,6 +367,10 @@ test('optional local config is loaded safely before app mount', () => {
 test('background keeps the toolbar badge empty', () => {
   assert.match(backgroundJs, /await chrome\.action\.setBadgeText\(\{\s*text:\s*["']{2}\s*\}\)/);
   assert.doesNotMatch(backgroundJs, /String\(count\)/);
+});
+
+test('background notifies pages when a tab is replaced (stale chip root cause)', () => {
+  assert.match(backgroundJs, /chrome\.tabs\.onReplaced\.addListener\(\(addedTabId\) => \{\s*updateBadge\(\);\s*notifyTabHarborPages\(\{ source: "tabs\.onReplaced", triggerTabId: addedTabId \}\)/);
 });
 
 test('manifest keeps only permissions required by the shipped runtime', () => {
@@ -568,6 +592,8 @@ test('theme menu styles and custom background layer are defined', () => {
   assert.match(css, /\.drawer-title-btn\.is-active,\s*\.drawer-title-btn\[aria-selected="true"\]\s*\{[\s\S]*text-decoration-color:\s*var\(--drawer-tab-underline-active\);/);
   assert.match(css, /\.archive-clear-btn\s*\{[\s\S]*color:\s*var\(--workspace-chip-text\);/);
   assert.match(css, /\.todo-detail-card\s*\{[\s\S]*background:\s*color-mix\(\s*in\s+srgb,\s*var\(--card-bg\)\s+96%,\s*var\(--paper\)\s+4%\s*\);/);
+  // Image handling anchors: the compress path is kept and the legacy
+  // readFileAsDataUrl path must stay gone.
   assert.match(appJs, /compressImageFileForStorage/);
   assert.doesNotMatch(appJs, /readFileAsDataUrl/);
   assert.match(html, /<script src="background-image\.js"><\/script>/);
@@ -753,7 +779,39 @@ test('todo list and tab chips expose drag handles with drag-state styling', () =
   assert.match(appJs, /data-chip-drag-handle="tab"/);
   assert.match(appJs, /const chipItem = e\.target\.closest\('\[data-chip-sort-id\]'\);/);
   assert.match(appJs, /const chipAction = e\.target\.closest\('\.chip-actions'\);/);
+  // The whole row is the drag surface: the handle is the visible grip, but a
+  // press on the row body arms the same drag.
   assert.match(appJs, /if \(chipItem && !chipAction && e\.button === 0\)/);
+  assert.match(appJs, /originatedFromHandle: Boolean\(chipHandle\),/);
+  // Handle-click toggles a row into the highlight-only selection; dragging a
+  // selected row reorders the whole selection together within its group.
+  assert.match(appJs, /function togglePageChipSelection\(chipId\) \{[\s\S]*selectedPageChipIds\.add\(key\);/);
+  assert.match(appJs, /row\.classList\.toggle\('is-selected', selected\);/);
+  assert.match(appJs, /if \(selectedPageChipIds\.size > 0 && !e\.target\.closest\('\.mission-card'\) && !e\.target\.closest\('#pageChipBatchBar'\)\) \{\s*clearPageChipSelection\(\);/);
+  assert.match(appJs, /const finalDistance = Math\.hypot\(e\.clientX - pageChipDragState\.x, e\.clientY - pageChipDragState\.y\);\s*if \(!pageChipDragState\.moved && finalDistance < 4\) \{[\s\S]*togglePageChipSelection\(draggedPageChipId\);/);
+  assert.match(appJs, /function buildBatchOrderedIdsFromList\(listEl, movingIds\) \{[\s\S]*rest\.splice\(dropPos, 0, \.\.\.moving\);/);
+  assert.match(appJs, /const orderIds = buildBatchOrderedIdsFromList\(targetListEl, movingIds\);/);
+  // Cross-group moves and new-group creation move the whole selection when
+  // the dragged row is selected.
+  assert.match(appJs, /function collectMovingTabIds\(movingChipIds, fallbackGroupKey = ''\) \{[\s\S]*const chipGroupKey = findGroupKeyForChip\(chipId\) \|\| String\(fallbackGroupKey \|\| ''\);[\s\S]*tabIds\.push\(\.\.\.getTabIdsForGroupChip\(chipGroupKey, chipId\)\);/);
+  assert.match(appJs, /function findGroupKeyForChip\(chipId\) \{[\s\S]*\(group\.tabs \|\| \[\]\)\.some\(tab => getTabOrderTokens\(tab\)\.includes\(key\)\)/);
+  assert.match(appJs, /getTabOrderTokens\(tab\)\.some\(token => movingSet\.has\(String\(token\)\)\)/);
+  assert.match(appJs, /async function saveCrossGroupTabRowOrder\(sourceGroupKey, targetGroupKey, targetListEl, movingIds\) \{[\s\S]*Array\.isArray\(movingIds\)[\s\S]*const chipsByGroup = \{\};[\s\S]*findGroupKeyForChip\(id\) \|\| String\(sourceGroupKey \|\| ''\)[\s\S]*buildCrossGroupTargetOrder\(targetListEl, ids\)/);
+  assert.match(appJs, /saveCrossGroupTabRowOrder\(sourceGroupKey, movedGroup\.groupKey, targetListEl, getMovingPageChipIds\(\)\)/);
+  // Every source card a batch move leaves must be patched, not just the
+  // dragged row's card — otherwise moved rows linger in their old cards.
+  assert.match(appJs, /for \(const g of \(movedGroup\.sourceGroupKeys \|\| \[\]\)\) changedGroupKeys\.add\(g\);/);
+  assert.match(appJs, /return \{ \.\.\.created\.group, sourceGroupKeys \};/);
+  assert.match(appJs, /\$\{isSelected \? ' is-selected' : ''\}/);
+  assert.match(css, /\.page-chip\.is-selected \{[\s\S]*background: color-mix\(in srgb, var\(--workspace-chip-bg\) 82%, var\(--workspace-accent-border\) 18%\);/);
+  // Drag feedback: the rest of the selection dims and a count badge appears.
+  assert.match(css, /body\.page-chip-list-dragging \.page-chip\.is-selected:not\(\.is-dragging\) \{\s*opacity: 0\.55;/);
+  assert.match(css, /\.page-chip-drag-badge \{[\s\S]*position: fixed;[\s\S]*pointer-events: none;/);
+  assert.match(css, /\.chip-reorder-handle \{\s*touch-action: none;/);
+  assert.match(appJs, /function updatePageChipDragBadge\(count\) \{[\s\S]*badge\.textContent = count > 1 \? `×\$\{count\}` : '';/);
+  assert.match(appJs, /if \(chipItem && !chipAction && e\.button === 0\) \{\s*\/\/ Re-entrancy guard[\s\S]{0,600}e\.preventDefault\(\);/);
+  assert.match(appJs, /if \(e\.key !== 'Escape'\) return;[\s\S]{0,300}if \(draggedPageChipId && pageChipDragState\) \{\s*clearPageChipDragState\(\{ removeNode: false \}\);/);
+  assert.match(appJs, /movingChipIds: getMovingPageChipIds\(\),/);
   assert.match(appJs, /e\.stopPropagation\(\);/);
   assert.match(appJs, /document\.body\.classList\.add\('page-chip-drag-armed'\)/);
   assert.match(appJs, /const GROUP_TAB_ORDER_KEY = 'groupTabOrder'/);
@@ -788,7 +846,7 @@ test('todo list and tab chips expose drag handles with drag-state styling', () =
   assert.match(appJs, /dragHandleEl\.setPointerCapture\(e\.pointerId\)/);
   assert.match(appJs, /async function finishPageChipDrag\(\)/);
   assert.match(appJs, /let requiresOpenTabsRebuild = true;/);
-  assert.match(appJs, /requiresOpenTabsRebuild = false;/);
+  assert.match(appJs, /requiresOpenTabsRebuild = !pageChipPlaceholderEl;/);
   assert.match(appJs, /clearPageChipDragState\(\{ removeNode: requiresOpenTabsRebuild \}\)/);
   assert.match(appJs, /if \(!requiresOpenTabsRebuild\) \{[\s\S]*finish-local-reorder-commit[\s\S]*await syncChromeTabGroupsWithoutImportEcho\(\);/);
   assert.match(appJs, /document\.addEventListener\('pointercancel', async \(e\) => \{/);
@@ -802,7 +860,7 @@ test('todo list and tab chips expose drag handles with drag-state styling', () =
   assert.match(appJs, /if \(!movedGroup\.targetWasManualGroup\) \{[\s\S]*buildPersistentGroupOrderReplacingKey\(movedGroup\.groupKey, targetGroupKey\)/);
   assert.match(appJs, /const clampedPoint = clampPageChipClientPoint\(clientX, clientY\);/);
   assert.match(appJs, /if \(!pageChipDragState\.moved\) \{[\s\S]*const distance = Math\.hypot\(e\.clientX - pageChipDragState\.x, e\.clientY - pageChipDragState\.y\);[\s\S]*if \(distance >= 4\) \{/);
-  assert.match(appJs, /updateDraggedPageChipPosition\(e\.clientX, e\.clientY\);[\s\S]*syncPageChipDropTarget\(e\.clientX, e\.clientY\);/);
+  assert.match(appJs, /updateDraggedPageChipPosition\(e\.clientX, e\.clientY\);[\s\S]*if \(!stickyIsNonSource\) \{\s*(?:\/\/[^\n]*\n\s*)*previewPageChipOrder\(e\.clientX, e\.clientY\);/);
   assert.match(appJs, /clearPageChipDragState\(\{ removeNode: moved \}\)/);
   assert.match(appJs, /let suppressPageChipClickUntil = 0;/);
   assert.match(appJs, /if \(Date\.now\(\) < suppressPageChipClickUntil\) return;/);
@@ -814,7 +872,7 @@ test('todo list and tab chips expose drag handles with drag-state styling', () =
   assert.doesNotMatch(drawerJs, /title="Drag to reorder"/);
   assert.match(css, /\.drawer-reorder-handle\s*\{/);
   assert.match(css, /\.todo-reorder-handle\s*\{[\s\S]*width:\s*30px;[\s\S]*height:\s*30px;/);
-  assert.match(css, /\.page-chip > \.chip-reorder-handle\s*\{[\s\S]*width:\s*30px;[\s\S]*height:\s*30px;/);
+  assert.match(css, /\.page-chip > \.chip-reorder-handle\s*\{[\s\S]*width:\s*30px;[\s\S]*height:\s*36px;/);
   assert.match(css, /\.chip-reorder-handle\s*\{[\s\S]*opacity:\s*1;[\s\S]*border:\s*1px solid/);
   assert.match(css, /\.drawer-reorder-placeholder\s*\{/);
   assert.match(css, /body\.page-chip-list-dragging\s*\{/);
@@ -985,11 +1043,27 @@ test('saved session restore supports both current-window and new-window modes', 
   assert.match(runtimeJs, /async function restoreSavedTabToBrowser\(tabUrl\)/);
   assert.match(runtimeJs, /const \{ windowId \} = await openSavedTabsInCurrentWindow\(\[\{ url: tabUrl \}]\);/);
   assert.match(sessionManagerJs, /runtime\.restoreSavedTabToBrowser/);
+  // Saved sessions re-create native Chrome groups (fresh groups with the
+  // recorded title/color, ordered tabs) after the tabs are opened.
+  assert.match(runtimeJs, /const \{ state: nextSessionGroups, chromeGroupPlans \} = runtimeCreateRestoredSessionGroups\(\{/);
+  assert.match(runtimeJs, /await restoreChromeGroupsForSession\(chromeGroupPlans, windowId\);/);
+  assert.match(runtimeJs, /async function restoreChromeGroupsForSession\(plans, windowId\) \{/);
+  assert.match(runtimeJs, /const groupId = await chrome\.tabs\.group\(groupOptions\);/);
+  // Chrome creates the fresh group in the CALLER's window by default, which
+  // would drag tabs created in the restore target window across windows;
+  // createProperties.windowId pins the new group to the target window so a
+  // new-window restore keeps chrome-group tabs in place with the other tabs.
+  assert.match(runtimeJs, /const groupOptions = windowId != null\s*\? \{ tabIds: planTabIds, createProperties: \{ windowId: Number\(windowId\) \} \}\s*: \{ tabIds: planTabIds \};/);
+  assert.match(runtimeJs, /const groupId = await chrome\.tabs\.group\(groupOptions\);/);
+  assert.match(runtimeJs, /await chrome\.tabGroups\.update\(groupId, \{/);
+  assert.match(runtimeJs, /reorderGroupedTabs\(groupId, planTabIds\.map\(String\), windowId\)/);
 });
 
 test('saved tabs top nav supports icon and name display modes', () => {
   const css = fs.readFileSync(path.join(__dirname, 'style.css'), 'utf8');
 
+  // Nav chips keep their circular size and scroll instead of squeezing.
+  assert.match(css, /\.group-nav-button \{\s*width: 40px;[\s\S]*flex-shrink: 0;/);
   assert.match(sessionManagerJs, /const navDisplayMode = getSavedSessionNavDisplayModeValue\(\);/);
   assert.match(sessionManagerJs, /if \(navDisplayMode === 'name'\)/);
   assert.match(sessionManagerJs, /class="group-nav-button saved-session-nav-button is-name-mode"/);
@@ -1001,11 +1075,231 @@ test('saved tabs top nav supports icon and name display modes', () => {
   assert.match(css, /\.saved-session-nav-label\s*\{[\s\S]*white-space:\s*nowrap;[\s\S]*text-overflow:\s*ellipsis;/);
 });
 
-test('quick shortcuts always open a new active tab from the dashboard and popup', () => {
+test('quick shortcuts default to a new active tab and can opt into the current tab', () => {
   assert.match(runtimeJs, /async function openOrFocusUrl\(url\)\s*\{\s*if \(!url\) return false;\s*await chrome\.tabs\.create\(\{\s*url,\s*active:\s*true\s*\}\);\s*return true;\s*\}/);
   assert.match(popupJs, /async function openPopupUrl\(url\)\s*\{\s*if \(!url\) return;\s*await chrome\.tabs\.create\(\{\s*url,\s*active:\s*true\s*\}\);\s*window\.close\(\);\s*\}/);
   assert.doesNotMatch(popupJs, /async function findTabByUrl\(/);
   assert.match(runtimeJs, /const fallbackUrl = `https:\/\/www\.google\.com\/search\?q=\$\{encodeURIComponent\(text\)\}`;\s*await navigateCurrentTabToUrl\(fallbackUrl\);/);
+  // New-tab stays the default so existing behavior is preserved.
+  assert.match(themeJs, /quickShortcutOpenMode:\s*'new-tab'/);
+  assert.match(themeJs, /getQuickShortcutOpenMode\(\) === 'current-tab'/);
+  assert.match(themeJs, /typeof navigateCurrentTabToUrl === 'function'/);
+  assert.match(themeJs, /await navigateCurrentTabToUrl\(url\)\.catch\(\(\) => false\)/);
+  // Ctrl/Cmd+click opens in a background tab; Shift+click opens a new window.
+  assert.match(themeJs, /if \(e\.ctrlKey \|\| e\.metaKey\) \{\s*await chrome\.tabs\.create\(\{ url, active: false \}\);\s*return;\s*\}/);
+  assert.match(themeJs, /if \(e\.shiftKey\) \{\s*await chrome\.windows\.create\(\{ url, focused: true \}\);\s*return;\s*\}/);
+  assert.match(themeJs, /await openOrFocusUrl\(url\);\s*return;\s*}\s*if \(action === 'close-shortcut-editor'\)/);
+  // The Features panel exposes a switch for the mode and persists it.
+  assert.match(runtimeJs, /id="themeMenuFeaturesPanel"[\s\S]*toggle-quick-shortcut-open-mode/);
+  assert.match(runtimeJs, /type="button" data-action="toggle-quick-shortcut-open-mode"/);
+  assert.match(runtimeJs, /saveThemePreferences\(\{\s*quickShortcutOpenMode: nextMode\s*\}\)/);
+  assert.match(runtimeJs, /toggleSwitch\.classList\.toggle\('is-active', nextMode === 'current-tab'\)/);
+  assert.match(runtimeJs, /toggleSwitch\.setAttribute\('aria-pressed', String\(nextMode === 'current-tab'\)\)/);
+  assert.match(themeJs, /globalThis\.TabOutThemeControls = \{\s*SEARCH_ENGINE_PRESETS,\s*buildSearchUrlForQuery,\s*filterRealTabs,\s*getCustomSearchUrl,\s*getQuickShortcutCols,\s*getQuickShortcutOpenMode,/);
+  assert.match(i18nJs, /quickShortcutOpenModeLabel: 'Open quick links in current tab'/);
+  assert.match(i18nJs, /quickShortcutOpenModeLabel: '在当前标签页打开快捷链接'/);
+});
+
+test('quick links per row can be fixed to 4 or 5 columns in landscape only', () => {
+  const css = fs.readFileSync(path.join(__dirname, 'style.css'), 'utf8');
+  // Preference defaults to auto so existing auto-fill behavior is preserved.
+  assert.match(themeJs, /quickShortcutCols:\s*'auto'/);
+  assert.match(themeJs, /quickShortcutCols: VALID_QUICK_SHORTCUT_COLS\.has\(rawQuickShortcutCols\) \? rawQuickShortcutCols : 'auto'/);
+  // applyThemePreferences pins the grid class from the saved preference.
+  assert.match(themeJs, /quickTabsList\.classList\.toggle\('is-fixed-cols-4', themePreferences\.quickShortcutCols === '4'\)/);
+  assert.match(themeJs, /quickTabsList\.classList\.toggle\('is-fixed-cols-5', themePreferences\.quickShortcutCols === '5'\)/);
+  // Landscape (>=961px) applies fixed tracks; portrait keeps auto-fill.
+  assert.match(css, /@media \(min-width: 961px\)[\s\S]*\.quick-tabs-grid\.is-fixed-cols-4 \{\s*grid-template-columns: repeat\(4, 1fr\);[\s\S]*\.quick-tabs-grid\.is-fixed-cols-5 \{\s*grid-template-columns: repeat\(5, 1fr\);[\s\S]*\.quick-tabs-grid\.is-fixed-cols-4 \.quick-shortcut-card,[\s\S]*\.quick-tabs-grid\.is-fixed-cols-5 \.quick-shortcut-card \{\s*width: 100%;/);
+  // The fixed rules must NOT leak into the portrait (max-width: 960px) block —
+  // scan the whole block, not just its head.
+  const portraitStart = css.indexOf('@media (max-width: 960px)');
+  const portraitEnd = css.indexOf('@media (prefers-reduced-motion');
+  const portraitBlock = portraitStart >= 0 && portraitEnd > portraitStart
+    ? css.slice(portraitStart, portraitEnd)
+    : '';
+  assert.ok(portraitBlock.length > 100, 'portrait media block should be present for the leak check');
+  assert.doesNotMatch(portraitBlock, /is-fixed-cols/);
+  // The Appearance panel exposes an Auto / 4 / 5 choice row.
+  assert.match(runtimeJs, /data-action="select-quick-shortcut-cols"[\s\S]*data-cols="auto"[\s\S]*data-cols="4"[\s\S]*data-cols="5"/);
+  assert.match(runtimeJs, /const cols = \['auto', '4', '5'\]\.includes\(actionEl\.dataset\.cols\) \? actionEl\.dataset\.cols : 'auto';/);
+  assert.match(runtimeJs, /saveThemePreferences\(\{\s*quickShortcutCols: cols\s*\}\)/);
+  // renderThemeMenu does not refresh this row, so the handler patches it in place.
+  assert.match(runtimeJs, /document\.querySelectorAll\('\[data-action="select-quick-shortcut-cols"\]'\)\.forEach\(option => \{[\s\S]*option\.dataset\.cols === cols[\s\S]*option\.classList\.toggle\('is-active', isActive\)[\s\S]*option\.setAttribute\('aria-pressed', String\(isActive\)\)/);
+  assert.match(i18nJs, /quickShortcutColsLabel: 'Quick links per row'/);
+  assert.match(i18nJs, /quickShortcutColsAuto: 'Auto'/);
+  assert.match(i18nJs, /quickShortcutCols4: '4 columns'/);
+  assert.match(i18nJs, /quickShortcutCols5: '5 columns'/);
+  assert.match(i18nJs, /quickShortcutColsLabel: '快捷链接每行'/);
+  assert.match(i18nJs, /quickShortcutColsAuto: '自动'/);
+  assert.match(i18nJs, /quickShortcutCols4: '4 列'/);
+  assert.match(i18nJs, /quickShortcutCols5: '5 列'/);
+});
+
+test('search engine can be customized with presets or a custom URL', () => {
+  // Browser default stays the default so existing search behavior is preserved.
+  assert.match(themeJs, /searchEngine:\s*'default'/);
+  assert.match(themeJs, /customSearchUrl:\s*''/);
+  assert.match(themeJs, /searchEngine: VALID_SEARCH_ENGINES\.has\(rawSearchEngine\) \? rawSearchEngine : 'default',/);
+  // Presets use the correct per-engine query params (Baidu uses wd=, Sogou query=, Yandex text=).
+  assert.match(themeJs, /SEARCH_ENGINE_PRESETS = \{[\s\S]*google: \{ name: 'Google', url: 'https:\/\/www\.google\.com\/search\?q=' \},[\s\S]*baidu: \{ name: 'Baidu', url: 'https:\/\/www\.baidu\.com\/s\?wd=' \},[\s\S]*sogou: \{ name: 'Sogou', url: 'https:\/\/www\.sogou\.com\/web\?query=' \},[\s\S]*brave: \{ name: 'Brave Search', url: 'https:\/\/search\.brave\.com\/search\?q=' \},[\s\S]*yandex: \{ name: 'Yandex', url: 'https:\/\/yandex\.com\/search\/\?text=' \}/);
+  // The builder supports {query}, %s and append semantics.
+  assert.match(themeJs, /if \(url\.includes\('\{query\}'\)\) return url\.replace\(\/\\\{query\\\}\/g, encoded\);/);
+  assert.match(themeJs, /if \(url\.includes\('%s'\)\) return url\.replace\(\/%s\/g, encoded\);/);
+  assert.match(themeJs, /return `\$\{url\}\$\{encoded\}`;/);
+  // runDefaultSearch prefers the configured engine, then falls back to chrome.search.
+  assert.match(runtimeJs, /const searchUrl = runtimeBuildSearchUrlForQuery \? runtimeBuildSearchUrlForQuery\(text\) : '';/);
+  assert.match(runtimeJs, /if \(searchUrl\) \{\s*let validSearchUrl = false;[\s\S]*if \(validSearchUrl\) \{\s*const navigated = await navigateCurrentTabToUrl\(searchUrl\)\.catch\(\(\) => false\);\s*if \(navigated\) return;/);
+  // The Features panel exposes the engine choice row and the conditional custom URL row.
+  assert.match(runtimeJs, /data-action="select-search-engine"[\s\S]*data-engine="default"[\s\S]*data-engine="google"[\s\S]*data-engine="bing"[\s\S]*data-engine="baidu"[\s\S]*data-engine="sogou"[\s\S]*data-engine="duckduckgo"[\s\S]*data-engine="brave"[\s\S]*data-engine="yandex"[\s\S]*data-engine="custom"/);
+  assert.match(runtimeJs, /id="customSearchUrlSection"[\s\S]*data-action="change-custom-search-url"/);
+  assert.match(runtimeJs, /const engine = \['default', 'google', 'bing', 'baidu', 'sogou', 'duckduckgo', 'brave', 'yandex', 'custom'\]\.includes\(actionEl\.dataset\.engine\) \? actionEl\.dataset\.engine : 'default';/);
+  assert.match(runtimeJs, /saveThemePreferences\(\{\s*searchEngine: engine\s*\}\);\s*syncSearchPlaceholder\(\);/);
+  assert.match(runtimeJs, /querySelectorAll\('\[data-action="select-search-engine"\]'\)\.forEach\(option => \{[\s\S]*option\.dataset\.engine === engine[\s\S]*option\.classList\.toggle\('is-active', isActive\)[\s\S]*option\.setAttribute\('aria-pressed', String\(isActive\)\)/);
+  assert.match(runtimeJs, /themePreferences = normalizeThemePreferences\(\{\s*\.\.\.themePreferences,\s*customSearchUrl: customSearchUrlInput\.value,\s*\}\);\s*await chrome\.storage\.local\.set\(\{ \[THEME_PREFERENCES_KEY\]: themePreferences \}\);\s*syncSearchPlaceholder\(\);/);
+  assert.match(i18nJs, /searchEngineLabel: 'Search engine'/);
+  assert.match(i18nJs, /searchEngineDefault: 'Browser default'/);
+  assert.match(i18nJs, /searchEngineBaidu: 'Baidu'/);
+  assert.match(i18nJs, /searchEngineLabel: '搜索引擎'/);
+  assert.match(i18nJs, /searchEngineDefault: '浏览器默认'/);
+  assert.match(i18nJs, /searchEngineBaidu: 'Baidu'/);
+  assert.match(i18nJs, /customSearchUrlHint: 'Use \{query\} or %s as the placeholder'/);
+  assert.match(i18nJs, /customSearchUrlHint: '用 \{query\} 或 %s 作为占位符'/);
+  // The search box placeholder follows the selected engine.
+  assert.match(runtimeJs, /function syncSearchPlaceholder\(\) \{/);
+  assert.match(runtimeJs, /placeholder = runtimeT[\s\S]*\? runtimeT\('searchPlaceholderEngine', \{ engine: engineName \}\)[\s\S]*: `Search with \$\{engineName\}\.\.\.`;/);
+  // Empty custom URL falls back to the default placeholder so UI matches behavior.
+  assert.match(runtimeJs, /const customUrl = \(\(typeof themePreferences !== 'undefined' && themePreferences\.customSearchUrl\) \|\| ''\)\.trim\(\);/);
+  assert.match(runtimeJs, /placeholder = customUrl[\s\S]*\? \(runtimeT \? runtimeT\('searchPlaceholderCustom'\) : 'Search with a custom engine\.\.\.'\)[\s\S]*: \(runtimeT \? runtimeT\('searchPlaceholderDefault'\) : 'Search with your default engine\.\.\.'\);/);
+  assert.match(runtimeJs, /placeholder = runtimeT \? runtimeT\('searchPlaceholderDefault'\) : 'Search with your default engine\.\.\.';/);
+  assert.match(runtimeJs, /await loadThemePreferences\(\);\s*syncSearchPlaceholder\(\);/);
+  assert.match(runtimeJs, /saveThemePreferences\(\{\s*searchEngine: engine\s*\}\);\s*syncSearchPlaceholder\(\);/);
+  assert.match(runtimeJs, /customSection\.style\.display = engine === 'custom' \? '' : 'none';/);
+  assert.match(runtimeJs, /navHost\.addEventListener\('wheel', \(e\) => \{[\s\S]*e\.target\.closest\('\.group-nav-list'\)[\s\S]*if \(list\.scrollWidth <= list\.clientWidth\) return;[\s\S]*if \(Math\.abs\(e\.deltaY\) > Math\.abs\(e\.deltaX\)\) \{[\s\S]*e\.preventDefault\(\);[\s\S]*list\.scrollLeft \+= e\.deltaY;/);
+  assert.match(runtimeJs, /navHost\.dataset\.wheelHijackAttached = '1';/);
+  // Malformed custom URLs must not replace the workspace with an error page.
+  assert.match(runtimeJs, /validSearchUrl = \/\^https\?:\$\/\.test\(new URL\(searchUrl\)\.protocol\);/);
+  assert.match(runtimeJs, /showToast\(runtimeT \? runtimeT\('toastInvalidCustomSearchUrl'\) : 'Invalid custom search URL, using browser default'\);/);
+  // The custom URL input escapes its value and points at the hint.
+  assert.match(runtimeJs, /value="\$\{runtimeEscapeHtmlAttribute \? runtimeEscapeHtmlAttribute\(\(\(typeof themePreferences !== 'undefined' && themePreferences\.customSearchUrl\) \|\| ''\)\) : ''\}" placeholder="https:\/\/example\.com\/search\?q=\{query\}"[\s\S]*aria-describedby="customSearchUrlHint"/);
+  assert.match(runtimeJs, /theme-menu-hint" id="customSearchUrlHint">\$\{runtimeT \? runtimeT\('customSearchUrlHint'\) : 'Use \{query\} or %s as the placeholder'\}/);
+  assert.match(i18nJs, /searchPlaceholderEngine: 'Search with \{engine\}\.\.\.'/);
+  assert.match(i18nJs, /searchPlaceholderEngine: '用 \{engine\} 搜索\.\.\.'/);
+  assert.match(i18nJs, /searchPlaceholderCustom: '用自定义搜索引擎搜索\.\.\.'/);
+  assert.match(i18nJs, /toastInvalidCustomSearchUrl: 'Invalid custom search URL, using browser default'/);
+  assert.match(i18nJs, /toastInvalidCustomSearchUrl: '自定义搜索 URL 无效，已改用浏览器默认'/);
+  // Bing and DuckDuckGo preset URLs are pinned too.
+  assert.match(themeJs, /bing: \{ name: 'Bing', url: 'https:\/\/www\.bing\.com\/search\?q=' \},[\s\S]*duckduckgo: \{ name: 'DuckDuckGo', url: 'https:\/\/duckduckgo\.com\/\?q=' \},/);
+  assert.match(i18nJs, /searchEngineBrave: 'Brave'/);
+  assert.match(i18nJs, /searchEngineSogou: 'Sogou'/);
+  assert.match(i18nJs, /searchEngineYandex: 'Yandex'/);
+  assert.match(i18nJs, /searchEngineCustom: '自定义'/);
+  assert.match(i18nJs, /customSearchUrlLabel: '自定义搜索 URL'/);
+  assert.match(i18nJs, /searchPlaceholderDefault: '用默认搜索引擎搜索\.\.\.'/);
+});
+
+test('popup scrolls inside panels only, never the document', () => {
+  // The popup clamps its height and hides document overflow so the native
+  // window scrollbar never appears next to the panel scrollbars; the width
+  // is fixed so switching views never resizes the popup window.
+  assert.match(popupCss, /html, body \{\s*[\s\S]*width: 400px;[\s\S]*height: fit-content;[\s\S]*max-height: 520px;[\s\S]*overflow: hidden;/);
+  assert.match(popupCss, /\.popup-app \{\s*[\s\S]*height: fit-content;[\s\S]*max-height: 520px;/);
+  assert.match(popupCss, /\.popup-tabs-list \{[\s\S]*overflow-y: auto;/);
+  assert.match(popupCss, /\.popup-shortcuts-grid \{[\s\S]*overflow-y: auto;/);
+  // Panel scrollbars are hidden like the nav's, so transient overflow (e.g.
+  // during the entry animation) can never flash a visible scrollbar.
+  assert.match(popupCss, /\.popup-shortcuts-grid,\s*\.popup-tabs-list \{\s*scrollbar-width: none;/);
+  assert.match(popupCss, /\.popup-shortcuts-grid::-webkit-scrollbar,\s*\.popup-tabs-list::-webkit-scrollbar \{\s*display: none;/);
+  assert.doesNotMatch(popupCss, /\.popup-tabs-list \{[\s\S]*scrollbar-width: thin;/);
+  // The top group nav keeps horizontal scrolling but never shows a scrollbar.
+  assert.match(popupCss, /\.popup-group-nav-wrap \{\s*[\s\S]*flex-wrap: nowrap;[\s\S]*flex: 0 0 auto;[\s\S]*overflow-x: auto;[\s\S]*overflow-y: hidden;[\s\S]*scrollbar-width: none;/);
+  assert.match(popupCss, /\.popup-group-nav-wrap::-webkit-scrollbar \{\s*display: none;/);
+  // Nav chips keep their size and overflow horizontally instead of shrinking.
+  assert.match(popupCss, /\.group-nav-button \{\s*width: 40px;[\s\S]*flex: 0 0 40px;/);
+  // With the nav scrollbar hidden, the vertical wheel scrolls it horizontally —
+  // but only when the nav can actually overflow, so short navs pass wheels through.
+  assert.match(popupJs, /groupNavWrap\.addEventListener\('wheel', \(e\) => \{[\s\S]*if \(list\.scrollWidth <= list\.clientWidth\) return;[\s\S]*if \(Math\.abs\(e\.deltaY\) > Math\.abs\(e\.deltaX\)\) \{[\s\S]*e\.preventDefault\(\);[\s\S]*list\.scrollLeft \+= e\.deltaY;/);
+  // The dashboard "quick links per row" setting drives the popup grid too.
+  assert.match(popupJs, /const cols = popupTheme\.getQuickShortcutCols \? popupTheme\.getQuickShortcutCols\(\) : 'auto';/);
+  assert.match(popupJs, /listEl\.classList\.toggle\('is-fixed-cols-4', cols === '4'\);/);
+  assert.match(popupJs, /listEl\.classList\.toggle\('is-fixed-cols-5', cols === '5'\);/);
+  // Shortcut grids skip re-rendering when data and columns are unchanged.
+  assert.match(themeJs, /let lastQuickShortcutsRenderKey = '';/);
+  assert.match(themeJs, /if \(renderKey === lastQuickShortcutsRenderKey && list\.innerHTML\) return;/);
+  assert.match(popupJs, /let popupShortcutsRenderKey = '';/);
+  assert.match(popupJs, /if \(renderKey === popupShortcutsRenderKey\) return;/);
+  // The popup entry animation replays only on view switches, not refreshes.
+  assert.match(popupJs, /const viewChanged = lastSyncedPopupView !== popupState\.view;/);
+  assert.match(popupJs, /if \(viewChanged\) \{\s*\[shortcutsList, tabsList, navEl\]\.forEach\(el => \{\s*el\?\.classList\.remove\('is-ready', 'is-entering'\);/);
+  // The remembered view is shown before the async refresh resolves, so the
+  // popup never flashes the default shortcuts panel when opened on tabs.
+  assert.match(popupJs, /localStorage\.getItem\(POPUP_VIEW_KEY\) === 'tabs' \? 'tabs' : 'shortcuts'/);
+  assert.match(popupJs, /localStorage\.setItem\(POPUP_VIEW_KEY, popupState\.view\)/);
+  assert.match(popupJs, /\/\/ Apply the remembered view before the first paint[\s\S]*syncPopupView\(\);/);
+  assert.match(popupJs, /loadPopupView\(\)\s*\.then\(\(\) => \{\s*syncPopupView\(\);\s*return refreshPopupSafely\(\);/);
+  // The incoming panel hides only on an actual view switch (is-entering added
+  // by syncPopupView); renderers must never add it on background refreshes.
+  assert.match(popupJs, /if \(viewChanged\) \{[\s\S]*shortcutsList\?\.classList\.add\('is-entering'\)/);
+  assert.match(popupJs, /if \(viewChanged\) \{[\s\S]*tabsList\?\.classList\.add\('is-entering'\)/);
+  assert.doesNotMatch(popupJs, /listEl\.classList\.add\('is-entering'\)/);
+  // Entrance animations are bound to .is-entering.is-ready, so refresh
+  // content (is-entering cleared by same-view sync) never replays them.
+  assert.match(popupJs, /if \(!viewChanged\) \{\s*\[shortcutsList, tabsList, navEl\]\.forEach\(el => \{\s*el\?\.classList\.remove\('is-entering'\)/);
+  assert.doesNotMatch(popupJs, /classList\.remove\('is-entering'\);\s*listEl\.classList\.add\('is-ready'\)/);
+  assert.match(popupCss, /\.popup-tabs-list\.is-entering\.is-ready \.popup-tab-group \{/);
+  assert.match(popupCss, /\.popup-tabs-list\.is-entering\.is-ready \.popup-tab-row \{/);
+  assert.match(popupCss, /\.popup-group-nav-wrap\.is-entering\.is-ready \.group-nav-button \{/);
+  assert.match(popupCss, /\.popup-shortcuts-grid\.is-entering\.is-ready \.popup-shortcut-card \{/);
+  assert.doesNotMatch(popupCss, /\.popup-tabs-list\.is-ready \.popup-tab-group \{/);
+  // The popup window fits its content instead of inheriting min-height:100vh.
+  const htmlBodyStart = popupCss.indexOf('html, body {');
+  const htmlBodyEnd = popupCss.indexOf('\n}', htmlBodyStart);
+  const htmlBodyBlock = htmlBodyStart >= 0 && htmlBodyEnd > htmlBodyStart
+    ? popupCss.slice(htmlBodyStart, htmlBodyEnd)
+    : '';
+  assert.ok(htmlBodyBlock.length > 50, 'html,body rule block should be present');
+  assert.match(htmlBodyBlock, /min-height: 0;/);
+  // Suspended tabs unwrap to their original URL like the dashboard — but only
+  // when the original URL exists (uri-less suspended pages fall through to
+  // the normal internal-page filter).
+  assert.match(popupJs, /suspended\.isSuspended && suspended\.originalUrl\) return true/);
+  assert.match(popupHtml, /<script src="\.\.\/tab-url-utils\.js"><\/script>/);
+  // Session groups sort by createdAt like the dashboard.
+  assert.match(popupJs, /\.sort\(\(a, b\) => new Date\(a\.createdAt\) - new Date\(b\.createdAt\)\)/);
+  // The close path refreshes through the safe pipeline; double-click close
+  // cannot penetrate into the row's open handler.
+  assert.match(popupJs, /await refreshPopupSafely\(\);/);
+  assert.match(popupJs, /popup-tab-close-btn\.is-loading'\)\) return;/);
+  // Deduplicating tabs re-renders the open-tabs area immediately instead of
+  // leaving stale duplicate chips until the next event-driven refresh.
+  // Chrome-group cards dedup within their own tab set (C12); regular cards
+  // keep the URL-wide path. Each branch gets its own assertion — a single
+  // alternation would also match a version that dropped the C12 scoping.
+  assert.match(runtimeJs, /if \(action === 'dedup-keep-one'\) \{[\s\S]*await closeDuplicatesInSelection\(chromeTabIds, \{ playSound: false \}\)[\s\S]*playCloseSound\(\);[\s\S]*await renderDashboard\(\);/);
+  assert.match(runtimeJs, /if \(action === 'dedup-keep-one'\) \{[\s\S]*await closeDuplicatesByUrls\(urls, \{ keepOne: true, playSound: false \}\)[\s\S]*playCloseSound\(\);[\s\S]*await renderDashboard\(\);/);
+  // Cards can merge all their tabs into one native Chrome tab group; the
+  // section header reuses the action with scope="all" to group every card.
+  assert.match(runtimeJs, /data-action="group-card-tabs" data-domain-id="\$\{stableId\}"/);
+  assert.match(runtimeJs, /if \(action === 'group-card-tabs'\) \{[\s\S]*const scope = actionEl\.dataset\.scope \|\| '';[\s\S]*const label = scope === 'all'[\s\S]*getGroupDisplayLabel\(group\);[\s\S]*await mergeTabsIntoChromeGroup\(tabIds, \{ title: label, color \}\)/);
+  assert.match(i18nJs, /groupCardTabsLabel: 'Merge into Chrome group'/);
+  assert.match(i18nJs, /groupCardTabsLabel: '合并为 Chrome 标签组'/);
+  assert.match(i18nJs, /toastGroupCreated: 'Created Chrome tab group'/);
+  assert.match(i18nJs, /toastGroupCreated: '已创建 Chrome 标签组'/);
+  // Renamed group labels reach the popup; grouping uses the primary domain.
+  assert.match(popupJs, /GROUP_LABEL_OVERRIDES_KEY/);
+  assert.match(popupJs, /popupState\.groupLabelOverrides\[group\.domain\]/);
+  assert.match(popupJs, /popupIcons\.getPrimaryDomain \? popupIcons\.getPrimaryDomain\(hostname\) : hostname/);
+  assert.match(popupJs, /const mergedGroups = \[\.\.\.sessionGroupsList, \.\.\.sortedAutomatic\];/);
+  assert.match(popupJs, /ungroupedTabs\.length > 0/);
+  // A failed refresh keeps the previous snapshot instead of rejecting.
+  assert.match(popupJs, /console\.warn\('\[tab-harbor popup\] refresh failed:'/);
+  // Duplicate URLs stay visible (aligned with the dashboard) and Gmail's bare
+  // inbox is a content tab, not a landing page.
+  assert.doesNotMatch(popupJs, /seenUrls/);
+  assert.match(popupJs, /!h\.includes\('#inbox'\)/);
+  assert.match(runtimeJs, /!h\.includes\('#inbox'\)/);
+  assert.match(popupCss, /\.popup-shortcuts-grid\.is-fixed-cols-4 \{\s*display: grid;[\s\S]*grid-template-columns: repeat\(4, 1fr\);/);
+  assert.match(popupCss, /\.popup-shortcuts-grid\.is-fixed-cols-5 \{\s*display: grid;[\s\S]*grid-template-columns: repeat\(5, 1fr\);/);
+  assert.match(popupCss, /\.popup-shortcuts-grid\.is-fixed-cols-4 \.popup-shortcut-card,[\s\S]*\.popup-shortcuts-grid\.is-fixed-cols-5 \.popup-shortcut-card \{\s*width: 100%;/);
 });
 
 test('keyboard focus receives explicit visible treatment', () => {
@@ -1115,7 +1409,22 @@ test('discard tab supports per-chip, group-level, and global sleep-all with gate
   assert.match(runtimeJs, /data-action="sleep-all-open-tabs"/);
   assert.match(runtimeJs, /page-chip--discarded/);
   assert.match(runtimeJs, /if \(action === 'discard-tab'\)\s*\{[\s\S]*await fetchOpenTabs\(\);[\s\S]*await renderDashboard\(\);/);
+  // Group/global sleep skip already-discarded tabs, so "nothing left to
+  // sleep" is a silent no-op instead of a misleading failure toast.
+  assert.match(runtimeJs, /getOrderedUniqueTabsForGroup\(group\)\.filter\(t => !t\.active && !t\.discarded\)/);
+  assert.match(runtimeJs, /getRealTabs\(\)\.filter\(t => !t\.active && !t\.discarded\)/);
   assert.match(runtimeJs, /if \(action === 'sleep-domain-tabs'\)\s*\{[\s\S]*await fetchOpenTabs\(\);[\s\S]*await renderDashboard\(\);/);
+  // The section-header sleep-all uses its own "all tabs" label; the per-group
+  // card keeps the "in group" label.
+  assert.match(runtimeJs, /data-action="sleep-all-open-tabs" aria-label="\$\{runtimeT \? runtimeT\('sleepAllOpenTabsButton'\) : 'Sleep all tabs'\}"/);
+  assert.match(runtimeJs, /data-action="sleep-domain-tabs"[\s\S]{0,120}aria-label="\$\{runtimeT \? runtimeT\('sleepAllTabsButton'\) : 'Sleep all tabs in group'\}"/);
+  const i18nJs = fs.readFileSync(path.join(__dirname, 'i18n.js'), 'utf8');
+  assert.match(i18nJs, /sleepAllOpenTabsButton: 'Sleep all tabs'/);
+  assert.match(i18nJs, /sleepAllOpenTabsButton: '休眠全部标签页'/);
+  // Both keys must stay distinct with their own wording — collapsing them to
+  // a shared string would silently rename one of the two buttons.
+  assert.match(i18nJs, /sleepAllTabsButton: 'Sleep all tabs in group'/);
+  assert.match(i18nJs, /sleepAllTabsButton: '休眠组内全部标签页'/);
 
   const css = fs.readFileSync(path.join(__dirname, 'style.css'), 'utf8');
   assert.match(css, /\.chip-discard:hover\s*\{[\s\S]*color:\s*var\(--muted\);/);

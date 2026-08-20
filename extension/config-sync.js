@@ -26,6 +26,7 @@
     'chromeTabGroupsMeta',
     'importedChromeSessionGroups',
     'deferredTriggerPosition',
+    'popupView',
   ];
 
   const STORAGE_DEFAULTS = {
@@ -44,6 +45,7 @@
     chromeTabGroupsMeta: null,
     importedChromeSessionGroups: { entries: [] },
     deferredTriggerPosition: { top: null },
+    popupView: 'shortcuts',
   };
 
   function isValidConfigObject(value) {
@@ -57,7 +59,12 @@
       exportedAt: new Date().toISOString(),
     };
     for (const key of STORAGE_KEYS) {
-      config[key] = key in data ? data[key] : null;
+      // chrome.storage.local.get(keys[]) resolves every requested key — unset
+      // keys come back as undefined, not absent. Serialize those as explicit
+      // null so importConfig can reset them to defaults on the target device
+      // (a missing key would be skipped by the importer instead).
+      const value = data[key];
+      config[key] = value === undefined ? null : value;
     }
     return JSON.stringify(config, null, 2);
   }
@@ -75,6 +82,7 @@
       return Array.isArray(value);
     }
     if (key === 'languagePreference') return typeof value === 'string';
+    if (key === 'popupView') return typeof value === 'string';
     if (key === 'chromeTabGroupsEnabled') return typeof value === 'boolean';
     return isValidConfigObject(value);
   }
