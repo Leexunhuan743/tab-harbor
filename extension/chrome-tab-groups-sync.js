@@ -237,6 +237,21 @@
             console.warn(`[tab-harbor] ambiguous chromeTabGroupsMeta for ${groupKey}; skipping auto-bind`);
             continue;
           }
+          if (matches.length === 0 && windowIdKey !== 'any') {
+            // Restart recovery: Chrome renumbers window ids every browser
+            // session, so a per-window record can point at a window id that
+            // no longer exists even though the mirror itself survived in its
+            // reopened window. Re-bind by title+color across all windows, but
+            // only when EXACTLY ONE candidate carries the fingerprint — with
+            // several, binding would be a guess that can hijack a user-created
+            // group (C4), so leave the mirror unbound instead.
+            const candidates = currentGroups.filter(g => g.title === info.title && g.color === info.color);
+            if (candidates.length === 1) {
+              if (!reconciled[groupKey]) reconciled[groupKey] = {};
+              reconciled[groupKey][candidates[0].windowId] = candidates[0].id;
+            }
+            continue;
+          }
           const match = matches[0];
           if (match) {
             if (!reconciled[groupKey]) reconciled[groupKey] = {};
@@ -525,6 +540,16 @@
         if (chromeGroupId != null && !validGroupIds.has(chromeGroupId)) {
           chromeGroupId = null;
         }
+        // A mapping can also point at a LIVE group in a DIFFERENT window than
+        // the tabs being synced (stale snapshot, or window-id reuse after a
+        // browser restart). Reusing it would drag these tabs across windows,
+        // so drop the stale mapping and recreate the mirror locally instead.
+        if (chromeGroupId != null) {
+          const mappedGroup = currentGroups.find(g => Number(g.id) === Number(chromeGroupId));
+          if (mappedGroup && Number(mappedGroup.windowId) !== Number(windowId)) {
+            chromeGroupId = null;
+          }
+        }
 
         if (chromeGroupId == null) {
           // In import mode, only reuse existing groups — don't create new ones
@@ -540,15 +565,18 @@
             creationColor = pickUncollidingGroupColor(title, groupColor, windowId, currentGroups);
           }
 
-          // Create new group
+          // Create new group pinned to the synced window: without
+          // createProperties.windowId Chrome creates the group in the
+          // CALLER's current window and drags these tabs across windows (the
+          // same contract bug fixed for session restore in be61745).
           try {
-            chromeGroupId = await chrome.tabs.group({ tabIds });
+            chromeGroupId = await chrome.tabs.group({ tabIds, createProperties: { windowId } });
           } catch {
             // Some tabs may have valid IDs but fail grouping; try one by one
             for (const tabId of tabIds) {
               try {
                 if (chromeGroupId == null) {
-                  chromeGroupId = await chrome.tabs.group({ tabIds: tabId });
+                  chromeGroupId = await chrome.tabs.group({ tabIds: tabId, createProperties: { windowId } });
                 } else {
                   await chrome.tabs.group({ groupId: chromeGroupId, tabIds: tabId });
                 }

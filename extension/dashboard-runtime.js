@@ -2043,7 +2043,7 @@ async function openSavedTabsInCurrentWindow(tabs = []) {
     });
   const targetWindowId = firstCreatedTab?.windowId ?? currentWindowId ?? null;
   const restoredTabs = firstCreatedTab?.id != null
-    ? [{ id: firstCreatedTab.id, url: firstTab.url }]
+    ? [{ id: firstCreatedTab.id, url: firstTab.url, groupKey: firstTab.groupKey }]
     : [];
 
   for (const tab of restTabs) {
@@ -2064,6 +2064,7 @@ async function openSavedTabsInCurrentWindow(tabs = []) {
     restoredTabs.push({
       id: createdTab.id,
       url: tab.url,
+      groupKey: tab.groupKey,
     });
   }
 
@@ -2084,6 +2085,7 @@ async function openSavedTabsInNewWindow(tabs = []) {
     restoredTabs.push({
       id: firstCreatedTab.id,
       url: firstTab.url,
+      groupKey: firstTab.groupKey,
     });
   } else if (createdWindow?.id != null) {
     const createdWindowTabs = await chrome.tabs.query({ windowId: createdWindow.id });
@@ -2092,6 +2094,7 @@ async function openSavedTabsInNewWindow(tabs = []) {
       restoredTabs.push({
         id: queriedFirstTab.id,
         url: firstTab.url,
+        groupKey: firstTab.groupKey,
       });
     }
   }
@@ -2114,6 +2117,7 @@ async function openSavedTabsInNewWindow(tabs = []) {
     restoredTabs.push({
       id: createdTab.id,
       url: tab.url,
+      groupKey: tab.groupKey,
     });
   }
 

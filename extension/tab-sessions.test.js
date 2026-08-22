@@ -153,8 +153,8 @@ test('createRestoredSessionGroups returns chrome group plans with ordered tab id
       ],
     },
     restoredTabs: [
-      { id: 201, url: 'https://a.test/1' },
-      { id: 202, url: 'https://b.test/1' },
+      { id: 201, url: 'https://a.test/1', groupKey: '__chrome_group__:77' },
+      { id: 202, url: 'https://b.test/1', groupKey: '__chrome_group__:77' },
     ],
     now: '2026-05-22T08:00:00.000Z',
   });
@@ -174,7 +174,7 @@ test('createRestoredSessionGroups chrome plan skips tabs that were not restored'
       ],
     },
     restoredTabs: [
-      { id: 301, url: 'https://a.test/1' },
+      { id: 301, url: 'https://a.test/1', groupKey: '__chrome_group__:77' },
       // https://b.test/1 and https://c.test/1 were not restored
     ],
     now: '2026-05-22T08:00:00.000Z',
@@ -194,14 +194,79 @@ test('createRestoredSessionGroups chrome plan includes every restored tab sharin
       ],
     },
     restoredTabs: [
-      { id: 401, url: 'https://a.test/1' },
-      { id: 402, url: 'https://a.test/1' },
+      { id: 401, url: 'https://a.test/1', groupKey: '__chrome_group__:77' },
+      { id: 402, url: 'https://a.test/1', groupKey: '__chrome_group__:77' },
     ],
     now: '2026-05-22T08:00:00.000Z',
   });
 
   assert.deepEqual(restored.chromeGroupPlans, [
     { title: 'Work', color: 'blue', tabIds: ['401', '402'] },
+  ]);
+});
+
+test('createRestoredSessionGroups keeps grouped vs ungrouped duplicates apart (F2)', () => {
+  const restored = createRestoredSessionGroups({
+    existingState: { groups: [], assignments: {} },
+    session: {
+      groups: [
+        { key: '__chrome_group__:docs', label: 'Docs', manualGroupId: '', chromeGroupColor: 'blue', tabUrls: ['https://a.test/1'] },
+      ],
+    },
+    restoredTabs: [
+      { id: 601, url: 'https://a.test/1', groupKey: '__chrome_group__:docs' },
+      { id: 602, url: 'https://a.test/1' }, // saved UNGROUPED occurrence of the same url
+    ],
+    now: '2026-05-22T08:00:00.000Z',
+  });
+
+  assert.deepEqual(restored.chromeGroupPlans, [
+    { title: 'Docs', color: 'blue', tabIds: ['601'] },
+  ]);
+});
+
+test('createRestoredSessionGroups restores two groups sharing a url to their own members (F2)', () => {
+  const restored = createRestoredSessionGroups({
+    existingState: { groups: [], assignments: {} },
+    session: {
+      groups: [
+        { key: '__chrome_group__:docs', label: 'Docs', manualGroupId: '', chromeGroupColor: 'blue', tabUrls: ['https://a.test/1'] },
+        { key: '__chrome_group__:refs', label: 'Refs', manualGroupId: '', chromeGroupColor: 'red', tabUrls: ['https://a.test/1'] },
+      ],
+    },
+    restoredTabs: [
+      { id: 701, url: 'https://a.test/1', groupKey: '__chrome_group__:refs' },
+      { id: 702, url: 'https://a.test/1', groupKey: '__chrome_group__:docs' },
+    ],
+    now: '2026-05-22T08:00:00.000Z',
+  });
+
+  // Each plan claims exactly its own occurrences regardless of restore order
+  // or which group the url-bucket would have fed first.
+  assert.deepEqual(restored.chromeGroupPlans, [
+    { title: 'Docs', color: 'blue', tabIds: ['702'] },
+    { title: 'Refs', color: 'red', tabIds: ['701'] },
+  ]);
+});
+
+test('createRestoredSessionGroups keeps recorded url order inside each chrome group (F2)', () => {
+  const restored = createRestoredSessionGroups({
+    existingState: { groups: [], assignments: {} },
+    session: {
+      groups: [
+        { key: '__chrome_group__:77', label: 'Work', manualGroupId: '', chromeGroupColor: 'blue', tabUrls: ['https://x.test', 'https://y.test'] },
+      ],
+    },
+    // Restored in a different order than saved; plan order must follow tabUrls.
+    restoredTabs: [
+      { id: 801, url: 'https://y.test', groupKey: '__chrome_group__:77' },
+      { id: 802, url: 'https://x.test', groupKey: '__chrome_group__:77' },
+    ],
+    now: '2026-05-22T08:00:00.000Z',
+  });
+
+  assert.deepEqual(restored.chromeGroupPlans, [
+    { title: 'Work', color: 'blue', tabIds: ['802', '801'] },
   ]);
 });
 

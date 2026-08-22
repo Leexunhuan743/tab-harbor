@@ -251,3 +251,30 @@ test('closeDuplicateNewTabs exempts freshly-created tabs within the grace period
   // one, so nothing is closed.
   assert.deepEqual(removedTabIds, []);
 });
+
+test('duplicate blank tab created beside another blank tab is deduped once the grace expires (F3)', async () => {
+  storageData = { themePreferences: { closeDuplicateNewTabsEnabled: true } };
+  removedTabIds = [];
+  globalThis.chrome.tabs.query = async () => [
+    // Pre-existing genuine blank tab plus a freshly created duplicate; id 4
+    // is a restore-created discarded tab that must stay protected even after
+    // the grace expires.
+    { id: 1, url: 'chrome://newtab/', active: false },
+    { id: 2, url: 'chrome://newtab/', active: true },
+    { id: 4, url: '', discarded: true, active: false },
+  ];
+  // The onCreated listener arms the grace and fires its OWN un-awaited
+  // cleanup pass. Drain it with a macrotask boundary before asserting, so no
+  // in-flight pass can straddle the later reconciliation.
+  globalThis.__tabHarborOnCreated({ id: 2, url: 'chrome://newtab/' });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  await closeDuplicateNewTabs();
+  // Tab 2 is shielded by the grace, so nothing can be closed yet.
+  assert.deepEqual(removedTabIds, []);
+  // Settle the armed post-grace reconciliation (test seam): registry is
+  // cleared to simulate the grace having elapsed, then cleanup re-runs.
+  await globalThis.TabHarborBackground.runPostGraceReconcileForTest();
+  // The grace has expired: only the non-active genuine blank (id 1) closes;
+  // the active duplicate (id 2) and the discarded restore tab (id 4) remain.
+  assert.deepEqual(removedTabIds, [1]);
+});

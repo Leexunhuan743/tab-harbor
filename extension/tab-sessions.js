@@ -339,7 +339,10 @@
       const canonicalUrl = sessionsGetCanonicalTabUrl ? sessionsGetCanonicalTabUrl(tab?.url || '') : normalizeString(tab?.url);
       if (!canonicalUrl || tab?.id == null) continue;
       if (!restoredByUrl.has(canonicalUrl)) restoredByUrl.set(canonicalUrl, []);
-      restoredByUrl.get(canonicalUrl).push(String(tab.id));
+      // Keep each restored occurrence's SAVED group identity: duplicate urls
+      // may belong to different groups (or to none), and restore must not
+      // conflate them by url alone (F2).
+      restoredByUrl.get(canonicalUrl).push({ id: String(tab.id), groupKey: normalizeString(tab?.groupKey) });
     }
 
     // Native Chrome groups cannot be re-created here (no chrome.* access in
@@ -359,21 +362,33 @@
         });
 
         for (const url of Array.isArray(group.tabUrls) ? group.tabUrls : []) {
-          const tabIds = restoredByUrl.get(url) || [];
-          const tabId = tabIds.shift();
-          if (tabId) normalizedState.assignments[tabId] = groupId;
+          const entry = restoredByUrl.get(url)?.shift();
+          if (entry) normalizedState.assignments[entry.id] = groupId;
         }
       } else if (groupKey.startsWith(CHROME_GROUP_PREFIX)) {
         // Restore as a fresh native Chrome group: title + color + the tab
         // order recorded in tabUrls (the native group id is session-local and
-        // cannot be reused). Every restored tab matching a recorded url joins —
-        // a url appears once in tabUrls but may map to several restored tabs.
+        // cannot be reused). Membership follows each restored tab's OWN saved
+        // group identity, not url buckets: duplicate urls saved in different
+        // groups (or grouped vs ungrouped) must return to their own groups (F2).
         const planTabIds = [];
         for (const url of Array.isArray(group.tabUrls) ? group.tabUrls : []) {
-          const tabIds = restoredByUrl.get(url) || [];
-          if (tabIds.length) {
-            planTabIds.push(...tabIds);
-            restoredByUrl.set(url, []);
+          const entries = restoredByUrl.get(url) || [];
+          // Occurrence-level filtering (F2): adopt only entries whose saved
+          // groupKey matches this plan; duplicates saved in other groups or
+          // ungrouped stay in the pool for their own plans.
+          const mine = entries.filter(entry => entry.groupKey === groupKey);
+          if (mine.length) {
+            planTabIds.push(...mine.map(entry => entry.id));
+            restoredByUrl.set(url, entries.filter(entry => entry.groupKey !== groupKey));
+          } else if (entries.length) {
+            // Bucket has restored entries but none matched this plan — a sign
+            // that a caller wired groupKey inconsistently or the saved data
+            // is corrupt. Surface it so the mismatch is caught early.
+            console.warn(
+              `[tab-harbor] chrome-group restore plan ${groupKey} has no matching tab for url ${url} ` +
+              `(${entries.length} orphaned entries)`
+            );
           }
         }
         if (planTabIds.length > 0) {

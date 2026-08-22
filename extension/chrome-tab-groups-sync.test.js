@@ -733,7 +733,7 @@ test('syncChromeTabGroups reuses chromeGroupMap populated by populateChromeGroup
     return 500;
   };
   globalThis.chrome.tabGroups.update = async () => {};
-  globalThis.chrome.tabGroups.query = async () => [{ id: 500, title: 'GitHub', color: 'grey' }];
+  globalThis.chrome.tabGroups.query = async () => [{ id: 500, title: 'GitHub', color: 'grey', windowId: 1 }];
   globalThis.chrome.tabs.query = async (opts) => [];
 
   await saveChromeTabGroupsSetting(true);
@@ -1114,4 +1114,122 @@ test('collapseChromeTabGroupsInWindow collapses only dashboard-managed groups in
   assert.deepEqual(updateCalls, [
     { id: 101, collapsed: true },
   ]);
+});
+
+// ─── F4: mirror creation must be pinned to the synced window ────────────────
+
+test('syncChromeTabGroups pins new mirror groups to their desired window (F4)', async () => {
+  resetChromeGroupState();
+  await saveChromeTabGroupsSetting(true);
+
+  const groupCalls = [];
+  globalThis.chrome.tabs.group = async (opts) => {
+    groupCalls.push(opts);
+    return 800 + groupCalls.length;
+  };
+  globalThis.chrome.tabGroups.update = async () => {};
+  globalThis.chrome.tabs.query = async () => [];
+  stubTabGroupsQuery([]);
+  globalThis.chrome.tabs.move = async () => {};
+
+  await syncChromeTabGroups([
+    { domain: 'docs.example.com', tabs: [{ id: 11, windowId: 2 }, { id: 12, windowId: 2 }] },
+  ]);
+
+  assert.equal(groupCalls.length, 1);
+  // Without createProperties.windowId Chrome creates the group in the
+  // CALLER's window and drags these window-2 tabs across windows.
+  assert.deepEqual(groupCalls[0], { tabIds: [11, 12], createProperties: { windowId: 2 } });
+});
+
+test('syncChromeTabGroups pins one-by-one fallback creations to the desired window too (F4)', async () => {
+  resetChromeGroupState();
+  await saveChromeTabGroupsSetting(true);
+
+  const groupCalls = [];
+  globalThis.chrome.tabs.group = async (opts) => {
+    groupCalls.push(opts);
+    if (Array.isArray(opts.tabIds) && opts.createProperties) throw new Error('bulk grouping failed');
+    return 810 + groupCalls.length;
+  };
+  globalThis.chrome.tabGroups.update = async () => {};
+  globalThis.chrome.tabs.query = async () => [];
+  stubTabGroupsQuery([]);
+  globalThis.chrome.tabs.move = async () => {};
+
+  await syncChromeTabGroups([
+    { domain: 'docs.example.com', tabs: [{ id: 21, windowId: 3 }, { id: 22, windowId: 3 }] },
+  ]);
+
+  // First call is the rejected bulk attempt; the fallback must carry the same
+  // window pin on its first single-tab creation.
+  assert.deepEqual(groupCalls[0], { tabIds: [21, 22], createProperties: { windowId: 3 } });
+  assert.equal(groupCalls[1].tabIds, 21);
+  assert.deepEqual(groupCalls[1].createProperties, { windowId: 3 });
+});
+
+test('syncChromeTabGroups drops a mapping that points into another window and recreates locally (F4)', async () => {
+  resetChromeGroupState();
+  await saveChromeTabGroupsSetting(true);
+  // get must return null so persistChromeGroupMap writes nothing to storage
+  // and loadPersistedChromeGroupMap exits early — otherwise the empty-meta
+  // reconcile path wipes the in-memory mapping before processing begins.
+  globalThis.chrome.tabGroups.get = async () => null;
+  populateChromeGroupMap([{ virtualGroupKey: 'github.com', windowId: 1, chromeGroupId: 501 }]);
+
+  const groupCalls = [];
+  globalThis.chrome.tabs.group = async (opts) => {
+    groupCalls.push(opts);
+    return 502;
+  };
+  globalThis.chrome.tabGroups.update = async () => {};
+  globalThis.chrome.tabs.query = async () => [];
+  globalThis.chrome.tabs.move = async () => {};
+  // Group 501 is alive but lives in window 2 while the synced tabs are in
+  // window 1 — reusing it would drag the tabs across windows.
+  stubTabGroupsQuery([{ id: 501, title: 'GitHub', color: 'grey', windowId: 2 }]);
+
+  await syncChromeTabGroups([
+    { domain: 'github.com', tabs: [{ id: 31, windowId: 1 }] },
+  ]);
+
+  assert.ok(!groupCalls.some(c => c.groupId === 501), 'must not reuse a foreign-window group');
+  const creation = groupCalls.find(c => c.createProperties);
+  assert.ok(creation, 'mirror must be recreated locally');
+  assert.deepEqual(creation.createProperties, { windowId: 1 });
+});
+
+// ─── F1: restart-tolerant mirror rebinding ──────────────────────────────────
+
+test('loadPersistedChromeGroupMap rebinds a surviving mirror after a restart changed the window id (F1)', async () => {
+  resetChromeGroupState();
+  await saveChromeTabGroupsSetting(true);
+  // Session A: the mirror lived in window 42. Session B renumbered windows
+  // and the surviving mirror now lives in window 7.
+  mockStorage.chromeTabGroupsMeta = { 'github.com': { '42': { title: 'GitHub', color: 'grey' } } };
+  stubTabGroupsQuery([
+    { id: 900, title: 'GitHub', color: 'grey', windowId: 7 },
+  ]);
+
+  await loadPersistedChromeGroupMap();
+
+  assert.deepEqual([...getManagedChromeGroupIds()].sort(), [900]);
+  // The rebinding must be usable by sync: mapping keyed under the live window.
+  assert.equal(getChromeGroupCount(), 1);
+});
+
+test('loadPersistedChromeGroupMap will not hijack when several groups share the fingerprint after a restart (F1)', async () => {
+  resetChromeGroupState();
+  await saveChromeTabGroupsSetting(true);
+  mockStorage.chromeTabGroupsMeta = { 'github.com': { '42': { title: 'GitHub', color: 'grey' } } };
+  stubTabGroupsQuery([
+    { id: 901, title: 'GitHub', color: 'grey', windowId: 7 },
+    { id: 902, title: 'GitHub', color: 'grey', windowId: 9 }, // at least one is the user's own group
+  ]);
+
+  await loadPersistedChromeGroupMap();
+
+  // Ambiguous fingerprint: leave it unbound rather than guess and adopt a
+  // user-created group (C4 discipline extended to restart recovery).
+  assert.equal(getChromeGroupCount(), 0);
 });
