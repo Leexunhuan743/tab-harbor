@@ -25,6 +25,8 @@
 | `audit-hardening.md` | 审计加固模式与已知边界：错误透出、配置导出、上下文失效恢复、已知 P2 缺陷 | 改可靠性/边界时 |
 | `pr42-change-map.md` | PR #42 的 29 个提交按 6 大主题归类的地图 | 理解"为什么有这些代码"时 |
 
+> 搜索建议（打开标签/快捷链接/会话/历史）与搜索框自动聚焦：纯逻辑见 `extension/search-suggestions.js`（模块地图有行），运行时接线在 `dashboard-runtime.js`（`setupSearchSuggestions` 等），Feature 决策见 `docs/decisions/search-focus-suggestions.md`。注意：Enter 提交搜索会跳过 IME 组合中的 Enter（`compositionstart`/`end` + `e.isComposing` 双守卫）；搜索在 keydown 直接发起（`searchSubmitInFlight` 防重入）。
+
 ## 项目一句话定位
 
 Tab Harbor 是一个**安静的浏览器工作台**（Chrome 新标签页扩展）：把打开中的标签、快捷链接、待读、轻量待办收进同一个本地优先的空间。设计气质：calm / literary / composed，拒绝 SaaS 后台感与装饰性噪音。

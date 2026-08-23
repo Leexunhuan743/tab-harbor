@@ -6,6 +6,16 @@ const path = require('node:path');
 
 const BACKGROUND_PATH = path.join(__dirname, 'background.js');
 
+// background.js schedules a 5s post-grace timer for every created tab; real
+// setTimeout would keep the test process alive. Stub it out (record, never
+// fire) so these broadcast tests run fast.
+const pendingTimers = new Map();
+let nextTimerId = 1;
+const realSetTimeout = global.setTimeout;
+const realClearTimeout = global.clearTimeout;
+global.setTimeout = (fn, delay) => { const id = nextTimerId++; pendingTimers.set(id, fn); return id; };
+global.clearTimeout = (id) => { pendingTimers.delete(id); };
+
 // background.js registers listeners at top level and caches its module, so we
 // flush the cache and re-evaluate it for each scenario.
 function loadBackground(chrome) {

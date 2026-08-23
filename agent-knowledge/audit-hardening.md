@@ -33,13 +33,16 @@
 
 ## 已知 P2 边界缺陷（暂不修，改动相关代码时注意）
 
-1. **grace 期空白去重缺口**（background.js）：`closeDuplicateNewTabs` 只在 `tabs.onCreated` 触发，5 秒 grace 内新标签豁免、**到期不补查**。快速连开空白页时"开第二个清第一个"失效。主流场景（Tab Harbor 扩展页）由页面内 `closeTabOutDupes` 兜底，日常不受影响。修复方案：grace 到期 `setTimeout` 补一次检查 + `onRemoved` 清理 `createdRecentlyAt`。
-2. **`createdRecentlyAt` Map 轻微泄漏**：`isNewTabBlank` 的 `discarded` 早退分支不删条目，`onRemoved` 不清理。长期运行累积有限条目。修复方案同上。
-3. **`chromeGroupColor` 注入面**（buildPageChipHtml）：`#` 开头的颜色值未经格式校验直接进 `style="--chrome-group-color:..."`，来源含配置导入路径。建议 `^#[0-9a-fA-F]{6}$` 正则校验（`sanitizeChromeGroupColor`）。
-4. **恢复轮询风暴**：`discardRestoredTabAfterCommit` 每标签 100ms 轮询 × N 标签 × 最长 15s，大会话（50+ 标签）时大量 `tabs.get`。优化方向：单个 `tabs.onUpdated` 集中消费 + 15s 兜底。
-5. **`__suppressAutoRefreshUntil` 魔法字符串**：散落多处、语义弱。长期应收敛为带深度的作用域工具（`withSuppressedRefresh`）。
-6. **`createProperties.windowId` 需 Chrome 111+**：低版本 `tabs.group` 忽略该参数，恢复的组可能落回调用者窗口。低优先级。
-7. **AGENTS.md 的 lat.md 工作流未落地**：PR #42 在 AGENTS.md 追加了 lat.md 知识库指令，但仓库无 `lat.md/` 目录、无依赖。改 AGENTS.md 前先确认是否要启用 lat 体系。
+1. **`chromeGroupColor` 注入面**（buildPageChipHtml）：`#` 开头的颜色值未经格式校验直接进 `style="--chrome-group-color:..."`，来源含配置导入路径。建议 `^#[0-9a-fA-F]{6}$` 正则校验（`sanitizeChromeGroupColor`）。
+2. **恢复轮询风暴**：`discardRestoredTabAfterCommit` 每标签 100ms 轮询 × N 标签 × 最长 15s，大会话（50+ 标签）时大量 `tabs.get`。优化方向：单个 `tabs.onUpdated` 集中消费 + 15s 兜底。
+3. **`__suppressAutoRefreshUntil` 魔法字符串**：散落多处、语义弱。长期应收敛为带深度的作用域工具（`withSuppressedRefresh`）。
+4. **`createProperties.windowId` 需 Chrome 111+**：低版本 `tabs.group` 忽略该参数，恢复的组可能落回调用者窗口。低优先级。
+5. **AGENTS.md 的 lat.md 工作流未落地**：PR #42 在 AGENTS.md 追加了 lat.md 知识库指令，但仓库无 `lat.md/` 目录、无依赖。改 AGENTS.md 前先确认是否要启用 lat 体系。
+
+## 已修复（原 P2 → 现状）
+
+1. **grace 期空白去重缺口**（background.js，已修复）：`closeDuplicateNewTabs` 现由 `tabs.onCreated`、`tabs.onUpdated`（URL 变为 new-tab 时）与 grace 到期补查（`scheduleGraceExpiryCheck`，5s+200ms）共同触发；`onRemoved` 清理 `createdRecentlyAt` 与 `graceTimers`。带重入锁（`duplicateCloseInFlight` + 计数）合并并发调用。配套：`isNewTabBlank` 归一化 URL（剥离 `?focus=1` 查询串），使 focus-redirect 后的页面仍被识别。**立即关闭语义**：URL 已是明确 new-tab 页（`chrome://newtab/` 或扩展页）的标签不受 grace 豁免——Ctrl+T 重复页立即关闭；grace 豁免只作用于 URL 为空/未提交的标签（保护会话恢复批量创建）。
+2. **`createdRecentlyAt` Map 轻微泄漏**（background.js，随 1 修复）：`onRemoved` 与 grace timer 均删除条目。
 
 ## 性能注意点
 

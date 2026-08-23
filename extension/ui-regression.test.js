@@ -379,6 +379,7 @@ test('manifest keeps only permissions required by the shipped runtime', () => {
   assert.match(manifest, /"tabs"/);
   assert.match(manifest, /"storage"/);
   assert.match(manifest, /"search"/);
+  assert.match(manifest, /"history"/);
   assert.match(manifest, /"clipboardRead"/);
   assert.doesNotMatch(manifest, /"activeTab"/);
 });
@@ -572,6 +573,47 @@ test('theme menu styles and custom background layer are defined', () => {
   assert.match(appJs, /disposition:\s*'CURRENT_TAB'/);
   assert.match(appJs, /e\.target\.id !== 'headerSearchForm'/);
   assert.match(appJs, /runDefaultSearch\(query\)/);
+  // Search suggestions: focus wiring, panel DOM, keyboard nav, and source hooks.
+  assert.match(runtimeJs, /function setupSearchSuggestions\(\)/);
+  assert.match(runtimeJs, /function focusSearchFieldOnForeground\(\)/);
+  assert.match(runtimeJs, /function refreshSearchSuggestions\(/);
+  assert.match(runtimeJs, /function activateSearchSuggestion\(/);
+  assert.match(runtimeJs, /function renderSearchSuggestions\(/);
+  assert.match(runtimeJs, /function scheduleSearchFocusVerification\(\)/);
+  assert.match(runtimeJs, /function cancelSearchFocusRetryIfInteracting\(\)/);
+  assert.match(runtimeJs, /window\.addEventListener\('load', scheduleSearchFocusVerification, \{ once: true \}\)/);
+  assert.match(runtimeJs, /window\.addEventListener\('focus', \(\) => \{[\s\S]*focusSearchFieldOnForeground\(\);/);
+  // Suggestions appear only while the query is non-empty; focusing or clearing
+  // the field must never open the panel.
+  assert.match(runtimeJs, /if \(!query\) \{\s*closeSearchSuggestions\(\);/);
+  assert.match(runtimeJs, /Focus alone must NOT open the panel/);
+  // Search submit latency: Enter on the input starts the navigation directly
+  // (keydown, one event-loop turn before form submit), a re-entrancy flag
+  // prevents the submit listener from running it twice, and the focus-retry
+  // loop is cancelled so it never contends with the navigation.
+  assert.match(runtimeJs, /let searchSubmitInFlight = false;/);
+  assert.match(runtimeJs, /if \(searchSubmitInFlight\) \{\s*searchSubmitInFlight = false;\s*return;\s*\}/);
+  assert.match(runtimeJs, /searchSuggestionsGeneration \+= 1;/);
+  assert.match(runtimeJs, /cancelSearchFocusRetryIfInteracting\(\);/);
+  // IME composition: Enter inside a composition confirms the IME candidate and
+  // must not submit the search.
+  assert.match(runtimeJs, /searchSuggestionsIsComposing \|\| e\.isComposing/);
+  assert.match(runtimeJs, /input\.addEventListener\('compositionstart'/);
+  // Suggestion sources load in parallel so fewer chrome.* calls are queued
+  // when the user hits Enter to search.
+  assert.match(runtimeJs, /const \[sources, history\] = await Promise\.all\(\[/);
+  assert.match(html, /id="headerSearchSuggestions"/);
+  assert.match(html, /id="headerSearchSuggestionsHint"/);
+  assert.match(html, /<script src="search-suggestions\.js"><\/script>/);
+  // New-tab focus workaround: the redirect script is the first script in head
+  // and the search input carries autofocus for the post-redirect load.
+  assert.match(html, /<script src="focus-redirect\.js"><\/script>[\s\S]*<link rel="preconnect"/);
+  assert.match(html, /id="headerSearchInput"[\s\S]*autofocus>/);
+  assert.match(runtimeJs, /function isTabHarborNewTabUrl\(/);
+  assert.match(runtimeJs, /function normalizeNewTabUrlForComparison\(/);
+  assert.match(css, /\.header-search-suggestions\s*\{/);
+  assert.match(css, /\.header-search-suggestion-row\s*\{/);
+  assert.match(runtimeJs, /chrome\.history\.search/);
   assert.match(themeJs, /'--workspace-accent':/);
   assert.match(themeJs, /'--workspace-accent-soft':/);
   assert.match(themeJs, /'--workspace-accent-border':/);
