@@ -802,8 +802,9 @@ test('close-duplicates and merge-group are header icon actions left of the sleep
   assert.match(runtimeJs, /const dedupButton = hasDupes \? `\s*<button class="group-action-icon" type="button" data-action="dedup-keep-one" data-dupe-urls="\$\{dupeUrlsEncoded\}" aria-label="\$\{dedupLabel\}" data-tooltip="\$\{dedupLabel\}">/);
   // The merge action is hidden on cards that already ARE a Chrome group.
   assert.match(runtimeJs, /const mergeGroupButton = group\.isChromeGroup \? '' : `\s*<button class="group-action-icon" type="button" data-action="group-card-tabs" data-domain-id="\$\{stableId\}" aria-label="\$\{runtimeT \? runtimeT\('groupCardTabsLabel'\)/);
-  // Close-duplicates sits leftmost, then merge, then the sleep icon.
-  assert.match(runtimeJs, /<div class="mission-actions">\s*\$\{dedupButton\}\s*\$\{mergeGroupButton\}\s*\$\{sleepControlEnabled \? `/);
+  // Close-duplicates sits leftmost, then merge, then the sleep icon. The
+  // sleep icon is gated on there being anything left to sleep in the card.
+  assert.match(runtimeJs, /<div class="mission-actions">\s*\$\{dedupButton\}\s*\$\{mergeGroupButton\}\s*\$\{sleepControlEnabled && hasSleepableTabs \? `/);
   // Chrome group cards carry their native group id and color for the bar.
   assert.match(runtimeJs, /class="mission-card domain-card \$\{hasDupes \? 'has-amber-bar' : 'has-neutral-bar'\}\$\{group\.isChromeGroup \? ' chrome-group-card' : ''\}"[\s\S]{0,200}data-chrome-group-id="\$\{group\.chromeGroupId\}"[\s\S]{0,120}--chrome-group-color:\$\{chromeColor\}/);
 });
@@ -813,6 +814,56 @@ test('merge/duplicate actions reuse the icon-button style of sleep/save/close', 
   assert.match(helperJs, /mergeGroup: `<svg[\s\S]*<\/svg>`/);
   assert.match(helperJs, /closeDuplicates: `<svg[\s\S]*<\/svg>`/);
   assert.doesNotMatch(runtimeJs, /data-action="group-card-tabs"[\s\S]{0,120}class="action-btn"/);
+});
+
+test('the group sleep button hides when no tab in the card can be slept', () => {
+  // Behavioral: render real cards with the row-level sleep rule mirrored —
+  // a row offers sleep only when its tab is awake, background and
+  // materialized, so an all-asleep (or all-active) card loses the header
+  // moon button exactly like its rows lose their own sleep indicators.
+  const fn = new Function(`
+    const expandedPageChipGroupKeys = new Set();
+    const groupRenameEditorState = null;
+    const selectedPageChipIds = new Set();
+    // Declared-but-null so the guarded fallbacks in the renderer kick in.
+    const runtimeT = null;
+    const runtimeEscapeHtml = null;
+    const runtimeEscapeHtmlAttribute = null;
+    let sleepControlEnabled = true;
+    const CHROME_GROUP_COLOR_MAP = {};
+    const ICONS = { moon: '<i>moon</i>', archive: '<i>arch</i>', close: '<i>close</i>', mergeGroup: '<i>merge</i>', closeDuplicates: '<i>dedup</i>' };
+    function getStableGroupId(key) { return 'stable-' + key; }
+    function getGroupDisplayLabel(group) { return group.label || group.domain; }
+    function getOrderedUniqueTabsForGroup(group) { return group.tabs; }
+    function cleanTitle(title) { return title; }
+    function smartTitle(title) { return title; }
+    function stripTitleNoise(title) { return title; }
+    function getPrimaryTabOrderToken(tab) { return String(tab.id); }
+    function runtimeGetIconSources() { return { sources: [], hostname: '' }; }
+    function runtimeGetFallbackLabel(label) { return label; }
+    ${extractFn(runtimeJs, 'buildOverflowChips')}
+    ${extractFn(runtimeJs, 'buildPageChipHtml')}
+    ${extractFn(runtimeJs, 'renderDomainCard')}
+    return renderDomainCard;
+  `)();
+
+  const awake = { id: 1, url: 'https://a.test/x', title: 'A', windowId: 1, discarded: false, active: false };
+  const asleep = { id: 2, url: 'https://b.test/x', title: 'B', windowId: 1, discarded: true, active: false };
+  const active = { id: 3, url: 'https://c.test/x', title: 'C', windowId: 1, discarded: false, active: true };
+  const cardOf = tabs => fn({ domain: 'a.test', label: 'A', tabs });
+
+  // At least one sleepable tab: the header moon button is present.
+  assert.match(cardOf([awake, asleep]), /data-action="sleep-domain-tabs"/);
+  // Every tab asleep: the moon button hides, exactly like the rows' own
+  // sleep indicators do.
+  assert.doesNotMatch(cardOf([asleep, { ...asleep, id: 4 }]), /data-action="sleep-domain-tabs"/);
+  // Active tabs are not sleepable either (same rule as the rows): an
+  // active + asleep card has nothing left to sleep and hides the button.
+  assert.doesNotMatch(cardOf([active, asleep]), /data-action="sleep-domain-tabs"/);
+  // Sleeping rows keep rendering (with the discarded style) when the header
+  // button is hidden.
+  const allAsleepCard = cardOf([asleep]);
+  assert.match(allAsleepCard, /page-chip--discarded/);
 });
 
 test('per-chip duplicate count badges are not rendered', () => {

@@ -4180,6 +4180,14 @@ function renderDomainCard(group) {
   const orderedTabs = getOrderedUniqueTabsForGroup(group);
   const extraCount  = Math.max(0, orderedTabs.length - 8);
 
+  // Mirror the per-row sleep rule (buildPageChipHtml): a row offers sleep
+  // only when its tab is awake, not active and materialized. When no row in
+  // the card can be slept — every tab asleep, active or a placeholder — the
+  // header's "sleep all in group" button is a guaranteed no-op and hides
+  // exactly like the rows' own sleep indicators do.
+  const hasSleepableTabs = orderedTabs.some(tab =>
+    !tab.active && !tab.discarded && !(!tab.url && !tab.title && tab.id != null));
+
   // Every row (visible + overflow) goes through the same renderer, so the
   // expanded "+N more" rows look and behave exactly like the first eight.
   // Overflow rows are direct list children hidden with a CSS class — they
@@ -4243,7 +4251,7 @@ function renderDomainCard(group) {
           <div class="mission-actions">
             ${dedupButton}
             ${mergeGroupButton}
-            ${sleepControlEnabled ? `
+            ${sleepControlEnabled && hasSleepableTabs ? `
             <button class="group-action-icon" type="button" data-action="sleep-domain-tabs" data-domain-id="${stableId}" aria-label="${runtimeT ? runtimeT('sleepAllTabsButton') : 'Sleep all tabs in group'}" data-tooltip="${runtimeT ? runtimeT('sleepAllTabsButton') : 'Sleep all tabs in group'}">
               ${ICONS.moon}
             </button>` : ''}
