@@ -20,6 +20,26 @@ if (TAB_HARBOR_BG_DEBUG)
 const NEW_TAB_GRACE_PERIOD_MS = 5000;
 const createdRecentlyAt = new Map(); // tabId -> timestamp
 
+// The grace period above defers dedup for freshly created tabs, so the
+// cleanup triggered by tabs.onCreated cannot yet see the full picture (a
+// pre-existing blank tab plus the fresh one yields only ONE dedupable blank).
+// Re-run the cleanup once after the grace expires; otherwise shielded
+// duplicate blank tabs stay open until some unrelated tab event happens to
+// trigger another cleanup. The timer only needs to outlive the few seconds
+// right after onCreated — well inside the service worker's post-event idle
+// lifetime — but it is unref'd so tests and worker shutdown never wait on it.
+const POST_GRACE_RECONCILE_DELAY_MS = NEW_TAB_GRACE_PERIOD_MS + 1000;
+let postGraceReconcileTimer = null;
+
+function schedulePostGraceReconcile() {
+  if (postGraceReconcileTimer != null) return;
+  postGraceReconcileTimer = setTimeout(() => {
+    postGraceReconcileTimer = null;
+    closeDuplicateNewTabs();
+  }, POST_GRACE_RECONCILE_DELAY_MS);
+  postGraceReconcileTimer.unref?.();
+}
+
 function getNewTabUrls() {
   return new Set([
     chrome.runtime.getURL("index.html"),
@@ -160,6 +180,7 @@ chrome.tabs.onCreated.addListener((tab) => {
   updateBadge();
   notifyTabHarborPages({ source: "tabs.onCreated", triggerTabId: tab?.id });
   closeDuplicateNewTabs();
+  schedulePostGraceReconcile();
 });
 
 // Update badge and notify Tab Harbor pages whenever a tab is closed
@@ -199,4 +220,16 @@ globalThis.TabHarborBackground = {
   getNewTabUrls,
   isNewTabBlank,
   closeDuplicateNewTabs,
+  // Test seam: settle the armed post-grace reconciliation right now AND
+  // advance past the grace window, so tests observe the eventual cleanup
+  // without real timers. Clearing the creation registry mirrors reality:
+  // once the grace expires, isNewTabBlank stops shielding those tabs.
+  async runPostGraceReconcileForTest() {
+    if (postGraceReconcileTimer != null) {
+      clearTimeout(postGraceReconcileTimer);
+      postGraceReconcileTimer = null;
+    }
+    createdRecentlyAt.clear();
+    await closeDuplicateNewTabs();
+  },
 };

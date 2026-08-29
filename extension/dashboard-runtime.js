@@ -2244,7 +2244,7 @@ async function openSavedTabsInCurrentWindow(tabs = []) {
     });
   const targetWindowId = firstCreatedTab?.windowId ?? currentWindowId ?? null;
   const restoredTabs = firstCreatedTab?.id != null
-    ? [{ id: firstCreatedTab.id, url: firstTab.url, sourceIndex: firstEntry.sourceIndex }]
+    ? [{ id: firstCreatedTab.id, url: firstTab.url, sourceIndex: firstEntry.sourceIndex, groupKey: firstTab.groupKey }]
     : [];
   // Queue the active first tab too. Chrome will reject it while it is active,
   // but once the user switches away the shared retry path can sleep it just
@@ -2266,6 +2266,7 @@ async function openSavedTabsInCurrentWindow(tabs = []) {
       id: createdTab.id,
       url: tab.url,
       sourceIndex,
+      groupKey: tab.groupKey,
     });
   }
 
@@ -2289,6 +2290,7 @@ async function openSavedTabsInNewWindow(tabs = []) {
       id: firstCreatedTab.id,
       url: firstTab.url,
       sourceIndex: firstEntry.sourceIndex,
+      groupKey: firstTab.groupKey,
     });
   } else if (createdWindow?.id != null) {
     const createdWindowTabs = await chrome.tabs.query({ windowId: createdWindow.id });
@@ -2298,6 +2300,7 @@ async function openSavedTabsInNewWindow(tabs = []) {
         id: queriedFirstTab.id,
         url: firstTab.url,
         sourceIndex: firstEntry.sourceIndex,
+        groupKey: firstTab.groupKey,
       });
     }
   }
@@ -2320,6 +2323,7 @@ async function openSavedTabsInNewWindow(tabs = []) {
       id: createdTab.id,
       url: tab.url,
       sourceIndex,
+      groupKey: tab.groupKey,
     });
   }
 
