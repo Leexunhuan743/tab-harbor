@@ -3864,6 +3864,20 @@ function getRestoredTabNavigationIdentity(url) {
   }
 }
 
+// Only a real web destination proves a committed navigation worth sleeping.
+// Error and interstitial pages (chrome-error://chromewebdata/,
+// about:blank#blocked, browser-internal urls) also report status 'complete',
+// but discarding one would sleep a tab that holds no restored content and can
+// never reload the saved URL.
+function isWebNavigationUrl(url) {
+  try {
+    const protocol = new URL(url).protocol;
+    return protocol === 'http:' || protocol === 'https:' || protocol === 'file:' || protocol === 'ftp:';
+  } catch {
+    return false;
+  }
+}
+
 function isRestoredTabNavigationReady(liveTab, targetUrl, changeInfo = {}) {
   const liveUrl = String(changeInfo?.url || liveTab?.url || '').trim();
   if (!liveUrl || liveUrl === 'about:blank' || liveUrl === 'chrome://newtab/') return false;
@@ -3872,6 +3886,10 @@ function isRestoredTabNavigationReady(liveTab, targetUrl, changeInfo = {}) {
   // safe to sleep: the tab has a committed destination, while a loading
   // redirect is left alone until Chrome reports the completed state.
   if (getRestoredTabNavigationIdentity(liveUrl) === getRestoredTabNavigationIdentity(targetUrl)) return true;
+  // The completed-redirect fallback must never accept an error page: a failed
+  // load lands on chrome-error://chromewebdata/ with status 'complete', which
+  // looks exactly like a finished redirect unless the destination is checked.
+  if (!isWebNavigationUrl(getRestoredTabNavigationIdentity(liveUrl))) return false;
   return changeInfo?.status === 'complete' || liveTab?.status === 'complete';
 }
 

@@ -1659,6 +1659,7 @@ test('discardRestoredTabAfterCommit uses one state check then waits for a Chrome
     let restoredTabDiscardDeadlineTimer = null;
     let restoredTabDiscardListenersAttached = false;
     ${extractFn(runtimeJs, 'getRestoredTabNavigationIdentity')}
+    ${extractFn(runtimeJs, 'isWebNavigationUrl')}
     ${extractFn(runtimeJs, 'isRestoredTabNavigationReady')}
     ${extractFn(runtimeJs, 'removeRestoredTabDiscard')}
     ${extractFn(runtimeJs, 'scheduleRestoredTabDiscardDeadline')}
@@ -1720,6 +1721,7 @@ test('restore discard requests survive a transient Chrome discard failure', asyn
     let restoredTabDiscardDeadlineTimer = null;
     let restoredTabDiscardListenersAttached = false;
     ${extractFn(runtimeJs, 'getRestoredTabNavigationIdentity')}
+    ${extractFn(runtimeJs, 'isWebNavigationUrl')}
     ${extractFn(runtimeJs, 'isRestoredTabNavigationReady')}
     ${extractFn(runtimeJs, 'removeRestoredTabDiscard')}
     ${extractFn(runtimeJs, 'scheduleRestoredTabDiscardDeadline')}
@@ -1757,6 +1759,79 @@ test('restore discard requests survive a transient Chrome discard failure', asyn
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(attempts, 2);
     assert.equal(fn.queue.size, 0, 'successful retry removes the pending request');
+  } finally {
+    delete globalThis.chrome;
+  }
+});
+
+test('a finished error page is never treated as a committed navigation', async () => {
+  const eventListeners = [];
+  const fn = new Function(`
+    ${extractFn(runtimeJs, 'discardTab')}
+    const RESTORED_TAB_DISCARD_TIMEOUT_MS = 15000;
+    const RESTORED_TAB_DISCARD_RETRY_MS = 1000;
+    const restoredTabDiscardQueue = new Map();
+    let restoredTabDiscardDeadlineTimer = null;
+    let restoredTabDiscardListenersAttached = false;
+    ${extractFn(runtimeJs, 'getRestoredTabNavigationIdentity')}
+    ${extractFn(runtimeJs, 'isWebNavigationUrl')}
+    ${extractFn(runtimeJs, 'isRestoredTabNavigationReady')}
+    ${extractFn(runtimeJs, 'removeRestoredTabDiscard')}
+    ${extractFn(runtimeJs, 'scheduleRestoredTabDiscardDeadline')}
+    ${extractFn(runtimeJs, 'tryDiscardRestoredTabAfterCommit')}
+    ${extractFn(runtimeJs, 'ensureRestoredTabDiscardListeners')}
+    ${extractFn(runtimeJs, 'discardRestoredTabAfterCommit')}
+    return { discardRestoredTabAfterCommit, queue: restoredTabDiscardQueue };
+  `)();
+
+  const discarded = [];
+  globalThis.chrome = {
+    tabs: {
+      get: async () => ({ id: 73, url: 'about:blank', status: 'loading', active: false }),
+      discard: async id => { discarded.push(Number(id)); },
+      onUpdated: { addListener: listener => eventListeners.push(listener) },
+      onRemoved: { addListener: () => {} },
+    },
+  };
+
+  try {
+    fn.discardRestoredTabAfterCommit(73, 'https://saved.example/article');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(discarded.length, 0);
+
+    // A failed load lands on the network error page with status 'complete'.
+    // That must not count as a committed destination: the tab holds no
+    // restored content and discarding it can never protect the saved URL.
+    eventListeners[0](73, { status: 'complete' }, {
+      id: 73,
+      url: 'chrome-error://chromewebdata/',
+      status: 'complete',
+      active: false,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(discarded, [], 'a finished chrome-error page is not discarded');
+    assert.equal(fn.queue.size, 1, 'the request stays queued for the real navigation');
+
+    // Blocked frames land on about:blank#blocked, also with status complete.
+    eventListeners[0](73, { status: 'complete' }, {
+      id: 73,
+      url: 'about:blank#blocked',
+      status: 'complete',
+      active: false,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(discarded, [], 'a finished about:blank#blocked page is not discarded');
+
+    // Once the real page finally commits, the queued request still fires.
+    eventListeners[0](73, { url: 'https://saved.example/article', status: 'complete' }, {
+      id: 73,
+      url: 'https://saved.example/article',
+      status: 'complete',
+      active: false,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(discarded, [73], 'the queued request discards once the real page commits');
+    assert.equal(fn.queue.size, 0);
   } finally {
     delete globalThis.chrome;
   }

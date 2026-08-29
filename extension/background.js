@@ -55,13 +55,16 @@ function isNewTabBlank(tab, newTabUrls) {
   ) {
     return false;
   }
+  // Only close a tab whose blank state is positively known (a committed
+  // chrome://newtab/ or the dashboard page itself). A tab with an empty url
+  // and no pendingUrl is in an unknown state — most likely a restore-batch tab
+  // whose navigation has not been reported yet — and must never be closed on
+  // a guess, so "url is empty" alone is deliberately not a blank signal.
   return (
     url === "chrome://newtab/" ||
     knownNewTabUrls.has(url) ||
     pendingUrl === "chrome://newtab/" ||
-    knownNewTabUrls.has(pendingUrl) ||
-    url === "" ||
-    (tab.status === "loading" && !url)
+    knownNewTabUrls.has(pendingUrl)
   );
 }
 
@@ -91,7 +94,11 @@ async function closeDuplicateNewTabs() {
     for (const tabsInWindow of blankTabsByWindow.values()) {
       if (tabsInWindow.length <= 1) continue;
       const activeTab = tabsInWindow.find((tab) => tab.active);
+      // No active blank tab: keep the Tab Harbor page when the group contains
+      // one, so the fallback below can never close the dashboard itself in
+      // favor of a genuinely blank new-tab page.
       const toKeep = activeTab
+        || tabsInWindow.find((tab) => newTabUrls.has(String(tab.url || "")))
         || tabsInWindow.reduce((a, b) => (a.id > b.id ? a : b));
       for (const tab of tabsInWindow) {
         if (tab.id !== toKeep.id) toClose.push(tab.id);

@@ -71,12 +71,18 @@ test('isNewTabBlank matches extension/index.html from root manifest entry', () =
   assert.equal(isNewTabBlank({ url: ROOT_MANIFEST_EXT_URL }, [EXT_URL, ROOT_MANIFEST_EXT_URL]), true);
 });
 
-test('isNewTabBlank matches empty url', () => {
-  assert.equal(isNewTabBlank({ url: '' }, EXT_URL), true);
+test('isNewTabBlank does not match an unknown tab with an empty url', () => {
+  // A tab whose url is empty and that carries no pendingUrl is in an unknown
+  // state — most likely a restore-batch tab whose navigation has not been
+  // reported yet. Closing it on a guess would kill restored tabs, so it is
+  // deliberately not treated as a blank new-tab page.
+  assert.equal(isNewTabBlank({ url: '' }, EXT_URL), false);
 });
 
-test('isNewTabBlank matches loading tab with no url', () => {
-  assert.equal(isNewTabBlank({ url: undefined, status: 'loading' }, EXT_URL), true);
+test('isNewTabBlank does not match a loading tab with no url and no pendingUrl', () => {
+  // Same unknown-state reasoning as the empty-url case: without a pendingUrl
+  // there is no evidence about where this tab is heading.
+  assert.equal(isNewTabBlank({ url: undefined, status: 'loading' }, EXT_URL), false);
 });
 
 test('isNewTabBlank does not match loading restored tab with normal pendingUrl', () => {
@@ -137,7 +143,7 @@ test('closeDuplicateNewTabs keeps active tab', async () => {
   globalThis.chrome.tabs.query = async () => [
     { id: 10, url: EXT_URL, active: false },
     { id: 20, url: 'chrome://newtab/', active: true },
-    { id: 30, url: '', active: false },
+    { id: 30, url: 'chrome://newtab/', active: false },
   ];
   await closeDuplicateNewTabs();
   // Should keep id=20 (active), close 10 and 30
@@ -173,12 +179,11 @@ test('closeDuplicateNewTabs handles mixed blank tab types', async () => {
   globalThis.chrome.tabs.query = async () => [
     { id: 1, url: 'chrome://newtab/', active: false },
     { id: 2, url: EXT_URL, active: true },
-    { id: 3, url: '', active: false },
-    { id: 4, url: undefined, status: 'loading', active: false },
+    { id: 3, url: ROOT_MANIFEST_EXT_URL, active: false },
   ];
   await closeDuplicateNewTabs();
-  // Keep id=2 (active), close 1, 3, 4
-  assert.deepEqual(removedTabIds, [1, 3, 4]);
+  // Keep id=2 (active), close 1 and 3
+  assert.deepEqual(removedTabIds, [1, 3]);
 });
 
 test('closeDuplicateNewTabs treats root manifest new tab pages as blank tabs', async () => {
@@ -211,8 +216,9 @@ test('isNewTabBlank never matches a discarded (sleeping) tab even with an empty 
   assert.equal(isNewTabBlank({ url: '', discarded: true }, EXT_URL), false);
   assert.equal(isNewTabBlank({ url: undefined, status: 'loading', discarded: true }, EXT_URL), false);
   assert.equal(isNewTabBlank({ url: 'chrome://newtab/', discarded: true }, EXT_URL), false);
-  // Non-discarded blank tabs are still matched as before.
-  assert.equal(isNewTabBlank({ url: '', discarded: false }, EXT_URL), true);
+  // A discarded tab committed to a genuine new-tab page is still never closed.
+  assert.equal(isNewTabBlank({ url: '', discarded: false }, EXT_URL), false);
+  assert.equal(isNewTabBlank({ url: 'chrome://newtab/', discarded: false }, EXT_URL), true);
 });
 
 test('closeDuplicateNewTabs never closes discarded (sleeping) tabs', async () => {
@@ -220,10 +226,11 @@ test('closeDuplicateNewTabs never closes discarded (sleeping) tabs', async () =>
   removedTabIds = [];
   globalThis.chrome.tabs.query = async () => [
     { id: 1, url: 'chrome://newtab/', active: true },
-    // Restore-created tabs that were discarded right away: empty urls, asleep.
-    { id: 2, url: '', discarded: true, active: false },
-    { id: 3, url: '', discarded: true, active: false },
-    { id: 4, url: undefined, status: 'loading', discarded: true, active: false },
+    // Restore-created tabs that were discarded right away: asleep on a
+    // committed new-tab page, which would otherwise look blank.
+    { id: 2, url: 'chrome://newtab/', discarded: true, active: false },
+    { id: 3, url: 'chrome://newtab/', discarded: true, active: false },
+    { id: 4, url: EXT_URL, status: 'loading', discarded: true, active: false },
   ];
   await closeDuplicateNewTabs();
   // Only the genuine blank new-tab page (id 1, kept active) is in play; the
@@ -235,15 +242,15 @@ test('closeDuplicateNewTabs exempts freshly-created tabs within the grace period
   storageData = { themePreferences: { closeDuplicateNewTabsEnabled: true } };
   removedTabIds = [];
   // Simulate the background's own onCreated bookkeeping: a restore batch just
-  // created tabs 2 and 3 whose navigation has not committed (empty url).
+  // created tabs 2 and 3 which look like blank new-tab pages so far.
   if (typeof globalThis.__tabHarborOnCreated === 'function') {
-    globalThis.__tabHarborOnCreated({ id: 2, url: '' });
-    globalThis.__tabHarborOnCreated({ id: 3, url: '' });
+    globalThis.__tabHarborOnCreated({ id: 2, url: 'chrome://newtab/' });
+    globalThis.__tabHarborOnCreated({ id: 3, url: 'chrome://newtab/' });
   }
   globalThis.chrome.tabs.query = async () => [
     { id: 1, url: 'chrome://newtab/', active: true },
-    { id: 2, url: '', active: false },
-    { id: 3, url: '', active: false },
+    { id: 2, url: 'chrome://newtab/', active: false },
+    { id: 3, url: 'chrome://newtab/', active: false },
   ];
   await closeDuplicateNewTabs();
   // Freshly-created tabs are exempt (they may still be committing their
@@ -254,15 +261,45 @@ test('closeDuplicateNewTabs exempts freshly-created tabs within the grace period
 
 test('recently-created tab state is released when a tab is removed or replaced', () => {
   const urls = [EXT_URL, ROOT_MANIFEST_EXT_URL];
-  globalThis.__tabHarborOnCreated({ id: 44, url: '' });
-  assert.equal(isNewTabBlank({ id: 44, url: '' }, urls), false, 'a live freshly-created tab stays in the grace period');
+  globalThis.__tabHarborOnCreated({ id: 44, url: 'chrome://newtab/' });
+  assert.equal(isNewTabBlank({ id: 44, url: 'chrome://newtab/' }, urls), false, 'a live freshly-created tab stays in the grace period');
   globalThis.__tabHarborOnRemoved(44, { windowId: 1, isWindowClosing: false });
-  assert.equal(isNewTabBlank({ id: 44, url: '' }, urls), true, 'a removed tab no longer owns a grace record');
+  assert.equal(isNewTabBlank({ id: 44, url: 'chrome://newtab/' }, urls), true, 'a removed tab no longer owns a grace record');
 
-  globalThis.__tabHarborOnCreated({ id: 45, url: '' });
-  assert.equal(isNewTabBlank({ id: 45, url: '' }, urls), false);
+  globalThis.__tabHarborOnCreated({ id: 45, url: 'chrome://newtab/' });
+  assert.equal(isNewTabBlank({ id: 45, url: 'chrome://newtab/' }, urls), false);
   globalThis.__tabHarborOnReplaced(46, 45);
-  assert.equal(isNewTabBlank({ id: 45, url: '' }, urls), true, 'the removed side of onReplaced is released');
+  assert.equal(isNewTabBlank({ id: 45, url: 'chrome://newtab/' }, urls), true, 'the removed side of onReplaced is released');
+});
+
+test('closeDuplicateNewTabs never closes a tab Chrome has not described yet', async () => {
+  storageData = { themePreferences: { closeDuplicateNewTabsEnabled: true } };
+  removedTabIds = [];
+  // Restore-batch tabs whose navigation has not been reported: empty url and
+  // no pendingUrl. Their state is unknown, so closing them on a guess is
+  // never acceptable, even outside the creation grace period.
+  globalThis.chrome.tabs.query = async () => [
+    { id: 1, url: 'chrome://newtab/', active: true },
+    { id: 2, url: '', active: false },
+    { id: 3, url: undefined, status: 'loading', active: false },
+    { id: 4, url: 'chrome-error://chromewebdata/', active: false },
+  ];
+  await closeDuplicateNewTabs();
+  assert.deepEqual(removedTabIds, []);
+});
+
+test('closeDuplicateNewTabs keeps the Tab Harbor page when no blank tab is active', async () => {
+  storageData = { themePreferences: { closeDuplicateNewTabsEnabled: true } };
+  removedTabIds = [];
+  // A window whose active tab is a real page: the fallback must keep the
+  // dashboard instead of an arbitrary max-id blank new-tab page.
+  globalThis.chrome.tabs.query = async () => [
+    { id: 100, windowId: 1, url: 'https://example.com/page', active: true },
+    { id: 101, windowId: 1, url: 'chrome://newtab/', active: false },
+    { id: 130, windowId: 1, url: EXT_URL, active: false },
+  ];
+  await closeDuplicateNewTabs();
+  assert.deepEqual(removedTabIds, [101], 'the dashboard page survives the fallback');
 });
 
 test('closeDuplicateNewTabs keeps one blank tab in every window', async () => {
