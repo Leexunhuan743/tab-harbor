@@ -741,6 +741,107 @@ test('syncChromeTabGroups reuses chromeGroupMap populated by populateChromeGroup
   assert.deepEqual(lastGroupCall.tabIds, [10]);
 });
 
+test('syncChromeTabGroups pins new mirror group creation to the synced window (F4)', async () => {
+  resetChromeGroupState();
+  const groupCalls = [];
+
+  globalThis.chrome.tabs.group = async (opts) => {
+    groupCalls.push(opts);
+    return 600;
+  };
+  globalThis.chrome.tabGroups.update = async () => {};
+  globalThis.chrome.tabGroups.query = async () => [];
+  globalThis.chrome.tabs.query = async (opts) => [];
+
+  await saveChromeTabGroupsSetting(true);
+
+  const groups = [
+    { domain: 'github.com', tabs: [{ id: 10, windowId: 1, url: 'https://github.com' }] },
+  ];
+
+  await syncChromeTabGroups(groups);
+
+  // Without createProperties.windowId Chrome creates the group in the
+  // CALLER's current window and drags these tabs across windows.
+  assert.equal(groupCalls.length, 1);
+  assert.deepEqual(groupCalls[0].createProperties, { windowId: 1 });
+  assert.deepEqual(groupCalls[0].tabIds, [10]);
+});
+
+test('syncChromeTabGroups pins the one-by-one creation fallback to the synced window (F4)', async () => {
+  resetChromeGroupState();
+  const groupCalls = [];
+
+  globalThis.chrome.tabs.group = async (opts) => {
+    groupCalls.push(opts);
+    // The bulk create fails, forcing the one-by-one fallback path.
+    if (Array.isArray(opts.tabIds) && !opts.groupId) throw new Error('bulk grouping failed');
+    return opts.groupId ?? 601;
+  };
+  globalThis.chrome.tabGroups.update = async () => {};
+  globalThis.chrome.tabGroups.query = async () => [];
+  globalThis.chrome.tabs.query = async (opts) => [];
+
+  await saveChromeTabGroupsSetting(true);
+
+  const groups = [
+    {
+      domain: 'github.com',
+      tabs: [
+        { id: 10, windowId: 1, url: 'https://github.com' },
+        { id: 11, windowId: 1, url: 'https://github.com/x' },
+      ],
+    },
+  ];
+
+  await syncChromeTabGroups(groups);
+
+  // The failed bulk attempt is recorded too (it also carries the pin); the
+  // one-by-one create is the non-array tabIds call.
+  const createCalls = groupCalls.filter(opts => opts.createProperties && !Array.isArray(opts.tabIds));
+  assert.equal(createCalls.length, 1, 'exactly one per-tab create call');
+  assert.deepEqual(createCalls[0].createProperties, { windowId: 1 });
+  assert.equal(createCalls[0].tabIds, 10);
+  // The remaining tab joins via groupId, not by cross-window creation.
+  assert.deepEqual(
+    groupCalls.find(opts => opts.groupId != null),
+    { groupId: 601, tabIds: 11 },
+  );
+});
+
+test('syncChromeTabGroups drops a mapping that points into another window (F4)', async () => {
+  resetChromeGroupState();
+  const groupCalls = [];
+
+  globalThis.chrome.tabs.group = async (opts) => {
+    groupCalls.push(opts);
+    return opts.groupId ?? 602;
+  };
+  globalThis.chrome.tabGroups.update = async () => {};
+  // The mapped group 500 is LIVE but lives in window 2, while the synced
+  // tabs are in window 1 — reusing it would drag the tabs across windows.
+  globalThis.chrome.tabGroups.query = async () => [
+    { id: 500, windowId: 2, title: 'GitHub', color: 'grey' },
+  ];
+  globalThis.chrome.tabs.query = async (opts) => [];
+
+  await saveChromeTabGroupsSetting(true);
+  await populateChromeGroupMap([
+    { virtualGroupKey: 'github.com', windowId: 1, chromeGroupId: 500 },
+  ]);
+
+  const groups = [
+    { domain: 'github.com', tabs: [{ id: 10, windowId: 1, url: 'https://github.com' }] },
+  ];
+
+  await syncChromeTabGroups(groups);
+
+  assert.equal(groupCalls.some(opts => opts.groupId === 500), false, 'the cross-window mapping is not reused');
+  const createCall = groupCalls.find(opts => opts.createProperties);
+  assert.ok(createCall, 'the mirror is recreated locally instead');
+  assert.deepEqual(createCall.createProperties, { windowId: 1 });
+});
+
 test('syncChromeTabGroups only removes obsolete mappings in synced windows', async () => {
   resetChromeGroupState();
   const ungroupedTabIds = [];

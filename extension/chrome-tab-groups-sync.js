@@ -498,6 +498,17 @@
         if (chromeGroupId != null && !validGroupIds.has(chromeGroupId)) {
           chromeGroupId = null;
         }
+        // A mapping can also point at a LIVE group in a DIFFERENT window than
+        // the tabs being synced (the group was dragged elsewhere, or a stale
+        // snapshot survived a window-id change). Reusing it would drag these
+        // tabs across windows, so drop the mapping and recreate the mirror
+        // locally instead (F4).
+        if (chromeGroupId != null) {
+          const mappedGroup = currentGroups.find(g => Number(g.id) === Number(chromeGroupId));
+          if (mappedGroup && Number(mappedGroup.windowId) !== Number(windowId)) {
+            chromeGroupId = null;
+          }
+        }
 
         if (chromeGroupId == null) {
           // In import mode, only reuse existing groups — don't create new ones
@@ -513,15 +524,18 @@
             creationColor = pickUncollidingGroupColor(title, groupColor, windowId, currentGroups);
           }
 
-          // Create new group
+          // Create new group pinned to the synced window: without
+          // createProperties.windowId Chrome creates the group in the
+          // CALLER's current window and drags these tabs across windows (the
+          // same contract behavior fixed for session restore in be61745).
           try {
-            chromeGroupId = await chrome.tabs.group({ tabIds });
+            chromeGroupId = await chrome.tabs.group({ tabIds, createProperties: { windowId } });
           } catch {
             // Some tabs may have valid IDs but fail grouping; try one by one
             for (const tabId of tabIds) {
               try {
                 if (chromeGroupId == null) {
-                  chromeGroupId = await chrome.tabs.group({ tabIds: tabId });
+                  chromeGroupId = await chrome.tabs.group({ tabIds: tabId, createProperties: { windowId } });
                 } else {
                   await chrome.tabs.group({ groupId: chromeGroupId, tabIds: tabId });
                 }
