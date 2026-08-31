@@ -1502,7 +1502,7 @@ body.theme-tone-dark .deferred-shell {
     width: auto;
     flex: 0 0 auto;
     justify-content: flex-end;
-    gap: 8px;
+    gap: 6px;
 }
 
 .saved-sessions-section .section-count {
@@ -2041,7 +2041,7 @@ body.page-chip-list-dragging .page-chip.is-selected:not(.is-dragging) {
 .page-chip-batch-bar {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: 6px;
     white-space: nowrap;
 }
 
