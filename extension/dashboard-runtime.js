@@ -227,6 +227,29 @@ let chromeTabGroupsImportTimer = null;
 let chromeTabGroupsUnsubscribe = null;
 let chromeTabGroupsImportInFlight = false;
 let suppressChromeTabGroupsImportUntil = 0;
+// Search-field suggestion panel state. openSuggestions tracks visibility;
+// suggestionHistoryCache debounces chrome.history lookups while the panel is
+// open so we never query on every keystroke.
+let searchSuggestionsOpen = false;
+let searchSuggestionsQuery = '';
+let searchSuggestionsSelectedIndex = -1;
+let searchSuggestionsRows = [];
+let searchSuggestionsHistoryCache = null;
+let searchSuggestionsHistoryCacheTime = 0;
+let searchSuggestionsDebounceTimer = null;
+let searchSuggestionsFocusGuardUntil = 0;
+// True while the input method editor is composing a candidate in the search
+// field (compositionstart fired, compositionend not yet). Enter during
+// composition confirms the IME candidate and must not submit the search.
+let searchSuggestionsIsComposing = false;
+// True while the Enter keydown handler has already started the search
+// navigation, so the following form submit does not run it a second time.
+let searchSubmitInFlight = false;
+// Incremented whenever the suggestion panel is invalidated (search submit,
+// outside click, Escape). In-flight refreshSearchSuggestions calls compare
+// their captured generation against this and discard stale results, so their
+// chrome.* calls never contend with a navigation's chrome.* calls.
+let searchSuggestionsGeneration = 0;
 let currentDashboardTabId = null;
 let currentDashboardWindowId = null;
 let dashboardStartupTabChangeIgnoreUntil = 0;
@@ -909,8 +932,6 @@ function warmHitokotoCacheInBackground() {
 async function fetchOpenTabs() {
   await waitForSessionGroupTabReplacementMigrations();
   try {
-    const newtabUrl = window.location.href;
-
     const currentWindowId = await getDashboardWindowIdForOpenTabs();
     const tabs = await chrome.tabs.query({});
     allOpenTabIds = tabs.map(tab => tab?.id).filter(tabId => tabId != null);
@@ -945,7 +966,7 @@ async function fetchOpenTabs() {
         isSuspended: Boolean(suspended.isSuspended),
         discarded: t.discarded || false,
         // Flag Tab Harbor's own pages so we can detect duplicate new tabs
-        isTabOut: rawUrl === newtabUrl || rawUrl === 'chrome://newtab/',
+        isTabOut: isTabHarborNewTabUrl(rawUrl),
       };
     });
     return true;
@@ -3651,8 +3672,44 @@ async function focusTab(url, tabId = null) {
   return true;
 }
 
+/**
+ * normalizeNewTabUrlForComparison(url)
+ *
+ * The focus-redirect appends `?focus=1` to the new-tab page URL (see
+ * focus-redirect.js). A Tab Harbor new-tab page may therefore appear with or
+ * without that query across different tabs/windows. Strip query + hash so the
+ * comparison identifies the page regardless of the focus parameter.
+ */
+function normalizeNewTabUrlForComparison(rawUrl = '') {
+  try {
+    const parsed = new URL(rawUrl);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return String(rawUrl).split(/[?#]/)[0] || rawUrl;
+  }
+}
+
+function isTabHarborNewTabUrl(rawUrl = '') {
+  const url = String(rawUrl || '');
+  if (url === 'chrome://newtab/') return true;
+  // The current page IS a Tab Harbor new-tab page; compare normalized forms so
+  // the ?focus=1 query (and any hash) does not break the match.
+  return normalizeNewTabUrlForComparison(url) === normalizeNewTabUrlForComparison(window.location.href);
+}
+
 async function navigateCurrentTabToUrl(url) {
   if (!url) return false;
+  // Prefer the dashboard's own cached tab id when it is still live — this
+  // skips a chrome.tabs.query round-trip so the search navigation starts
+  // immediately (a real-perceived-latency win on the search submit path).
+  if (currentDashboardTabId != null) {
+    try {
+      await chrome.tabs.update(currentDashboardTabId, { url });
+      return true;
+    } catch {
+      // Tab was replaced/closed; fall through to the query path.
+    }
+  }
   const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!activeTab?.id) return false;
   await chrome.tabs.update(activeTab.id, { url });
@@ -3687,6 +3744,10 @@ function syncSearchPlaceholder() {
     placeholder = runtimeT ? runtimeT('searchPlaceholderDefault') : 'Search with your default engine...';
   }
   input.setAttribute('placeholder', placeholder);
+  const hint = document.getElementById('headerSearchSuggestionsHint');
+  if (hint) {
+    hint.textContent = runtimeT ? runtimeT('suggestHintArrows') : 'Use ↑↓ to move, Enter to open';
+  }
 }
 
 async function runDefaultSearch(query) {
@@ -3721,6 +3782,535 @@ async function runDefaultSearch(query) {
   const fallbackUrl = `https://www.google.com/search?q=${encodeURIComponent(text)}`;
   await navigateCurrentTabToUrl(fallbackUrl);
 }
+
+/* ----------------------------------------------------------------
+   SEARCH SUGGESTIONS — inline panel under the header search field
+   ----------------------------------------------------------------
+   Sources (union, de-duplicated by URL):
+     1. open tabs in the current window (type 'tab')
+     2. quick shortcuts (type 'shortcut')
+     3. saved session tabs (type 'session')
+     4. browser history (type 'history') — only when chrome.history exists
+   The panel is keyboard-navigable (ArrowUp/Down, Enter, Escape) and follows
+   the quiet visual language of the rest of the dashboard.
+   ---------------------------------------------------------------- */
+
+const SEARCH_SUGGESTION_SOURCES = ['tab', 'shortcut', 'session', 'history'];
+const SEARCH_SUGGESTIONS_MAX = 12;
+const SEARCH_HISTORY_CACHE_TTL_MS = 30000;
+const SEARCH_SUGGESTION_DEBOUNCE_MS = 120;
+
+function getSearchSuggestionsInput() {
+  return document.getElementById('headerSearchInput');
+}
+
+function getSearchSuggestionsPanel() {
+  return document.getElementById('headerSearchSuggestions');
+}
+
+function searchSuggestionsAvailable() {
+  return typeof chrome !== 'undefined' && !!chrome.history && typeof chrome.history.search === 'function';
+}
+
+function getSearchSuggestionSectionLabel(type) {
+  switch (type) {
+    case 'tab': return runtimeT ? runtimeT('suggestSectionTabs') : 'Open tabs';
+    case 'shortcut': return runtimeT ? runtimeT('suggestSectionShortcuts') : 'Quick links';
+    case 'session': return runtimeT ? runtimeT('suggestSectionSessions') : 'Saved sessions';
+    case 'history': return runtimeT ? runtimeT('suggestSectionHistory') : 'History';
+    default: return '';
+  }
+}
+
+async function loadSearchSuggestionSources() {
+  // Tabs come from the dashboard's own in-memory snapshot (already filtered to
+  // the current window and canonicalized).
+  const tabs = getRealTabs().map(tab => ({
+    id: tab.id,
+    url: tab.url,
+    title: tab.title,
+    favIconUrl: tab.favIconUrl || '',
+    windowId: tab.windowId,
+  }));
+
+  // Read shortcuts and sessions in parallel: both are independent
+  // chrome.storage calls, and running them concurrently keeps the whole
+  // suggestion refresh shorter, so fewer chrome.* calls are still queued when
+  // the user hits Enter to search.
+  const [shortcuts, sessions] = await Promise.all([
+    (async () => {
+      if (typeof globalThis.TabOutThemeControls?.getQuickShortcuts === 'function') {
+        return await globalThis.TabOutThemeControls.getQuickShortcuts();
+      }
+      return [];
+    })(),
+    (async () => {
+      if (typeof runtimeGetSavedTabSessions === 'function') {
+        return await runtimeGetSavedTabSessions();
+      }
+      return [];
+    })(),
+  ]);
+
+  return { tabs, shortcuts, sessions };
+}
+
+async function loadSearchHistoryCache() {
+  if (!searchSuggestionsAvailable()) {
+    searchSuggestionsHistoryCache = null;
+    return [];
+  }
+  const now = Date.now();
+  if (searchSuggestionsHistoryCache && now - searchSuggestionsHistoryCacheTime < SEARCH_HISTORY_CACHE_TTL_MS) {
+    return searchSuggestionsHistoryCache;
+  }
+  try {
+    // Empty text returns the most recent browsing history — exactly what a
+    // default (no-query) suggestion panel wants. Deeper filtering happens
+    // client-side against this bounded cache.
+    const items = await chrome.history.search({
+      text: '',
+      maxResults: 20,
+      startTime: 0,
+    });
+    searchSuggestionsHistoryCache = items.map(item => ({
+      url: item.url,
+      title: item.title || item.url,
+      visitCount: item.visitCount || 0,
+      lastVisitTime: item.lastVisitTime || 0,
+    }));
+    searchSuggestionsHistoryCacheTime = now;
+    return searchSuggestionsHistoryCache;
+  } catch (err) {
+    if (isExtensionContextInvalidated(err)) recoverFromInvalidatedExtensionContext();
+    console.warn('[tab-harbor] history search failed:', err);
+    searchSuggestionsHistoryCache = null;
+    return [];
+  }
+}
+
+async function refreshSearchSuggestions(force = false) {
+  const input = getSearchSuggestionsInput();
+  const panel = getSearchSuggestionsPanel();
+  if (!input || !panel) return;
+
+  // Capture the generation at start; if the user submits the search (or the
+  // page otherwise invalidates suggestions) mid-refresh, the in-flight
+  // chrome.* calls become stale and their results are discarded instead of
+  // being rendered — this keeps the suggestion refresh from contending with
+  // the navigation's chrome.* calls in the extension page's API queue.
+  const gen = searchSuggestionsGeneration;
+
+  const query = input.value || '';
+  if (query === searchSuggestionsQuery && !force) return;
+
+  // The panel only ever shows for a non-empty query: empty input means no
+  // suggestions, no matter who calls refresh (focus, tab change, debounce).
+  if (!query) {
+    closeSearchSuggestions();
+    return;
+  }
+
+  searchSuggestionsQuery = query;
+
+  const [sources, history] = await Promise.all([
+    loadSearchSuggestionSources(),
+    loadSearchHistoryCache(),
+  ]);
+  // A search was submitted (or the panel otherwise invalidated) while we were
+  // awaiting chrome.* — discard this stale refresh instead of rendering it.
+  if (gen !== searchSuggestionsGeneration) return;
+  const allRows = [
+    ...sources.tabs.map(tab => ({ type: 'tab', url: tab.url, title: tab.title || tab.url, favIconUrl: tab.favIconUrl, tabId: tab.id, windowId: tab.windowId })),
+    ...sources.shortcuts.map(shortcut => ({ type: 'shortcut', url: shortcut.url, title: shortcut.label || shortcut.url, label: shortcut.label || '', favIconUrl: shortcut.icon || '' })),
+    ...sources.sessions.map(session => ({
+      type: 'session',
+      url: session.url,
+      title: session.title || session.url,
+      label: session.label || '',
+      favIconUrl: session.favIconUrl || '',
+    })),
+    ...history.map(item => ({ type: 'history', url: item.url, title: item.title || item.url, favIconUrl: '', visitCount: item.visitCount, lastVisitTime: item.lastVisitTime })),
+  ];
+
+  let rows;
+  if (typeof globalThis.TabHarborSearchSuggestions?.filterSuggestions === 'function') {
+    rows = globalThis.TabHarborSearchSuggestions.filterSuggestions(allRows, query);
+  } else {
+    rows = allRows.slice(0, SEARCH_SUGGESTIONS_MAX);
+  }
+  searchSuggestionsRows = rows;
+
+  if (!rows.length) {
+    closeSearchSuggestions();
+    return;
+  }
+
+  openSearchSuggestions();
+  renderSearchSuggestions(rows, query);
+}
+
+function renderSearchSuggestions(rows = [], query = '') {
+  const panel = getSearchSuggestionsPanel();
+  if (!panel) return;
+
+  if (!rows.length) {
+    panel.innerHTML = '';
+    panel.hidden = true;
+    const input = getSearchSuggestionsInput();
+    if (input) input.setAttribute('aria-expanded', 'false');
+    return;
+  }
+
+  const grouped = new Map();
+  for (const row of rows) {
+    if (!grouped.has(row.type)) grouped.set(row.type, []);
+    grouped.get(row.type).push(row);
+  }
+
+  let html = '';
+  for (const type of SEARCH_SUGGESTION_SOURCES) {
+    const groupRows = grouped.get(type);
+    if (!groupRows || !groupRows.length) continue;
+    const label = getSearchSuggestionSectionLabel(type);
+    html += `<div class="header-search-suggestion-section" data-suggestion-section="${type}">`;
+    if (label) html += `<div class="header-search-suggestion-section-label">${runtimeEscapeHtml ? runtimeEscapeHtml(label) : label}</div>`;
+    groupRows.forEach(row => {
+      const safeTitle = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(row.title || row.url || '') : String(row.title || row.url || '').replace(/"/g, '&quot;');
+      const safeUrl = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(row.url || '') : String(row.url || '').replace(/"/g, '&quot;');
+      const iconData = runtimeGetIconSources ? runtimeGetIconSources(row, 16) : { sources: [] };
+      const faviconUrl = iconData.sources?.[0] || '';
+      const fallbackUrl = iconData.sources?.[1] || '';
+      const fallbackLabel = runtimeGetFallbackLabel ? runtimeGetFallbackLabel(row.title || row.url, iconData.hostname) : '';
+      const safeFallbackUrl = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(fallbackUrl) : String(fallbackUrl).replace(/"/g, '&quot;');
+      html += `<div class="header-search-suggestion-row" role="option" data-suggestion-type="${row.type}" data-suggestion-url="${safeUrl}" data-suggestion-tab-id="${row.tabId != null ? row.tabId : ''}" aria-selected="false" tabindex="-1">
+        <span class="header-search-suggestion-icon">${faviconUrl ? `<img src="${faviconUrl}" alt="" data-fallback-src="${safeFallbackUrl}">` : ''}</span>
+        <span class="header-search-suggestion-title">${runtimeEscapeHtml ? runtimeEscapeHtml(row.title || row.url) : String(row.title || row.url)}</span>
+        <span class="header-search-suggestion-url">${runtimeEscapeHtml ? runtimeEscapeHtml(row.url || '') : String(row.url || '')}</span>
+      </div>`;
+    });
+    html += '</div>';
+  }
+
+  panel.innerHTML = html;
+  panel.hidden = false;
+  const input = getSearchSuggestionsInput();
+  if (input) input.setAttribute('aria-expanded', 'true');
+  setupSearchSuggestionImageFallbacks(panel);
+}
+
+function setupSearchSuggestionImageFallbacks(panel) {
+  panel.querySelectorAll('img[data-fallback-src]').forEach(img => {
+    if (img.dataset.errorHandlerAttached) return;
+    img.addEventListener('error', function handleSuggestionIconError() {
+      const fallbackSrc = this.dataset.fallbackSrc;
+      if (fallbackSrc && this.dataset.fallbackApplied !== 'true') {
+        this.dataset.fallbackApplied = 'true';
+        this.src = fallbackSrc;
+        return;
+      }
+      this.style.display = 'none';
+    });
+    img.dataset.errorHandlerAttached = 'true';
+  });
+}
+
+function openSearchSuggestions() {
+  const panel = getSearchSuggestionsPanel();
+  if (!panel) return;
+  searchSuggestionsOpen = true;
+  searchSuggestionsSelectedIndex = -1;
+  panel.hidden = false;
+}
+
+function closeSearchSuggestions({ restoreFocus = false } = {}) {
+  const panel = getSearchSuggestionsPanel();
+  if (panel) {
+    panel.hidden = true;
+    panel.innerHTML = '';
+  }
+  const input = getSearchSuggestionsInput();
+  if (input) input.setAttribute('aria-expanded', 'false');
+  searchSuggestionsOpen = false;
+  searchSuggestionsSelectedIndex = -1;
+  searchSuggestionsRows = [];
+  searchSuggestionsQuery = '';
+  if (searchSuggestionsDebounceTimer) {
+    clearTimeout(searchSuggestionsDebounceTimer);
+    searchSuggestionsDebounceTimer = null;
+  }
+  // Invalidate any in-flight suggestion refresh so its pending chrome.* calls
+  // are discarded (their results would be stale anyway) and do not contend
+  // with the navigation's chrome.* calls in the extension page API queue.
+  searchSuggestionsGeneration += 1;
+  if (restoreFocus && input) input.focus({ preventScroll: true });
+}
+
+function selectSearchSuggestionIndex(nextIndex) {
+  const rows = Array.from(document.querySelectorAll('.header-search-suggestion-row'));
+  if (!rows.length) return;
+  const count = rows.length;
+  if (nextIndex < 0) nextIndex = count - 1;
+  if (nextIndex >= count) nextIndex = 0;
+  searchSuggestionsSelectedIndex = nextIndex;
+
+  rows.forEach((row, index) => {
+    const selected = index === nextIndex;
+    row.classList.toggle('is-selected', selected);
+    row.setAttribute('aria-selected', String(selected));
+    if (selected) {
+      row.scrollIntoView({ block: 'nearest' });
+    }
+  });
+}
+
+async function activateSearchSuggestion(row, { openInNewTab = false } = {}) {
+  if (!row) return;
+  const type = row.dataset.suggestionType || '';
+  const url = row.dataset.suggestionUrl || '';
+  const tabId = row.dataset.suggestionTabId || '';
+
+  if (type === 'tab' && tabId && !openInNewTab) {
+    const numericTabId = getTabIdValue(tabId);
+    if (numericTabId != null) {
+      closeSearchSuggestions();
+      try {
+        const targetTab = await chrome.tabs.get(numericTabId);
+        if (targetTab?.id != null) {
+          await chrome.tabs.update(targetTab.id, { active: true });
+          await chrome.windows.update(targetTab.windowId, { focused: true });
+          if (typeof syncChromeTabGroupExpansionForTab === 'function') {
+            await syncChromeTabGroupExpansionForTab(targetTab);
+          }
+          return;
+        }
+      } catch { /* fall through to URL open */ }
+    }
+  }
+
+  if (!url) return;
+  closeSearchSuggestions();
+  if (openInNewTab) {
+    await chrome.tabs.create({ url, active: false }).catch(err => {
+      if (isExtensionContextInvalidated(err)) recoverFromInvalidatedExtensionContext();
+      console.warn('[tab-harbor] failed to open suggestion in new tab:', err);
+    });
+    return;
+  }
+  await openOrFocusUrl(url);
+}
+
+async function handleSearchSuggestionKeydown(e) {
+  const input = getSearchSuggestionsInput();
+  if (!input || document.activeElement !== input) return;
+
+  // An Enter while the input method editor (IME) is composing a candidate —
+  // e.g. a Chinese/Japanese input method where Enter confirms the chosen
+  // word — must NOT submit the search. Block the default submit and return;
+  // the search runs only on a "real" Enter outside composition.
+  if (e.key === 'Enter' && (searchSuggestionsIsComposing || e.isComposing)) {
+    e.preventDefault();
+    return;
+  }
+
+  // Enter always starts the search here (one event-loop turn earlier than the
+  // form submit), whether or not the suggestion panel is open. The panel is
+  // only relevant for picking a highlighted row.
+  if (e.key === 'Enter') {
+    if (searchSuggestionsOpen) {
+      const selected = document.querySelector('.header-search-suggestion-row.is-selected');
+      if (selected) {
+        e.preventDefault();
+        await activateSearchSuggestion(selected, { openInNewTab: e.ctrlKey || e.metaKey });
+        return;
+      }
+    }
+    // Nothing selected: start the search immediately from the keydown so the
+    // navigation begins a full event-loop turn earlier than waiting for the
+    // form submit. Prevent the submit listener from running it a second time.
+    e.preventDefault();
+    const query = input.value || '';
+    closeSearchSuggestions();
+    // Stop any pending self-focus retries before we navigate away — a timer
+    // firing during the teardown adds nothing and can contend with the
+    // navigation's chrome.* calls.
+    cancelSearchFocusRetryIfInteracting();
+    searchSubmitInFlight = true;
+    try {
+      await runDefaultSearch(query);
+    } finally {
+      // preventDefault on keydown stops the form submit, so the flag is never
+      // consumed by the submit listener; clear it here (a navigation usually
+      // unloads the page anyway, but an empty query must not leave it stuck).
+      searchSubmitInFlight = false;
+    }
+    return;
+  }
+
+  if (!searchSuggestionsOpen) return;
+
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    selectSearchSuggestionIndex(searchSuggestionsSelectedIndex + 1);
+    return;
+  }
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    selectSearchSuggestionIndex(searchSuggestionsSelectedIndex - 1);
+    return;
+  }
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeSearchSuggestions({ restoreFocus: true });
+    return;
+  }
+}
+
+function shouldAutoFocusSearchField() {
+  const active = document.activeElement;
+  if (!active) return true;
+  if (active.id === 'headerSearchInput') return false;
+  // Never steal focus from another form field the user may be typing in.
+  const tag = active.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return false;
+  if (active.isContentEditable) return false;
+  return true;
+}
+
+// Retry schedule for claiming the search-field focus on new-tab load.
+// Chrome focuses the omnibox after a fresh newtab (Ctrl+T) renders, which can
+// override an earlier focus() call. Refresh-on-the-same-tab usually keeps the
+// focus, which is why Ctrl+T behaves differently. We retry across a wide
+// window (up to ~5s) with increasing delays, and stop as soon as the input
+// holds focus or the user interacts with the page.
+const SEARCH_FOCUS_RETRY_DELAYS_MS = [150, 400, 900, 1800, 3200, 5000];
+let searchFocusRetryTimer = null;
+let searchFocusRetryAttempt = 0;
+
+function focusSearchFieldOnForeground() {
+  if (!shouldAutoFocusSearchField()) return;
+  const input = getSearchSuggestionsInput();
+  if (!input) return;
+  // Avoid re-focusing in the same tick as a user click that just landed on
+  // another control (focusin fires after pointerdown on some platforms).
+  if (Date.now() < searchSuggestionsFocusGuardUntil) return;
+  input.focus({ preventScroll: true });
+  // Verify the focus actually landed; if the browser grabbed it back (e.g. the
+  // omnibox on a fresh newtab), retry on a short schedule.
+  scheduleSearchFocusVerification();
+}
+
+function scheduleSearchFocusVerification() {
+  if (searchFocusRetryTimer) clearTimeout(searchFocusRetryTimer);
+  searchFocusRetryTimer = null;
+  searchFocusRetryAttempt = 0;
+  const verify = () => {
+    const input = getSearchSuggestionsInput();
+    // The user took over (clicked elsewhere / typed) — stop retrying.
+    if (!input || document.activeElement === input) return;
+    if (!shouldAutoFocusSearchField()) return;
+    if (Date.now() < searchSuggestionsFocusGuardUntil) return;
+    if (searchFocusRetryAttempt >= SEARCH_FOCUS_RETRY_DELAYS_MS.length) return;
+    const delay = SEARCH_FOCUS_RETRY_DELAYS_MS[searchFocusRetryAttempt];
+    searchFocusRetryAttempt += 1;
+    searchFocusRetryTimer = setTimeout(() => {
+      searchFocusRetryTimer = null;
+      input.focus({ preventScroll: true });
+      verify();
+    }, delay);
+  };
+  verify();
+}
+
+// A user interaction with the page (focus landed back on a page control) means
+// the user is using the workspace, not aiming at self-focus; stop retrying so
+// we never yank focus mid-session.
+function cancelSearchFocusRetryIfInteracting() {
+  if (searchFocusRetryTimer) clearTimeout(searchFocusRetryTimer);
+  searchFocusRetryTimer = null;
+  searchFocusRetryAttempt = SEARCH_FOCUS_RETRY_DELAYS_MS.length; // exhausted
+}
+
+/**
+ * Setup search-field focus + suggestion panel wiring. Called once from
+ * initializeDashboardRuntime so all listeners attach after the DOM is ready.
+ */
+function setupSearchSuggestions() {
+  const input = getSearchSuggestionsInput();
+  const panel = getSearchSuggestionsPanel();
+  if (!input || !panel) return;
+
+  const onFocus = () => {
+    // Focus alone must NOT open the panel — suggestions appear only once the
+    // user starts typing (see the input listener below).
+    if (getSearchSuggestionsInput()?.value) {
+      void refreshSearchSuggestions(true);
+    }
+  };
+  input.addEventListener('focus', onFocus);
+
+  // IME composition tracking: Enter inside composition confirms the selected
+  // candidate (e.g. Chinese input methods) and must not submit the search.
+  input.addEventListener('compositionstart', () => {
+    searchSuggestionsIsComposing = true;
+  });
+  input.addEventListener('compositionend', () => {
+    searchSuggestionsIsComposing = false;
+  });
+
+  input.addEventListener('input', () => {
+    // Only a non-empty query shows suggestions; clearing the field hides them.
+    const query = input.value || '';
+    if (!query) {
+      closeSearchSuggestions();
+      return;
+    }
+    if (searchSuggestionsDebounceTimer) clearTimeout(searchSuggestionsDebounceTimer);
+    searchSuggestionsDebounceTimer = setTimeout(() => {
+      searchSuggestionsDebounceTimer = null;
+      void refreshSearchSuggestions(true);
+    }, SEARCH_SUGGESTION_DEBOUNCE_MS);
+  });
+
+  input.addEventListener('keydown', (e) => {
+    void handleSearchSuggestionKeydown(e);
+  });
+
+  // Clicking a suggestion row activates it (Ctrl/Cmd opens in new tab).
+  panel.addEventListener('mousedown', (e) => {
+    // Prevent the input from losing focus before the click handler runs.
+    e.preventDefault();
+  });
+  panel.addEventListener('click', async (e) => {
+    const row = e.target.closest('.header-search-suggestion-row');
+    if (!row) return;
+    e.preventDefault();
+    e.stopPropagation();
+    await activateSearchSuggestion(row, { openInNewTab: e.ctrlKey || e.metaKey });
+  });
+
+  // Close when the user clicks anywhere outside the search form.
+  document.addEventListener('pointerdown', (e) => {
+    if (!searchSuggestionsOpen) return;
+    if (e.target.closest('#headerSearchForm')) return;
+    closeSearchSuggestions();
+  });
+
+  // The user clicked into the page: they are using the workspace, not waiting
+  // for the search field to claim focus. Stop the self-focus retry loop.
+  document.addEventListener('pointerdown', () => {
+    cancelSearchFocusRetryIfInteracting();
+  }, { capture: true, passive: true });
+
+  // Refresh the panel when tabs change (openTabs re-render) so open-tab
+  // suggestions stay current while the panel is open.
+  if (typeof window.__tabHarborSuggestionsRefresh === 'undefined') {
+    window.__tabHarborSuggestionsRefresh = () => {
+      if (searchSuggestionsOpen) void refreshSearchSuggestions(true);
+    };
+  }
+}
+
 
 /**
  * groupTabsWithStaleRetry(tabIds)
@@ -3801,13 +4391,9 @@ async function ungroupTabsWithStaleRetry(tabIds) {
  * closed keeps it instead of closing the window.
  */
 async function closeTabOutDupes() {
-  const newtabUrl = window.location.href;
-
   const allTabs = await queryTabsForDashboardWindow();
   const currentWindow = await chrome.windows.getCurrent();
-  const tabOutTabs = allTabs.filter(t =>
-    t.url === newtabUrl || t.url === 'chrome://newtab/'
-  );
+  const tabOutTabs = allTabs.filter(t => isTabHarborNewTabUrl(t.url));
 
   if (tabOutTabs.length <= 1) return;
 
@@ -5067,8 +5653,7 @@ async function collapseChromeGroupsForCurrentTabHarborTab() {
 
   const currentTab = await resolveCurrentDashboardTab();
 
-  const newtabUrl = window.location.href;
-  const isTabHarborTab = currentTab?.url === newtabUrl || currentTab?.url === 'chrome://newtab/';
+  const isTabHarborTab = isTabHarborNewTabUrl(currentTab?.url);
   if (!currentTab?.windowId || !isTabHarborTab) return;
   await collapseChromeTabGroupsInWindow(currentTab.windowId);
 }
@@ -6940,8 +7525,24 @@ document.addEventListener('submit', async (e) => {
   if (e.target.id !== 'headerSearchForm') return;
 
   e.preventDefault();
+  // An IME-confirmation Enter (composition active) must not submit a search.
+  // The keydown handler blocks the default submit, but guard here too in case
+  // a browser still dispatches submit during composition.
+  if (searchSuggestionsIsComposing || e.isComposing) {
+    searchSubmitInFlight = false;
+    return;
+  }
+  // Enter was already handled by the input's keydown listener (which starts
+  // the navigation one event-loop turn earlier). A submit still fires as the
+  // form's default action; skip the duplicate run.
+  if (searchSubmitInFlight) {
+    searchSubmitInFlight = false;
+    return;
+  }
   const input = document.getElementById('headerSearchInput');
   const query = input?.value || '';
+  closeSearchSuggestions();
+  cancelSearchFocusRetryIfInteracting();
   await runDefaultSearch(query);
 });
 
@@ -7103,6 +7704,18 @@ async function initializeDashboardRuntime() {
   await collapseChromeGroupsForCurrentTabHarborTab();
   updateBackToTopVisibility();
 
+  // Search-field auto-focus + inline suggestions.
+  setupSearchSuggestions();
+  focusSearchFieldOnForeground();
+  // Chrome focuses the omnibox shortly after a newtab page finishes loading,
+  // which can override the focus above. Re-claim the search field once the
+  // window has fully loaded.
+  if (document.readyState === 'complete') {
+    scheduleSearchFocusVerification();
+  } else {
+    window.addEventListener('load', scheduleSearchFocusVerification, { once: true });
+  }
+
   // Listen for tab change notifications from background script
   setupTabChangeListener();
 }
@@ -7167,6 +7780,9 @@ function setupTabChangeListener() {
           if (DEBUG) console.log('[tab-harbor] Refreshing dashboard...');
           await renderDashboard();
           updateBackToTopVisibility();
+          if (typeof window.__tabHarborSuggestionsRefresh === 'function') {
+            window.__tabHarborSuggestionsRefresh();
+          }
           if (DEBUG) console.log('[tab-harbor] Dashboard refreshed successfully');
         } catch (err) {
           console.warn('[tab-harbor] Failed to refresh dashboard:', err);
@@ -7188,10 +7804,12 @@ function mountDashboardRuntime() {
     });
     window.addEventListener('focus', () => {
       void collapseChromeGroupsForCurrentTabHarborTab();
+      focusSearchFieldOnForeground();
     });
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
         void collapseChromeGroupsForCurrentTabHarborTab();
+        focusSearchFieldOnForeground();
       }
     });
     window.__tabHarborRuntimeMounted = true;

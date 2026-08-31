@@ -72,6 +72,11 @@ Used to store user-created and user-selected local state, including:
 Used when the user types into the built-in search field and explicitly submits a search.  
 This permission allows Tab Harbor to send the query through the browser’s default search engine in the current tab.
 
+### `history`
+
+Used only while the user is typing in the built-in search field and the inline suggestion panel is shown.  
+Tab Harbor reads a bounded list of recently visited pages to suggest them as destinations, alongside open tabs, quick links, and saved sessions. History is read on demand while the user types, filtered in the page, and never stored, exported, or sent anywhere by Tab Harbor.
+
 ### `clipboardRead`
 
 Used only when the user explicitly pastes an image or SVG into the shortcut editor to create a custom shortcut icon.  

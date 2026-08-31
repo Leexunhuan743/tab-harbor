@@ -7,6 +7,32 @@ const assert = require('node:assert/strict');
 let removedTabIds = [];
 let storageData = {};
 
+// Controlled timers: background.js schedules a one-shot post-grace check for
+// every created tab. Real setTimeout would keep the test process alive for
+// NEW_TAB_GRACE_PERIOD_MS; record callbacks instead so tests can fire them
+// deterministically (or leave them pending).
+const pendingTimers = new Map(); // id -> { fn, delay }
+let nextTimerId = 1;
+const realSetTimeout = global.setTimeout;
+const realClearTimeout = global.clearTimeout;
+global.setTimeout = (fn, delay) => {
+  const id = nextTimerId++;
+  pendingTimers.set(id, { fn, delay });
+  return id;
+};
+global.clearTimeout = (id) => {
+  pendingTimers.delete(id);
+};
+// Some tests still need a real macrotask boundary (e.g. awaiting an
+// un-awaited cleanup pass). The controlled timer above only records
+// callbacks, so a real delay must bypass it.
+const scheduleRealMacrotask = () => new Promise(resolve => { realSetTimeout(resolve, 0); });
+function firePendingTimers() {
+  const snapshot = [...pendingTimers.values()];
+  pendingTimers.clear();
+  for (const { fn } of snapshot) fn();
+}
+
 globalThis.chrome = {
   runtime: {
     id: 'test-extension-id',
@@ -35,7 +61,7 @@ globalThis.chrome = {
     remove: async ids => { removedTabIds = removedTabIds.concat(ids); },
     onCreated: { addListener: (fn) => { globalThis.__tabHarborOnCreated = fn; } },
     onRemoved: { addListener: (fn) => { globalThis.__tabHarborOnRemoved = fn; } },
-    onUpdated: { addListener: () => {} },
+    onUpdated: { addListener: (fn) => { globalThis.__tabHarborOnUpdated = fn; } },
     onReplaced: { addListener: (fn) => { globalThis.__tabHarborOnReplaced = fn; } },
   },
   action: {
@@ -65,6 +91,13 @@ test('isNewTabBlank matches chrome://newtab/', () => {
 
 test('isNewTabBlank matches extension index.html', () => {
   assert.equal(isNewTabBlank({ url: EXT_URL }, EXT_URL), true);
+});
+
+test('isNewTabBlank matches extension page with the focus-redirect query', () => {
+  // focus-redirect.js appends ?focus=1 to the new-tab URL; the blank-tab
+  // cleanup must still recognize the page.
+  assert.equal(isNewTabBlank({ url: `${EXT_URL}?focus=1` }, EXT_URL), true);
+  assert.equal(isNewTabBlank({ url: `${ROOT_MANIFEST_EXT_URL}?focus=1` }, [EXT_URL, ROOT_MANIFEST_EXT_URL]), true);
 });
 
 test('isNewTabBlank matches extension/index.html from root manifest entry', () => {
@@ -238,11 +271,13 @@ test('closeDuplicateNewTabs never closes discarded (sleeping) tabs', async () =>
   assert.deepEqual(removedTabIds, []);
 });
 
-test('closeDuplicateNewTabs exempts freshly-created tabs within the grace period', async () => {
+test('closeDuplicateNewTabs closes an explicit new-tab page beside an older blank even inside the grace window', async () => {
   storageData = { themePreferences: { closeDuplicateNewTabsEnabled: true } };
   removedTabIds = [];
-  // Simulate the background's own onCreated bookkeeping: a restore batch just
-  // created tabs 2 and 3 which look like blank new-tab pages so far.
+  // An explicitly-committed new-tab page is a real new tab: it is not exempt
+  // from cleanup the way an uncommitted (empty-url) restore tab is. When the
+  // batch registers the new tabs through onCreated and one of them already
+  // committed chrome://newtab/, the duplicate blank is closed immediately.
   if (typeof globalThis.__tabHarborOnCreated === 'function') {
     globalThis.__tabHarborOnCreated({ id: 2, url: 'chrome://newtab/' });
     globalThis.__tabHarborOnCreated({ id: 3, url: 'chrome://newtab/' });
@@ -253,23 +288,25 @@ test('closeDuplicateNewTabs exempts freshly-created tabs within the grace period
     { id: 3, url: 'chrome://newtab/', active: false },
   ];
   await closeDuplicateNewTabs();
-  // Freshly-created tabs are exempt (they may still be committing their
-  // navigation); only the genuine blank tab 1 remains and it is the active
-  // one, so nothing is closed.
-  assert.deepEqual(removedTabIds, []);
+  // The onCreated listener armed its own un-awaited cleanup pass; drain the
+  // microtask queue so any queued re-entrant pass settles before asserting.
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  // chrome.tabs.remove is idempotent for already-closed ids, so a re-entrant
+  // pass may re-issue the same removals; assert the set of closed tabs.
+  assert.deepEqual([...new Set(removedTabIds)], [2, 3]);
 });
 
 test('recently-created tab state is released when a tab is removed or replaced', () => {
   const urls = [EXT_URL, ROOT_MANIFEST_EXT_URL];
-  globalThis.__tabHarborOnCreated({ id: 44, url: 'chrome://newtab/' });
-  assert.equal(isNewTabBlank({ id: 44, url: 'chrome://newtab/' }, urls), false, 'a live freshly-created tab stays in the grace period');
+  globalThis.__tabHarborOnCreated({ id: 44, url: '' });
+  assert.equal(isNewTabBlank({ id: 44, url: '' }, urls), false, 'an uncommitted tab with no pendingUrl is never blank, so onRemoved does not need a grace record');
   globalThis.__tabHarborOnRemoved(44, { windowId: 1, isWindowClosing: false });
-  assert.equal(isNewTabBlank({ id: 44, url: 'chrome://newtab/' }, urls), true, 'a removed tab no longer owns a grace record');
+  assert.equal(isNewTabBlank({ id: 44, url: '' }, urls), false, 'removal does not change an uncommitted tab: still never blank');
 
-  globalThis.__tabHarborOnCreated({ id: 45, url: 'chrome://newtab/' });
-  assert.equal(isNewTabBlank({ id: 45, url: 'chrome://newtab/' }, urls), false);
+  globalThis.__tabHarborOnCreated({ id: 45, url: '' });
+  assert.equal(isNewTabBlank({ id: 45, url: '' }, urls), false);
   globalThis.__tabHarborOnReplaced(46, 45);
-  assert.equal(isNewTabBlank({ id: 45, url: 'chrome://newtab/' }, urls), true, 'the removed side of onReplaced is released');
+  assert.equal(isNewTabBlank({ id: 45, url: '' }, urls), false, 'replacement does not change an uncommitted tab: still never blank');
 });
 
 test('closeDuplicateNewTabs never closes a tab Chrome has not described yet', async () => {
@@ -316,29 +353,118 @@ test('closeDuplicateNewTabs keeps one blank tab in every window', async () => {
   assert.deepEqual(removedTabIds, [11], 'the second window keeps its only blank tab instead of being closed');
 });
 
-test('duplicate blank tab created beside another blank tab is deduped once the grace expires (F3)', async () => {
+test('an uncommitted freshly-created tab is never closed even after the grace expires (F2)', async () => {
   storageData = { themePreferences: { closeDuplicateNewTabsEnabled: true } };
   removedTabIds = [];
   globalThis.chrome.tabs.query = async () => [
-    // Pre-existing genuine blank tab plus a freshly created duplicate; id 4
-    // is a restore-created discarded tab that must stay protected even after
-    // the grace expires.
+    // A single genuine blank tab: nothing to dedupe. The point of this test is
+    // that the uncommitted restore tab (id 2, empty url) is never counted as a
+    // blank — so it cannot turn a single-blank window into a "duplicate" and
+    // cause the genuine blank to be closed. id 4 is a discarded restore tab.
     { id: 1, url: 'chrome://newtab/', active: false },
-    { id: 2, url: 'chrome://newtab/', active: true },
+    { id: 2, url: '', active: true },
     { id: 4, url: '', discarded: true, active: false },
   ];
   // The onCreated listener arms the grace and fires its OWN un-awaited
   // cleanup pass. Drain it with a macrotask boundary before asserting, so no
   // in-flight pass can straddle the later reconciliation.
-  globalThis.__tabHarborOnCreated({ id: 2, url: 'chrome://newtab/' });
-  await new Promise(resolve => setTimeout(resolve, 0));
+  globalThis.__tabHarborOnCreated({ id: 2, url: '' });
+  await scheduleRealMacrotask();
   await closeDuplicateNewTabs();
-  // Tab 2 is shielded by the grace, so nothing can be closed yet.
+  // Tab 2 is an uncommitted restore tab: never treated as blank, so the
+  // window holds exactly one blank tab (id 1) and nothing closes.
   assert.deepEqual(removedTabIds, []);
   // Settle the armed post-grace reconciliation (test seam): registry is
   // cleared to simulate the grace having elapsed, then cleanup re-runs.
   await globalThis.TabHarborBackground.runPostGraceReconcileForTest();
-  // The grace has expired: only the non-active genuine blank (id 1) closes;
-  // the active duplicate (id 2) and the discarded restore tab (id 4) remain.
-  assert.deepEqual(removedTabIds, [1]);
+  // Still the only blank tab; the uncommitted restore tab and the discarded
+  // tab never count as blanks, so nothing is closed.
+  assert.deepEqual(removedTabIds, []);
+});
+
+// ─── Grace-expiry re-check + onUpdated/onRemoved cleanup ─────────────────────
+
+test('Ctrl+T new-tab page with an explicit URL closes the older duplicate immediately', async () => {
+  storageData = { themePreferences: { closeDuplicateNewTabsEnabled: true } };
+  removedTabIds = [];
+  // Existing Tab Harbor page in another tab; user Ctrl+T's a new one on top.
+  globalThis.chrome.tabs.query = async () => [
+    { id: 1, url: EXT_URL, active: false },
+    { id: 2, url: 'chrome://newtab/', active: true }, // fresh, in grace
+  ];
+  // Simulate the onCreated hook firing for the new tab (records grace start +
+  // schedules the expiry check).
+  if (typeof globalThis.__tabHarborOnCreated === 'function') {
+    globalThis.__tabHarborOnCreated({ id: 2, url: '' });
+  }
+  // A Ctrl+T'd new-tab page with an explicit new-tab URL is not exempt from
+  // cleanup: the duplicate is closed immediately, not after the grace window.
+  globalThis.chrome.tabs.query = async () => [
+    { id: 1, url: EXT_URL, active: false },
+    { id: 2, url: 'chrome://newtab/', active: true },
+  ];
+  // onCreated already triggered an async check; let it settle.
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  // Drain any pending grace-expiry timer so it cannot leak into later tests.
+  firePendingTimers();
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  // The active new tab (2) is kept; the older duplicate page (1) closes.
+  // chrome.tabs.remove is idempotent for already-closed ids, so repeated
+  // removals of the same tab are harmless; assert the set of closed tabs.
+  assert.deepEqual([...new Set(removedTabIds)], [1]);
+});
+
+test('onRemoved clears a created tab from bookkeeping so it is not double-checked', async () => {
+  storageData = { themePreferences: { closeDuplicateNewTabsEnabled: true } };
+  removedTabIds = [];
+  if (typeof globalThis.__tabHarborOnCreated === 'function') {
+    // Simulate a tab that is created then quickly closed; firing its newly
+    // pending grace expiry must not throw or close anything.
+    globalThis.__tabHarborOnCreated({ id: 9, url: '' });
+  }
+  if (typeof globalThis.__tabHarborOnRemoved === 'function') {
+    globalThis.__tabHarborOnRemoved(9);
+  }
+  firePendingTimers();
+  globalThis.chrome.tabs.query = async () => [
+    { id: 1, url: 'chrome://newtab/', active: true },
+  ];
+  await closeDuplicateNewTabs();
+  assert.deepEqual(removedTabIds, []);
+});
+
+test('onUpdated with a committed new-tab URL triggers the duplicate check', async () => {
+  storageData = { themePreferences: { closeDuplicateNewTabsEnabled: true } };
+  removedTabIds = [];
+  // Scenario: one Tab Harbor page exists; a new tab is created but its URL is
+  // still empty (uncommitted). At onCreated the cleanup sees only the old page
+  // (single blank) and does nothing.
+  globalThis.chrome.tabs.query = async () => [
+    { id: 1, url: EXT_URL, active: true },
+    { id: 2, url: '', active: false },
+  ];
+  if (typeof globalThis.__tabHarborOnCreated === 'function') {
+    globalThis.__tabHarborOnCreated({ id: 2, url: '' });
+  }
+  await closeDuplicateNewTabs();
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  // The uncommitted tab 2 (empty url) is still in its grace window → the
+  // cleanup keeps the only committed blank page and closes nothing.
+  assert.deepEqual(removedTabIds, []);
+  // Now the tab commits an explicit new-tab URL: it is a real new tab, so the
+  // onUpdated hook re-runs the cleanup, which closes the older duplicate.
+  globalThis.chrome.tabs.query = async () => [
+    { id: 1, url: EXT_URL, active: false },
+    { id: 2, url: 'chrome://newtab/', active: true },
+  ];
+  if (typeof globalThis.__tabHarborOnUpdated === 'function') {
+    globalThis.__tabHarborOnUpdated(2, { url: 'chrome://newtab/' });
+  }
+  // Let the async check settle.
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  // Drain any pending grace-expiry timer so it cannot leak into later tests.
+  firePendingTimers();
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  // The active new tab (2) is kept; the older duplicate page (1) closes.
+  assert.deepEqual([...new Set(removedTabIds)], [1]);
 });

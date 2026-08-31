@@ -3,7 +3,7 @@
   "name": "Tab Harbor",
   "version": "1.1.2",
   "description": "A new tab dashboard for organizing open tabs, quick links, todos, and saved tab sessions in one calm workspace.",
-  "permissions": ["tabs", "storage", "search", "clipboardRead", "tabGroups", "favicon"],
+  "permissions": ["tabs", "storage", "search", "history", "clipboardRead", "tabGroups", "favicon"],
   "chrome_url_overrides": { "newtab": "extension/index.html" },
   "background": { "service_worker": "extension/background.js" },
   "action": {
