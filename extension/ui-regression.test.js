@@ -392,7 +392,11 @@ test('background keeps the toolbar badge empty', () => {
 });
 
 test('background clears replaced-tab state and notifies pages (stale chip root cause)', () => {
-  assert.match(backgroundJs, /chrome\.tabs\.onReplaced\.addListener\(\(addedTabId, removedTabId\) => \{\s*createdRecentlyAt\.delete\(removedTabId\);\s*updateBadge\(\);\s*notifyTabHarborPages\(\{\s*source:\s*"tabs\.onReplaced",\s*triggerTabId:\s*addedTabId,\s*replacedTabId:\s*removedTabId,\s*\}\)/);
+  // The onReplaced listener releases both the created-recently record and any
+  // pending grace-expiry timer for the removed tab, then broadcasts to pages.
+  // clearGraceExpiryCheck was added by the merge resolution; the assertion must
+  // tolerate it between the record delete and the badge update.
+  assert.match(backgroundJs, /chrome\.tabs\.onReplaced\.addListener\(\(addedTabId, removedTabId\) => \{\s*createdRecentlyAt\.delete\(removedTabId\);\s*(?:clearGraceExpiryCheck\(removedTabId\);\s*)?updateBadge\(\);\s*notifyTabHarborPages\(\{\s*source:\s*"tabs\.onReplaced",\s*triggerTabId:\s*addedTabId,\s*replacedTabId:\s*removedTabId,\s*\}\)/);
 });
 
 test('manifest keeps only permissions required by the shipped runtime', () => {

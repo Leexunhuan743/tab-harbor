@@ -174,6 +174,17 @@ async function closeDuplicateNewTabs() {
       blankTabsByWindow.get(windowKey).push(tab);
     }
 
+    // Match the dashboard by its normalized URL (same as isNewTabBlank), so a
+    // real dashboard tab — whose URL always carries the ?focus=1 query added by
+    // focus-redirect.js — is recognized and preserved even though the raw URL
+    // is not in newTabUrls. Without this, a non-active dashboard next to a
+    // genuinely blank new-tab page could be closed in favor of the blank.
+    const normalizedKnown = new Set(
+      [...newTabUrls].map((u) => normalizeNewTabUrl(u)),
+    );
+    const isDashboardTab = (tab) =>
+      normalizedKnown.has(normalizeNewTabUrl(String(tab.url || "")));
+
     const toClose = [];
     for (const tabsInWindow of blankTabsByWindow.values()) {
       if (tabsInWindow.length <= 1) continue;
@@ -182,7 +193,7 @@ async function closeDuplicateNewTabs() {
       // one, so the fallback below can never close the dashboard itself in
       // favor of a genuinely blank new-tab page.
       const toKeep = activeTab
-        || tabsInWindow.find((tab) => newTabUrls.has(String(tab.url || "")))
+        || tabsInWindow.find(isDashboardTab)
         || tabsInWindow.reduce((a, b) => (a.id > b.id ? a : b));
       for (const tab of tabsInWindow) {
         if (tab.id !== toKeep.id) toClose.push(tab.id);

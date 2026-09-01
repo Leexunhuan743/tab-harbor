@@ -1293,6 +1293,7 @@ test('a failed sleep refresh cannot prune manual membership or overwrite a newer
   const globalNames = [
     'chrome',
     'window',
+    'isTabHarborNewTabUrl',
     'getDashboardWindowIdForOpenTabs',
     'runtimeParseSuspendedTabUrl',
     'runtimeGetCanonicalTabUrl',
@@ -1329,6 +1330,14 @@ test('a failed sleep refresh cannot prune manual membership or overwrite a newer
   let readStarted;
 
   globalThis.window = { location: { href: 'chrome-extension://test/newtab.html' } };
+  // The merged fetchOpenTabs classifies new-tab URLs via this module-scope
+  // helper; the extracted Function body references it as a free variable, so
+  // the test must provide it on globalThis the same way it provides the other
+  // runtime helpers below.
+  globalThis.isTabHarborNewTabUrl = url => {
+    const raw = String(url || '');
+    return raw === 'chrome://newtab/' || raw === 'chrome-extension://test/newtab.html';
+  };
   globalThis.getDashboardWindowIdForOpenTabs = async () => 7;
   globalThis.runtimeParseSuspendedTabUrl = () => ({ isSuspended: false, originalUrl: '', title: '' });
   globalThis.runtimeGetCanonicalTabUrl = url => url;
