@@ -636,6 +636,12 @@ test('theme menu styles and custom background layer are defined', () => {
   assert.match(html, /<script src="focus-redirect\.js"><\/script>[\s\S]*<link rel="preconnect"/);
   assert.match(html, /id="headerSearchInput"[\s\S]*autofocus>/);
   assert.match(runtimeJs, /function isTabHarborNewTabUrl\(/);
+  // The duplicate count and close-extras banner must recognize the new-tab URL
+  // of every supported browser (Chrome and Edge), or tabs keep their native
+  // new-tab URL when the auto-focus redirect is disabled and become invisible
+  // to the dedup count.
+  assert.match(runtimeJs, /url === 'chrome:\/\/newtab\/' \|\| url === 'edge:\/\/newtab\/'/);
+  assert.match(backgroundJs, /url === "edge:\/\/newtab\/"/);
   assert.match(runtimeJs, /function normalizeNewTabUrlForComparison\(/);
   assert.match(css, /\.header-search-suggestions\s*\{/);
   assert.match(css, /\.header-search-suggestion-row\s*\{/);
@@ -649,8 +655,8 @@ test('theme menu styles and custom background layer are defined', () => {
   assert.match(css, /\.group-nav-button\s*\{[\s\S]*width:\s*40px;[\s\S]*height:\s*40px;/);
   assert.match(css, /\.group-nav-button::after\s*\{[\s\S]*background:\s*var\(--tooltip-surface\);[\s\S]*color:\s*var\(--tooltip-text\);[\s\S]*border:\s*1px solid var\(--tooltip-border\);/);
   assert.match(css, /\.tab-cleanup-banner\s*\{[\s\S]*var\(--theme-accent-soft\)[\s\S]*border:\s*1px solid var\(--theme-accent-muted\);/);
-  assert.match(css, /\.tab-cleanup-icon svg\s*\{[\s\S]*color:\s*var\(--theme-accent-strong\);/);
-  assert.match(css, /\.tab-cleanup-btn\s*\{[\s\S]*background:\s*var\(--banner-action-bg\);[\s\S]*color:\s*var\(--banner-action-text\);/);
+  assert.match(css, /\.tab-cleanup-banner\s*\{[\s\S]*border-radius:\s*999px;[\s\S]*flex:\s*0 0 auto;/);
+  assert.match(css, /\.tab-cleanup-btn\s*\{[\s\S]*border-radius:\s*999px;/);
   assert.match(css, /\.tab-cleanup-btn:hover\s*\{[\s\S]*background:\s*var\(--banner-action-bg-hover\);/);
   assert.match(css, /\.duplicate-count-badge\s*\{[\s\S]*color:\s*var\(--workspace-chip-text\);[\s\S]*background:\s*var\(--workspace-chip-bg-strong\);[\s\S]*border:\s*1px solid var\(--workspace-chip-border\);/);
   assert.match(css, /\.action-btn\.close-tabs\s*\{[\s\S]*border-color:\s*var\(--workspace-chip-border\);[\s\S]*color:\s*var\(--workspace-chip-text\);[\s\S]*background:\s*color-mix\(\s*in\s+srgb,\s*var\(--workspace-chip-bg\)\s+92%,\s*var\(--card-bg\)\s+8%\s*\);[\s\S]*border-radius:\s*8px;[\s\S]*min-height:\s*28px;/);

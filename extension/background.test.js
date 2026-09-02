@@ -98,6 +98,13 @@ test('isNewTabBlank matches chrome://newtab/', () => {
   assert.equal(isNewTabBlank({ url: 'chrome://newtab/' }, EXT_URL), true);
 });
 
+test('isNewTabBlank matches edge://newtab/ (Edge maps the overridden new tab there)', () => {
+  // On Edge the auto-focus-off tab keeps edge://newtab/ as its URL; the
+  // duplicate cleanup must treat it exactly like chrome://newtab/.
+  assert.equal(isNewTabBlank({ url: 'edge://newtab/' }, EXT_URL), true);
+  assert.equal(isNewTabBlank({ url: undefined, pendingUrl: 'edge://newtab/', status: 'loading' }, EXT_URL), true);
+});
+
 test('isNewTabBlank matches extension index.html', () => {
   assert.equal(isNewTabBlank({ url: EXT_URL }, EXT_URL), true);
 });

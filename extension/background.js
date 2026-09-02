@@ -108,11 +108,14 @@ function isNewTabBlank(tab, newTabUrls) {
   // A tab whose URL is already an explicit new-tab page is not "in flight":
   // it IS a new tab, so it must count for duplicate cleanup immediately. Only
   // tabs with an empty/uncommitted URL (session-restore bursts that have not
-  // navigated yet) get the grace-period exemption.
+  // navigated yet) get the grace-period exemption. edge://newtab/ is Edge's
+  // mapping of the overridden new-tab page.
   const isExplicitNewTab =
     url === "chrome://newtab/" ||
+    url === "edge://newtab/" ||
     normalizedKnown.has(normalizedUrl) ||
     pendingUrl === "chrome://newtab/" ||
+    pendingUrl === "edge://newtab/" ||
     normalizedKnown.has(normalizedPendingUrl);
 
   if (!isExplicitNewTab && tab?.id != null) {
@@ -126,7 +129,8 @@ function isNewTabBlank(tab, newTabUrls) {
   if (
     pendingUrl &&
     !normalizedKnown.has(normalizedPendingUrl) &&
-    pendingUrl !== "chrome://newtab/"
+    pendingUrl !== "chrome://newtab/" &&
+    pendingUrl !== "edge://newtab/"
   ) {
     return false;
   }
@@ -288,7 +292,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   // onCreated; this is a second, URL-driven opportunity.
   if (changeInfo?.url) {
     const urls = getNewTabUrls();
-    const isNewTab = changeInfo.url === "chrome://newtab/" || urls.has(changeInfo.url);
+    const isNewTab =
+      changeInfo.url === "chrome://newtab/" ||
+      changeInfo.url === "edge://newtab/" ||
+      urls.has(changeInfo.url);
     if (isNewTab) closeDuplicateNewTabs();
   }
 });

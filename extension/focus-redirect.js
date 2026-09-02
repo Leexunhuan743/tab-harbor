@@ -22,6 +22,14 @@
  */
 
 (function focusRedirectOnce() {
+  // When the auto-focus search toggle is off (mirrored from chrome.storage into
+  // localStorage by the settings UI), do not self-navigate: the tab stays a
+  // plain new-tab page (address bar keeps showing chrome://newtab/) and the
+  // search field is not auto-focused.
+  try {
+    if (localStorage.getItem('tabHarborAutoFocusSearch') === '0') return;
+  } catch { /* ignore */ }
+
   if (location.search.indexOf('focus=1') !== -1) return;
   const target = `${location.pathname}?focus=1${location.hash}`;
   location.replace(target);

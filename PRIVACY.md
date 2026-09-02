@@ -75,7 +75,7 @@ This permission allows Tab Harbor to send the query through the browser’s defa
 ### `history`
 
 Used only while the user is typing in the built-in search field and the inline suggestion panel is shown.  
-Tab Harbor reads a bounded list of recently visited pages to suggest them as destinations, alongside open tabs, quick links, and saved sessions. History is read on demand while the user types, filtered in the page, and never stored, exported, or sent anywhere by Tab Harbor.
+Tab Harbor reads a bounded list of recently visited pages to suggest them as destinations, alongside open tabs, quick links, and saved sessions. History is read on demand while the user types, filtered in the page, and never stored, exported, or sent anywhere by Tab Harbor. Suggestion-row icons are resolved locally (extension favicon cache, page origin, or a blank icon) — history entries never trigger a request to a third-party favicon service.
 
 ### `clipboardRead`
 

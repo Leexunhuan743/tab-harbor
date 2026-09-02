@@ -3691,7 +3691,11 @@ function normalizeNewTabUrlForComparison(rawUrl = '') {
 
 function isTabHarborNewTabUrl(rawUrl = '') {
   const url = String(rawUrl || '');
-  if (url === 'chrome://newtab/') return true;
+  // Chrome maps the overridden new tab to chrome://newtab/; Edge (which can
+  // also load this extension) maps it to edge://newtab/. When the auto-focus
+  // redirect is disabled the tab keeps that URL, so it must still count as a
+  // Tab Harbor page for the duplicate count and the close-extras banner.
+  if (url === 'chrome://newtab/' || url === 'edge://newtab/') return true;
   // The current page IS a Tab Harbor new-tab page; compare normalized forms so
   // the ?focus=1 query (and any hash) does not break the match.
   return normalizeNewTabUrlForComparison(url) === normalizeNewTabUrlForComparison(window.location.href);
@@ -3978,13 +3982,14 @@ function renderSearchSuggestions(rows = [], query = '') {
     groupRows.forEach(row => {
       const safeTitle = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(row.title || row.url || '') : String(row.title || row.url || '').replace(/"/g, '&quot;');
       const safeUrl = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(row.url || '') : String(row.url || '').replace(/"/g, '&quot;');
-      const iconData = runtimeGetIconSources ? runtimeGetIconSources(row, 16) : { sources: [] };
+      const iconData = runtimeGetIconSources ? runtimeGetIconSources(row, 16, { allowExternalFavicon: row.type !== 'history' }) : { sources: [] };
       const faviconUrl = iconData.sources?.[0] || '';
       const fallbackUrl = iconData.sources?.[1] || '';
       const fallbackLabel = runtimeGetFallbackLabel ? runtimeGetFallbackLabel(row.title || row.url, iconData.hostname) : '';
+      const safeFaviconUrl = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(faviconUrl) : String(faviconUrl).replace(/"/g, '&quot;');
       const safeFallbackUrl = runtimeEscapeHtmlAttribute ? runtimeEscapeHtmlAttribute(fallbackUrl) : String(fallbackUrl).replace(/"/g, '&quot;');
       html += `<div class="header-search-suggestion-row" role="option" data-suggestion-type="${row.type}" data-suggestion-url="${safeUrl}" data-suggestion-tab-id="${row.tabId != null ? row.tabId : ''}" aria-selected="false" tabindex="-1">
-        <span class="header-search-suggestion-icon">${faviconUrl ? `<img src="${faviconUrl}" alt="" data-fallback-src="${safeFallbackUrl}">` : ''}</span>
+        <span class="header-search-suggestion-icon">${faviconUrl ? `<img src="${safeFaviconUrl}" alt="" data-fallback-src="${safeFallbackUrl}">` : ''}</span>
         <span class="header-search-suggestion-title">${runtimeEscapeHtml ? runtimeEscapeHtml(row.title || row.url) : String(row.title || row.url)}</span>
         <span class="header-search-suggestion-url">${runtimeEscapeHtml ? runtimeEscapeHtml(row.url || '') : String(row.url || '')}</span>
       </div>`;
@@ -4117,6 +4122,13 @@ async function handleSearchSuggestionKeydown(e) {
   // form submit), whether or not the suggestion panel is open. The panel is
   // only relevant for picking a highlighted row.
   if (e.key === 'Enter') {
+    // A key-repeat or fast double-press can fire a second Enter keydown while
+    // the first search is still awaiting its chrome.* calls. Guard the keydown
+    // path itself (the flag also gates the form-submit duplicate).
+    if (searchSubmitInFlight) {
+      e.preventDefault();
+      return;
+    }
     if (searchSuggestionsOpen) {
       const selected = document.querySelector('.header-search-suggestion-row.is-selected');
       if (selected) {
@@ -4188,6 +4200,10 @@ let searchFocusRetryTimer = null;
 let searchFocusRetryAttempt = 0;
 
 function focusSearchFieldOnForeground() {
+  // The auto-focus search toggle (Desk settings → Features) gates all
+  // foreground auto-focus, including the window focus / visibilitychange
+  // listeners below.
+  if (typeof themePreferences !== 'undefined' && themePreferences.autoFocusSearchEnabled === false) return;
   if (!shouldAutoFocusSearchField()) return;
   const input = getSearchSuggestionsInput();
   if (!input) return;
@@ -4215,6 +4231,10 @@ function scheduleSearchFocusVerification() {
     searchFocusRetryAttempt += 1;
     searchFocusRetryTimer = setTimeout(() => {
       searchFocusRetryTimer = null;
+      // Re-check right before focusing: if the user has since taken over
+      // (keyboard-navigated into another form field or contenteditable), do
+      // not yank focus away from them.
+      if (!shouldAutoFocusSearchField()) return;
       input.focus({ preventScroll: true });
       verify();
     }, delay);
@@ -4276,6 +4296,19 @@ function setupSearchSuggestions() {
     void handleSearchSuggestionKeydown(e);
   });
 
+  // Clicking anywhere in the pill shell (the icon or the surrounding padding,
+  // but not the input itself) focuses the search input. Clicking the input is
+  // already handled natively; clicking a suggestion row is handled by the
+  // panel listener below and must not be redirected here.
+  const shell = document.querySelector('.header-search-shell');
+  if (shell) {
+    shell.addEventListener('click', (e) => {
+      if (e.target.closest('#headerSearchInput')) return;
+      cancelSearchFocusRetryIfInteracting();
+      input.focus({ preventScroll: true });
+    });
+  }
+
   // Clicking a suggestion row activates it (Ctrl/Cmd opens in new tab).
   panel.addEventListener('mousedown', (e) => {
     // Prevent the input from losing focus before the click handler runs.
@@ -4299,6 +4332,13 @@ function setupSearchSuggestions() {
   // The user clicked into the page: they are using the workspace, not waiting
   // for the search field to claim focus. Stop the self-focus retry loop.
   document.addEventListener('pointerdown', () => {
+    cancelSearchFocusRetryIfInteracting();
+  }, { capture: true, passive: true });
+
+  // Same for keyboard navigation: once the user presses a key (Tab, arrows,
+  // typing elsewhere), they have taken over — never steal focus on the next
+  // retry tick.
+  document.addEventListener('keydown', () => {
     cancelSearchFocusRetryIfInteracting();
   }, { capture: true, passive: true });
 
@@ -4470,7 +4510,7 @@ function isWebNavigationUrl(url) {
 
 function isRestoredTabNavigationReady(liveTab, targetUrl, changeInfo = {}) {
   const liveUrl = String(changeInfo?.url || liveTab?.url || '').trim();
-  if (!liveUrl || liveUrl === 'about:blank' || liveUrl === 'chrome://newtab/') return false;
+  if (!liveUrl || liveUrl === 'about:blank' || liveUrl === 'chrome://newtab/' || liveUrl === 'edge://newtab/') return false;
 
   // The normal case should match the saved URL. A completed redirect is also
   // safe to sleep: the tab has a committed destination, while a loading
@@ -4623,26 +4663,6 @@ function getRealTabs() {
       !url.startsWith('brave://')
     );
   });
-}
-
-/**
- * checkTabOutDupes()
- *
- * Counts how many Tab Harbor pages are open. If more than 1,
- * shows a banner offering to close the extras.
- */
-function checkTabOutDupes() {
-  const tabOutTabs = openTabs.filter(t => t.isTabOut);
-  const banner  = document.getElementById('tabOutDupeBanner');
-  const countEl = document.getElementById('tabOutDupeCount');
-  if (!banner) return;
-
-  if (tabOutTabs.length > 1) {
-    if (countEl) countEl.textContent = tabOutTabs.length;
-    banner.style.display = 'flex';
-  } else {
-    banner.style.display = 'none';
-  }
 }
 
 
@@ -5020,8 +5040,14 @@ function renderWorkspaceThemeTools() {
           </div>
           <div class="theme-menu-section">
             <label class="theme-menu-toggle-label theme-menu-toggle-button-row">
-              <button class="theme-toggle-switch ${(typeof themePreferences !== 'undefined' && themePreferences.closeDuplicateNewTabsEnabled) ? 'is-active' : ''}" type="button" data-action="toggle-close-duplicate-new-tabs" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.closeDuplicateNewTabsEnabled) ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('closeDuplicateNewTabsLabel') : 'Auto-close duplicate new tabs'}"></button>
-              <span class="theme-menu-label theme-menu-toggle-text">${runtimeT ? runtimeT('closeDuplicateNewTabsLabel') : 'Auto-close duplicate new tabs'}</span>
+              <button class="theme-toggle-switch ${(typeof themePreferences !== 'undefined' && themePreferences.closeDuplicateNewTabsEnabled) ? 'is-active' : ''}" type="button" data-action="toggle-close-duplicate-new-tabs" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.closeDuplicateNewTabsEnabled) ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('closeDuplicateNewTabsLabel') : 'Auto-close duplicate Tab Harbors'}"></button>
+              <span class="theme-menu-label theme-menu-toggle-text">${runtimeT ? runtimeT('closeDuplicateNewTabsLabel') : 'Auto-close duplicate Tab Harbors'}</span>
+            </label>
+          </div>
+          <div class="theme-menu-section">
+            <label class="theme-menu-toggle-label theme-menu-toggle-button-row">
+              <button class="theme-toggle-switch ${(typeof themePreferences !== 'undefined' && themePreferences.autoFocusSearchEnabled) ? 'is-active' : ''}" type="button" data-action="toggle-auto-focus-search" aria-pressed="${(typeof themePreferences !== 'undefined' && themePreferences.autoFocusSearchEnabled) ? 'true' : 'false'}" aria-label="${runtimeT ? runtimeT('autoFocusSearchLabel') : 'Auto-focus search on new tab'}"></button>
+              <span class="theme-menu-label theme-menu-toggle-text">${runtimeT ? runtimeT('autoFocusSearchLabel') : 'Auto-focus search on new tab'}</span>
             </label>
           </div>
           <div class="theme-menu-section">
@@ -5119,11 +5145,33 @@ async function handleConfigImportInput(inputEl) {
   }
 }
 
+function renderTabOutDupeBanner(dupeExtras) {
+  // Only rendered when there are extra Tab Harbor tabs open (dupeExtras > 0).
+  // The banner sits to the left of the Home / Saved tabs page switch in the
+  // top nav; it re-renders with the nav on every openTabs refresh so it
+  // appears/disappears automatically.
+  if (!dupeExtras || dupeExtras <= 0) return '';
+  const label = runtimeT
+    ? runtimeT('closeExtrasLabel', { count: dupeExtras, suffix: dupeExtras !== 1 ? 's' : '' })
+    : `Close ${dupeExtras} extra tab${dupeExtras !== 1 ? 's' : ''}`;
+  return `
+    <div class="tab-cleanup-banner" id="tabOutDupeBanner">
+      <button class="tab-cleanup-btn" type="button" data-action="close-tabout-dupes" aria-label="${label}">
+        ${label}
+      </button>
+    </div>`;
+}
+
 function renderGroupNavArea(groups) {
+  // Count extra Tab Harbor tabs (all but the current one) to decide whether
+  // the cleanup banner shows and what number it carries.
+  const tabOutTabs = openTabs.filter(t => t.isTabOut);
+  const dupeExtras = tabOutTabs.length > 1 ? tabOutTabs.length - 1 : 0;
   return `
     <div class="group-nav-list" data-nav-kind="open-tabs">
       ${groups.map(group => renderGroupNav(group)).join('')}
     </div>
+    ${renderTabOutDupeBanner(dupeExtras)}
     ${renderWorkspacePageSwitch('home')}
     ${renderWorkspaceThemeTools()}`;
 }
@@ -5600,9 +5648,6 @@ async function renderStaticDashboard() {
   await buildDomainGroups(realTabs);
   renderOpenTabsArea(realTabs);
 
-  // --- Check for duplicate Tab Harbor tabs ---
-  checkTabOutDupes();
-
   // --- Render the todos drawer (deferred column) ---
   await renderDeferredColumn();
   
@@ -5867,6 +5912,23 @@ document.addEventListener('click', async (e) => {
     const nextEnabled = !(typeof themePreferences !== 'undefined' && themePreferences.closeDuplicateNewTabsEnabled);
     await saveThemePreferences({ closeDuplicateNewTabsEnabled: nextEnabled });
     const toggleSwitch = document.querySelector('[data-action="toggle-close-duplicate-new-tabs"]');
+    if (toggleSwitch) {
+      toggleSwitch.classList.toggle('is-active', nextEnabled);
+      toggleSwitch.setAttribute('aria-pressed', String(nextEnabled));
+    }
+    return;
+  }
+
+  if (action === 'toggle-auto-focus-search') {
+    const nextEnabled = !(typeof themePreferences !== 'undefined' && themePreferences.autoFocusSearchEnabled);
+    await saveThemePreferences({ autoFocusSearchEnabled: nextEnabled });
+    // Mirror the toggle into localStorage so focus-redirect.js (the first
+    // <head> script, which runs before chrome.storage is readable) can decide
+    // synchronously whether to self-navigate. '0' = off.
+    try {
+      localStorage.setItem('tabHarborAutoFocusSearch', nextEnabled ? '1' : '0');
+    } catch { /* ignore */ }
+    const toggleSwitch = document.querySelector('[data-action="toggle-auto-focus-search"]');
     if (toggleSwitch) {
       toggleSwitch.classList.toggle('is-active', nextEnabled);
       toggleSwitch.setAttribute('aria-pressed', String(nextEnabled));
@@ -7705,15 +7767,24 @@ async function initializeDashboardRuntime() {
   updateBackToTopVisibility();
 
   // Search-field auto-focus + inline suggestions.
+  const autoFocusEnabled = !(typeof themePreferences !== 'undefined' && themePreferences.autoFocusSearchEnabled === false);
+  // Mirror the toggle into localStorage so focus-redirect.js (head-first,
+  // runs before chrome.storage is readable) sees the persisted value on every
+  // load — not only when the user toggles it here. '0' = off.
+  try {
+    localStorage.setItem('tabHarborAutoFocusSearch', autoFocusEnabled ? '1' : '0');
+  } catch { /* ignore */ }
   setupSearchSuggestions();
-  focusSearchFieldOnForeground();
-  // Chrome focuses the omnibox shortly after a newtab page finishes loading,
-  // which can override the focus above. Re-claim the search field once the
-  // window has fully loaded.
-  if (document.readyState === 'complete') {
-    scheduleSearchFocusVerification();
-  } else {
-    window.addEventListener('load', scheduleSearchFocusVerification, { once: true });
+  if (autoFocusEnabled) {
+    focusSearchFieldOnForeground();
+    // Chrome focuses the omnibox shortly after a newtab page finishes loading,
+    // which can override the focus above. Re-claim the search field once the
+    // window has fully loaded.
+    if (document.readyState === 'complete') {
+      scheduleSearchFocusVerification();
+    } else {
+      window.addEventListener('load', scheduleSearchFocusVerification, { once: true });
+    }
   }
 
   // Listen for tab change notifications from background script
